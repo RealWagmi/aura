@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# aura-call - launch aura-server for ONE voice call, print the single-use
+# connection string on stdout, and leave the server running to accept the call.
+#
+# This is the one launch helper for every host. `install.sh` installs it on PATH
+# as `aura-call` (together with the server); the host skill calls it.
+#
+# Behaviour:
+#   - aura-server prints its connection line on STDERR, then blocks to accept the
+#     client and run the whole call. This helper lifts that ONE line onto its own
+#     STDOUT and returns immediately, while the server keeps running detached.
+#   - The session secret is printed exactly once (inside the AURA_CONNECT=...
+#     line) for the caller to relay or run. It is NEVER written to disk and NEVER
+#     placed on argv. aura-server reads XAI_API_KEY from its own environment (else
+#     the OS keychain, else a ./.env file); this script never reads or echoes it.
+#
+# Usage:
+#   aura-call local                          LOCAL loopback call (binds 127.0.0.1)
+#   aura-call remote <PUBLIC_HOST>           REMOTE call; clients dial PUBLIC_HOST
+# Options:
+#   --host <claude|codex|hermes|openclaw>    select the host adapter (default: claude)
+#   -h, --help                               show this help
+#
+# Env overrides honoured:
+#   AURA_SERVER_BIN   explicit path to aura-server (else PATH, else ~/.local/bin)
+#   AURA_PORT         fixed UDP port (default 47821); read by aura-server itself
+#
+# Portable to Linux and macOS (bash 3.2, BSD tools; no setsid, no GNU timeout).
+
+set -euo pipefail
+
+prog=aura-call
+
+die() {
+  printf '%s: %s\n' "$prog" "$1" >&2
+  exit 1
+}
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  aura-call local                       Start a LOCAL (loopback) call on 127.0.0.1
+  aura-call remote <PUBLIC_HOST>        Start a REMOTE call; clients dial PUBLIC_HOST
+Options:
+  --host <claude|codex|hermes|openclaw> Select the host adapter (default: claude)
+  -h, --help                            Show this help and exit
+Prints one line on stdout (the single-use connection string, ~120 s validity):
+  AURA_CONNECT='aura://HOST:PORT#k=...&c=...' aura-cli
+EOF
+}
+
+mode=""
+public_host=""
+host_kind=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --host) shift; [ "$#" -gt 0 ] || die "--host needs a value"; host_kind="$1" ;;
+    --host=*) host_kind="${1#--host=}" ;;
+    local|remote)
+      [ -z "$mode" ] || die "mode given more than once"
+      mode="$1" ;;
+    -*) die "unknown option: $1" ;;
+    *)
+      if [ "$mode" = "remote" ] && [ -z "$public_host" ]; then
+        public_host="$1"
+      else
+        die "unexpected argument: $1"
+      fi ;;
+  esac
+  shift
+done
+
+[ -n "$mode" ] || { usage; exit 2; }
+
+# Mode -> bind interface. AURA_PUBLIC_HOST is what the client dials AND it selects
+# the bind interface inside aura-server (loopback-only for local, all interfaces
+# for a real remote host).
+case "$mode" in
+  local)
+    export AURA_PUBLIC_HOST="127.0.0.1" ;;
+  remote)
+    [ -n "$public_host" ] || die "remote mode needs a public host: aura-call remote <PUBLIC_HOST>"
+    case "$public_host" in
+      127.*|localhost|::1|0.0.0.0)
+        die "remote mode needs a real public host, not a loopback/wildcard ($public_host)" ;;
+    esac
+    export AURA_PUBLIC_HOST="$public_host" ;;
+esac
+
+# Host adapter selection (default: Claude). AURA_HOST is the explicit override the
+# server's registry honours above every other signal.
+if [ -n "$host_kind" ]; then
+  case "$host_kind" in
+    claude|codex|hermes|openclaw) export AURA_HOST="$host_kind" ;;
+    *) die "unknown --host: $host_kind (expected claude|codex|hermes|openclaw)" ;;
+  esac
+fi
+
+# Resolve the server binary: explicit override, then PATH, then ~/.local/bin.
+server_bin="${AURA_SERVER_BIN:-}"
+if [ -z "$server_bin" ]; then
+  if command -v aura-server >/dev/null 2>&1; then
+    server_bin="$(command -v aura-server)"
+  elif [ -x "$HOME/.local/bin/aura-server" ]; then
+    server_bin="$HOME/.local/bin/aura-server"
+  else
+    die "aura-server not found on PATH or in ~/.local/bin (build it with ./install.sh --server)"
+  fi
+fi
+[ -x "$server_bin" ] || die "aura-server is not executable: $server_bin"
+
+# The server's stderr (where the connection line is printed) flows through a FIFO.
+# We read it until the connection line, then hand the read end to a DETACHED
+# drainer that keeps it open for the server's whole life. This is essential:
+# aura-server keeps logging to stderr after it prints the connection line (e.g.
+# "client connected" at handshake), and Rust's eprintln! PANICS on a broken pipe
+# (EPIPE) - so abandoning the read end would kill the call at the moment the
+# client connects. The FIFO is unlinked immediately; the secret never hits disk.
+fifo_dir="$(mktemp -d "${TMPDIR:-/tmp}/aura-call.XXXXXX")" || die "could not create a temp dir"
+fifo="$fifo_dir/stderr"
+mkfifo "$fifo" || die "could not create the stderr pipe"
+
+# Launch the server detached (nohup + disown so a SIGHUP on our exit can't reach
+# it), stdout discarded, stderr to the FIFO. It survives this helper's exit.
+nohup "$server_bin" >/dev/null 2>"$fifo" &
+disown 2>/dev/null || true
+
+# Open the read end (this unblocks the server's open-for-write), then unlink the
+# path - the open fds keep working and nothing about the call is left on disk.
+exec 3<"$fifo"
+rm -rf "$fifo_dir" 2>/dev/null || true
+
+emitted=0
+while IFS= read -r line; do
+  # Trim leading whitespace; aura-server indents the connection line.
+  trimmed="${line#"${line%%[![:space:]]*}"}"
+  case "$trimmed" in
+    "AURA_CONNECT='aura://"*"' aura-cli"*)
+      printf '%s\n' "$trimmed"   # the one connection line -> our stdout, once
+      emitted=1
+      break ;;
+    *)
+      # Forward the server's startup diagnostics so they stay visible; never the
+      # connection line (handled above), never anything we synthesize.
+      [ -n "$line" ] && printf '%s\n' "$line" >&2 ;;
+  esac
+done <&3
+
+if [ "$emitted" -ne 1 ]; then
+  # The FIFO reached EOF without a connection line: the server exited early.
+  die "aura-server exited before printing a connection string (check XAI_API_KEY, the host config, and that UDP ${AURA_PORT:-47821} is free)"
+fi
+
+# Hand fd 3 to a detached drainer so the live server never sees a closed stderr
+# pipe. `cat` reads to EOF (server exit) then exits; we discard the drained text.
+nohup cat <&3 >/dev/null 2>&1 &
+disown 2>/dev/null || true
+
+exit 0

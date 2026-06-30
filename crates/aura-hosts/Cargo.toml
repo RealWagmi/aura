@@ -1,0 +1,32 @@
+[package]
+name = "aura-hosts"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+# The `HostAdapter` trait + 4 implementations (Claude / Codex / Hermes /
+# OpenClaw): trigger, read context → Brief, dispatch, callback.
+# `async-trait` + `aura-core` are present because the trait surface depends on
+# `aura-core` types.
+[dependencies]
+aura-core = { path = "../aura-core" }
+async-trait.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "process", "io-util", "sync", "time", "macros", "net", "fs"] }
+tracing.workspace = true
+rusqlite.workspace = true
+# OpenClaw adapter: gateway-WS trigger (Ed25519 device-signed connect) +
+# runtime-inbox AES-256-GCM tool_result callback.
+aes-gcm.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+base64.workspace = true
+zeroize.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

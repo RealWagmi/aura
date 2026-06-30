@@ -1,0 +1,10 @@
+/target
+**/target
+Cargo.lock
+*.pem
+*.key
+.env
+.aura/
+*.log
+.DS_Store
+.claude/

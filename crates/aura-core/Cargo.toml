@@ -1,0 +1,18 @@
+[package]
+name = "aura-core"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,24 @@
+[package]
+name = "aura-feeder"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+# Live ambient-context channel that makes "the AI already knows the chat"
+# true *during* the call: tail_events / run_digest_cycle produce digests
+# the engine injects via `VoiceSink::inject_system_context` (no response
+# trigger), plus a cold-start opener. Aligned with `Brief` — one packer, no
+# double-budgeting.
+[dependencies]
+aura-core = { path = "../aura-core" }
+aura-engine = { path = "../aura-engine" }
+async-trait.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "time", "sync", "process", "rt", "macros"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

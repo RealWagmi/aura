@@ -1,0 +1,20 @@
+[package]
+name = "aura-server"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+# The unified call server: the host launches it (local or
+# VPS). Holds the key + engine + host Brief + tools, mints the session secret,
+# prints the connection string, terminates the Noise tunnel, and drives the
+# SAME `aura-engine`. Deps `aura-tunnel` (server feature = the AudioTransport
+# wrapper) + engine/voice/hosts/feeder/core. NOT `aura-audio` (no local mic).
+[dependencies]
+aura-core = { path = "../../crates/aura-core" }
+aura-voice = { path = "../../crates/aura-voice" }
+aura-engine = { path = "../../crates/aura-engine" }
+aura-hosts = { path = "../../crates/aura-hosts" }
+aura-feeder = { path = "../../crates/aura-feeder" }
+aura-tunnel = { path = "../../crates/aura-tunnel", features = ["server", "iroh"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
+getrandom.workspace = true

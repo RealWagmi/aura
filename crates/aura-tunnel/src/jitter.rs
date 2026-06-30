@@ -1,0 +1,238 @@
+//! Adaptive jitter buffer for inbound tunnel audio frames.
+//!
+//! Frames arrive over UDP with network jitter and occasional reordering or
+//! loss. This buffer reorders by sequence number (the low 16 bits of the Noise
+//! per-packet nonce, wraparound-aware per RFC 1982), holds a target depth
+//! between 40 ms and 80 ms (2–4 frames at the 20 ms profile) to absorb jitter,
+//! drops already-played late packets, and on a persistent gap (loss) skips
+//! ahead rather than stalling — bumping the target depth up so future jitter is
+//! absorbed (the "adaptive" part). The outbound side paces sends at
+//! [`FRAME_MS`] via a ticker in `endpoint`.
+
+use std::collections::HashMap;
+
+/// One audio frame is 20 ms (the standard Opus frame duration).
+pub const FRAME_MS: u64 = 20;
+/// Minimum buffered depth: 40 ms.
+pub const MIN_DEPTH_FRAMES: usize = 2;
+/// Maximum buffered depth: 80 ms.
+pub const MAX_DEPTH_FRAMES: usize = 4;
+
+/// RFC 1982 serial comparison for `u16` RTP sequence numbers: is `a` strictly
+/// after `b` (accounting for wraparound)?
+fn seq_after(a: u16, b: u16) -> bool {
+    a != b && a.wrapping_sub(b) < 0x8000
+}
+
+/// Reordering, depth-gating jitter buffer over Opus packets keyed by RTP seq.
+pub struct JitterBuffer {
+    entries: HashMap<u16, Vec<u8>>,
+    /// Next sequence number to release (set from the first pushed packet).
+    next_pop: Option<u16>,
+    /// Highest sequence number seen so far.
+    highest: Option<u16>,
+    /// Current adaptive target depth, in frames, within [MIN, MAX].
+    target: usize,
+    /// `false` until the initial target depth is reached (pre-buffering); once
+    /// `true`, frames are released continuously until an underrun re-buffers.
+    playing: bool,
+    /// Consecutive `pop()` ticks spent waiting on a missing slot while later
+    /// frames are buffered behind it. Bounds reorder tolerance: after
+    /// `LOSS_SKIP_TICKS` the gap is declared lost and skipped, so a tail-of-
+    /// spurt loss can't strand the trailing frames forever.
+    stuck: usize,
+}
+
+/// Ticks (×20 ms) to wait on a gap with later frames buffered before declaring
+/// the missing packet lost and skipping it.
+const LOSS_SKIP_TICKS: usize = 3;
+
+impl Default for JitterBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl JitterBuffer {
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            next_pop: None,
+            highest: None,
+            target: MIN_DEPTH_FRAMES,
+            playing: false,
+            stuck: 0,
+        }
+    }
+
+    /// Current adaptive target depth in frames.
+    pub fn target_frames(&self) -> usize {
+        self.target
+    }
+
+    /// Packets currently buffered.
+    pub fn buffered(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The span from `next_pop` to `highest` inclusive (frames of "distance",
+    /// including any gaps). 0 before the first push or once drained past
+    /// `highest`.
+    pub fn span(&self) -> usize {
+        match (self.next_pop, self.highest) {
+            (Some(np), Some(h)) if np == h => 1,
+            (Some(np), Some(h)) if seq_after(h, np) => (h.wrapping_sub(np) as usize) + 1,
+            // next_pop has advanced past highest → buffer drained.
+            _ => 0,
+        }
+    }
+
+    /// Insert a packet. Packets older than `next_pop` (already released) are
+    /// dropped as too-late. The first packet establishes the release baseline.
+    pub fn push(&mut self, seq: u16, payload: Vec<u8>) {
+        match self.next_pop {
+            None => self.next_pop = Some(seq),
+            Some(np) if seq != np && !seq_after(seq, np) => return, // too late
+            _ => {}
+        }
+        match self.highest {
+            None => self.highest = Some(seq),
+            Some(h) if seq_after(seq, h) => self.highest = Some(seq),
+            _ => {}
+        }
+        self.entries.insert(seq, payload);
+    }
+
+    /// Release the next in-order frame, or `None` to keep waiting. Waits until
+    /// the span reaches the target depth; on a missing packet with an overfull
+    /// buffer (span > MAX) it treats the gap as loss, skips it, and bumps the
+    /// target up (adaptation).
+    pub fn pop(&mut self) -> Option<Vec<u8>> {
+        let np = self.next_pop?;
+        if !self.playing {
+            // Pre-buffer: wait until the initial target depth is reached.
+            if self.span() < self.target {
+                return None;
+            }
+            self.playing = true;
+        }
+        if let Some(payload) = self.entries.remove(&np) {
+            self.next_pop = Some(np.wrapping_add(1));
+            self.stuck = 0;
+            return Some(payload);
+        }
+        // Missing packet at `np`. Are later frames already buffered behind it?
+        let have_later = self.highest.is_some_and(|h| seq_after(h, np)) && !self.entries.is_empty();
+        // Skip the gap as a confirmed loss when the buffer is overfull, OR when
+        // later frames have sat behind it for `LOSS_SKIP_TICKS` (a tail-of-spurt
+        // loss never grows span past MAX, so the time bound is what frees those
+        // trailing frames instead of stranding them). Skipping adapts target up.
+        if self.span() > MAX_DEPTH_FRAMES || (have_later && self.stuck + 1 >= LOSS_SKIP_TICKS) {
+            self.target = (self.target + 1).min(MAX_DEPTH_FRAMES);
+            self.next_pop = Some(np.wrapping_add(1));
+            self.stuck = 0;
+            return self.pop();
+        }
+        if have_later {
+            // Wait a few ticks for a reordered packet before declaring loss.
+            self.stuck += 1;
+            return None;
+        }
+        // True underrun: nothing buffered ahead; re-buffer to the target.
+        self.playing = false;
+        self.stuck = 0;
+        None
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::useless_vec)]
+mod tests {
+    use super::*;
+
+    fn pkt(b: u8) -> Vec<u8> {
+        vec![b]
+    }
+
+    #[test]
+    fn seq_after_handles_wraparound() {
+        assert!(seq_after(5, 4));
+        assert!(!seq_after(4, 5));
+        assert!(seq_after(0, 65_535)); // wrap forward
+        assert!(!seq_after(65_535, 0));
+        assert!(!seq_after(3, 3));
+    }
+
+    #[test]
+    fn releases_in_order_after_target_filled() {
+        let mut jb = JitterBuffer::new();
+        // target is 2 frames; need span >= 2 before release.
+        jb.push(10, pkt(10));
+        assert!(jb.pop().is_none()); // span 1 < target 2
+        jb.push(11, pkt(11));
+        assert_eq!(jb.pop(), Some(pkt(10)));
+        assert_eq!(jb.pop(), Some(pkt(11)));
+        assert!(jb.pop().is_none());
+    }
+
+    #[test]
+    fn tail_end_loss_does_not_strand_trailing_frames() {
+        let mut jb = JitterBuffer::new();
+        jb.push(0, pkt(0));
+        jb.push(1, pkt(1));
+        assert_eq!(jb.pop(), Some(pkt(0)));
+        assert_eq!(jb.pop(), Some(pkt(1))); // playing; next_pop = 2
+                                            // Seq 2 is lost; 3 and 4 arrive, then the talker goes silent.
+        jb.push(3, pkt(3));
+        jb.push(4, pkt(4));
+        // span(2..=4) = 3 (never > MAX), so the time bound frees the gap: wait
+        // LOSS_SKIP_TICKS, then skip 2 and release the stranded 3, 4.
+        assert!(jb.pop().is_none()); // stuck = 1
+        assert!(jb.pop().is_none()); // stuck = 2
+        assert_eq!(jb.pop(), Some(pkt(3)), "skip lost 2, release trailing 3");
+        assert_eq!(jb.pop(), Some(pkt(4)), "and 4 — not stranded");
+        assert!(jb.pop().is_none());
+    }
+
+    #[test]
+    fn reorders_out_of_order_arrivals() {
+        let mut jb = JitterBuffer::new();
+        jb.push(1, pkt(1));
+        jb.push(3, pkt(3)); // arrives before 2
+        jb.push(2, pkt(2));
+        // span = 3 (1..=3) >= target 2 → release in order.
+        assert_eq!(jb.pop(), Some(pkt(1)));
+        assert_eq!(jb.pop(), Some(pkt(2)));
+        assert_eq!(jb.pop(), Some(pkt(3)));
+    }
+
+    #[test]
+    fn drops_late_packet_already_past() {
+        let mut jb = JitterBuffer::new();
+        jb.push(5, pkt(5));
+        jb.push(6, pkt(6));
+        assert_eq!(jb.pop(), Some(pkt(5))); // next_pop now 6
+                                            // A late seq 5 arriving now is older than next_pop → dropped.
+        jb.push(5, pkt(99));
+        jb.push(7, pkt(7));
+        assert_eq!(jb.pop(), Some(pkt(6)));
+        assert_eq!(jb.pop(), Some(pkt(7)));
+        assert!(!jb.entries.contains_key(&5));
+    }
+
+    #[test]
+    fn skips_persistent_gap_and_adapts_target_up() {
+        let mut jb = JitterBuffer::new();
+        // 1,2 present, 3 missing, 4,5,6 present → span grows past MAX (4).
+        for s in [1u16, 2, 4, 5, 6] {
+            jb.push(s, pkt(s as u8));
+        }
+        assert_eq!(jb.pop(), Some(pkt(1)));
+        assert_eq!(jb.pop(), Some(pkt(2)));
+        // next_pop=3 missing; span (3..=6)=4 not > MAX yet → wait.
+        // Push 7 so span (3..=7)=5 > MAX → skip 3, continue.
+        jb.push(7, pkt(7));
+        assert_eq!(jb.pop(), Some(pkt(4))); // 3 skipped as loss
+        assert!(jb.target_frames() > MIN_DEPTH_FRAMES); // adapted up
+    }
+}

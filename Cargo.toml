@@ -1,0 +1,78 @@
+# aura — Cargo workspace root.
+[workspace]
+members = ["crates/*", "bins/*"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+authors = ["aura"]
+description = "Voice calls for AI chats — all-Rust, no broker (xAI Grok voice realtime)."
+publish = false
+
+# Dependency pins are the single source of truth for the workspace.
+# Member crates reference these via `<dep>.workspace = true`.
+[workspace.dependencies]
+# --- async / runtime ---
+async-trait = "0.1"
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time", "sync"] }
+futures-util = "0.3"
+# --- serde / encoding ---
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"
+url = "2.5"
+# --- errors / logging ---
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# --- crypto / secrets ---
+sha2 = "0.10"
+hmac = "0.12"
+getrandom = "0.2"
+aes-gcm = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+# Noise protocol for the REMOTE tunnel (NNpsk0). Pure Rust.
+snow = "0.9"
+# iroh: optional 2nd REMOTE transport — NAT/CGNAT-friendly QUIC P2P with
+# hole-punching + blind relay fallback. Pure Rust; behind aura-tunnel's `iroh`
+# feature (off by default → does not touch the base build).
+iroh = "1.0"
+# Native OS keychains for the BYOK key fallback. On headless Linux (no
+# secret-service) the probe fails soft and env is the supported source;
+# `sync-secret-service` uses a pure-Rust D-Bus client (no system libdbus).
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+# ring-only: `default-features = false` drops rustls's default `aws_lc_rs`
+# provider (which would pull `aws-lc-sys` — a C/cmake/nasm build that hard-fails
+# on common gcc, breaking source builds). We install the ring provider at
+# startup. Re-enable the non-provider defaults (std/tls12/logging).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# --- audio (LOCAL: aura-audio) ---
+cpal = "0.16"
+crossbeam-queue = "0.3"
+# --- optional audio codec (aura-tunnel `opus` feature; default = raw PCM) ---
+opus = "0.3"
+rubato = "0.16"
+# --- net / voice WS (xAI realtime) ---
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
+# --- hosts ---
+rusqlite = { version = "0.32", features = ["bundled"] }
+notify = "7"
+# --- misc ---
+bytes = "1"
+regex = "1.11"
+libc = "0.2"
+clap = { version = "4.5", features = ["derive", "env"] }
+# --- dev ---
+tempfile = "3"
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[profile.release]
+codegen-units = 1
+debug = false
+lto = "thin"
+overflow-checks = true
+panic = "abort"
+strip = "symbols"

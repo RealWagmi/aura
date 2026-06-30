@@ -1,0 +1,16 @@
+[package]
+name = "aura-audio"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+# Client-side cpal mic/speaker capture+playback, the lock-free `PlaybackHandle`,
+# the device-follower, and `CpalTransport` (inherent 24k-frame I/O — NO
+# `aura-engine` dep, so the thin client stays light). Needs ALSA dev headers on
+# Linux (libasound2-dev).
+[dependencies]
+cpal.workspace = true
+crossbeam-queue.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }

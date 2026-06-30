@@ -1,0 +1,23 @@
+[package]
+name = "aura-voice"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+aura-core = { path = "../aura-core" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "sync", "time", "macros"] }
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+url.workspace = true
+zeroize.workspace = true
+rustls.workspace = true
+keyring.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

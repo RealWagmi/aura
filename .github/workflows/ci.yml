@@ -1,0 +1,127 @@
+# aura CI — build + test + clippy on every target OS, plus a formatting check.
+#
+# What this gates:
+#   * The workspace COMPILES on all three target OSes (ubuntu / windows / macOS).
+#   * `cargo test --workspace` is GREEN on every OS. Tests are hermetic: they
+#     MUST NOT require XAI_API_KEY or any network/secret (fake VoiceProvider +
+#     fake HostAdapter drive the e2e engine tests). No secrets are wired into
+#     this workflow on purpose.
+#   * `cargo clippy --workspace --all-targets -- -D warnings` — zero warnings.
+#   * `cargo fmt --all -- --check` — formatting is enforced (separate ubuntu-only
+#     job; formatting is OS-independent so running it once is sufficient).
+#   * The cross-OS matrix de-risks the cpal audio build (aura-audio) on all three
+#     platforms. The base build is pure Rust; the optional Opus codec
+#     (aura-tunnel `opus` feature) is off by default and not exercised here.
+#
+# Toolchain: pinned to rust-toolchain.toml (channel 1.92.0, components rustfmt +
+# clippy). actions-rust-lang/setup-rust-toolchain auto-detects and honours that
+# file, so the version lives in exactly one place.
+
+name: CI
+
+"on":
+  push:
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege: CI only needs to read the repo.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Surface full backtraces if a test panics, to make matrix failures debuggable.
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Matrix: build + test + clippy on every target OS. A failure of ANY step fails
+  # the job (no continue-on-error anywhere, per the task constraints).
+  build-test-clippy:
+    name: build / test / clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Don't abort the other OSes when one fails — we want the full per-OS
+      # signal (especially for the cpal/opus cross-OS build check).
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --- System dependencies -------------------------------------------------
+      # Linux: ALSA dev headers for cpal (aura-audio). cmake + pkg-config are
+      # installed for the optional Opus codec build (off by default).
+      - name: Install Linux system dependencies (ALSA, cmake, pkg-config)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev \
+            cmake \
+            pkg-config
+
+      # macOS: GitHub images ship cmake + pkg-config; CoreAudio (cpal) is part of
+      # the SDK. Verify the toolchain prerequisites are present rather than
+      # silently relying on the image.
+      - name: Verify macOS build prerequisites (cmake)
+        if: runner.os == 'macOS'
+        run: cmake --version
+
+      # Windows: opus (audiopus_sys) compiles via cmake at build time. cmake is
+      # preinstalled on the windows-latest image; verify it is on PATH so an opus
+      # build failure is unambiguous.
+      - name: Verify Windows build prerequisites (cmake)
+        if: runner.os == 'Windows'
+        run: cmake --version
+
+      # --- Toolchain (pinned via rust-toolchain.toml) --------------------------
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # Reads channel + components from rust-toolchain.toml (1.92.0).
+          components: clippy, rustfmt
+          # This action wires in its own cargo cache; we additionally use
+          # rust-cache below for a finer-grained per-OS cache key.
+          cache: false
+
+      - name: Cache cargo registry + build (Swatinem/rust-cache)
+        uses: Swatinem/rust-cache@v2
+
+      # --- Gates ---------------------------------------------------------------
+      # Build first: this is the cross-OS build check, because --workspace pulls
+      # in aura-audio (cpal) and the rest of the audio/transport stack. A
+      # non-compiling stack fails here.
+      - name: Build workspace
+        run: cargo build --workspace
+
+      # Hermetic test suite. No secrets / network required.
+      - name: Test workspace
+        run: cargo test --workspace
+
+      # Lint with warnings promoted to errors across all targets (lib/bin/tests).
+      - name: Clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Formatting is OS-independent, so run it exactly once on ubuntu. Kept out of
+  # the matrix to avoid redundant runs.
+  fmt:
+    name: rustfmt (--check)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt
+          cache: false
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check

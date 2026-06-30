@@ -1,0 +1,18 @@
+[package]
+name = "aura-engine"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+aura-core = { path = "../aura-core" }
+aura-voice = { path = "../aura-voice" }
+aura-hosts = { path = "../aura-hosts" }
+async-trait.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
+serde_json.workspace = true

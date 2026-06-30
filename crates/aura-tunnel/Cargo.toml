@@ -1,0 +1,33 @@
+[package]
+name = "aura-tunnel"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+# REMOTE transport: a dedicated Noise_NNpsk0 tunnel over UDP. The symmetric
+# `TunnelEndpoint` (Noise + UDP + jitter + 20 ms pacing, PCM16@24k in/out) is
+# used by BOTH the thin client and the server. The `server` feature adds the
+# `AudioTransport` impl (and the `aura-engine` dep) so the thin client need not
+# pull the engine.
+[dependencies]
+snow.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "sync", "time", "rt", "macros"] }
+getrandom.workspace = true
+base64.workspace = true
+zeroize.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait = { workspace = true, optional = true }
+aura-engine = { path = "../aura-engine", optional = true }
+# Optional 2nd REMOTE transport: iroh QUIC P2P for NAT/CGNAT hosts.
+iroh = { workspace = true, optional = true }
+
+[features]
+# Server side: the `TunnelTransport: aura_engine::AudioTransport` wrapper.
+server = ["dep:aura-engine", "dep:async-trait"]
+# iroh transport backend (NAT/CGNAT-friendly). Used by both client and server;
+# the iroh `AudioTransport` wrapper additionally needs the `server` feature.
+iroh = ["dep:iroh"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net"] }

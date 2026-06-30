@@ -1,0 +1,16 @@
+[package]
+name = "aura-cli"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+# The thin client: cpal mic/speaker ↔ tunnel. No engine /
+# key / host here — those live on `aura-server`, which the host launches. Deps
+# are deliberately light: `aura-audio` (cpal, no `aura-engine`) + `aura-tunnel`.
+# The `iroh` feature bundles BOTH transports (direct Noise/UDP + iroh QUIC) so
+# the client can dial whichever the connection string names.
+# Needs `libasound2-dev` on Linux for cpal.
+[dependencies]
+aura-audio = { path = "../../crates/aura-audio" }
+aura-tunnel = { path = "../../crates/aura-tunnel", features = ["iroh"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
