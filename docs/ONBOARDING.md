@@ -181,65 +181,56 @@ re-run `./install.sh --server`.
 ## Step 3 — Obtain the `XAI_API_KEY` (get it from the user)
 
 `aura` is **BYOK** (bring your own key). The server resolves the key in this
-order, using the **first** source that has a non-empty value:
+order (first non-empty value wins):
 
 1. the environment variable `XAI_API_KEY`;
-2. the OS keychain (service `aura`, entry `XAI_API_KEY`);
-3. a `./.env` file (`KEY=VALUE` lines) in the server's working directory — the
-   server reads it on startup and **never overrides** an already-set environment
-   variable.
+2. a `.env` file (`KEY=VALUE` lines), loaded into the environment without
+   overriding an already-set variable — first `./.env` in the directory the
+   server starts in, then a fixed user-global `$AURA_HOME/.env` (else
+   `${XDG_CONFIG_HOME:-~/.config}/aura/.env`);
+3. the OS keychain (service `aura`, entry `XAI_API_KEY`).
 
 The key is sent **only** to `api.x.ai` (host-pinned); the server refuses to send
 it anywhere else.
 
-**Ask the user for their xAI API key now.** This is the one place you stop and
-wait for input. Then store it **without ever echoing or logging it**, using one
-of these (prefer the `./.env` file for a long-lived server so the key survives
-restarts):
+**Ask the user for their xAI API key now** — this is where you stop for input.
+Store it **without ever echoing or logging it**, and choose the location by how
+the server runs.
 
-**Option A — write a `chmod 600` `./.env` file (recommended for a persistent
-server).** Create the file with restrictive permissions *first*, then have the
-user paste the key so it never appears in your transcript or shell history:
+**Recommended — a user-global `~/.config/aura/.env`.** The host (e.g. Claude
+Code) launches the server from whatever directory it is in, so a key tied to one
+project directory may not be found. The global file is read **regardless of the
+launch directory**, so it is the safe default. Create it owner-only *first*, then
+have the user paste the key so it never appears in your transcript or shell history:
 
 ```bash
-# Run from the repository root (the server's working directory).
 umask 077
-printf 'XAI_API_KEY=' > .env        # create the file, owner-only (0600)
-chmod 600 .env
-# Then APPEND the key. Do NOT put the key on a command line. Instruct the user
-# to paste it (it is read from stdin, not argv, and not printed):
-#   (read -rs k; printf '%s\n' "$k" >> .env; unset k)
+mkdir -p ~/.config/aura
+printf 'XAI_API_KEY=' > ~/.config/aura/.env && chmod 600 ~/.config/aura/.env
+# The user pastes the key — read from stdin, never argv, never printed:
+( read -rs k; printf '%s\n' "$k" >> ~/.config/aura/.env; unset k )
+echo "key written to ~/.config/aura/.env"   # confirmation only; the key is never printed
 ```
 
-When you guide the user, have them run exactly:
+Verify it exists and is owner-only, **without printing its contents**:
 
 ```bash
-( read -rs k; printf '%s\n' "$k" >> .env; unset k )
-echo "key written to ./.env"      # confirmation only — the key itself is never printed
+f=~/.config/aura/.env
+test -f "$f" && [ "$(stat -c '%a' "$f" 2>/dev/null || stat -f '%Lp' "$f")" = "600" ] \
+  && echo "$f present and 0600: OK"
 ```
 
-Verify the file exists and is owner-only, **without printing its contents**:
+> `stat -c` is GNU/Linux; `stat -f '%Lp'` is macOS/BSD — the line tries both.
 
-```bash
-test -f .env && [ "$(stat -c '%a' .env 2>/dev/null || stat -f '%Lp' .env)" = "600" ] \
-  && echo ".env present and 0600: OK"
-```
+**Alternatives.** For a dedicated server you always start from one fixed directory,
+a `chmod 600 ./.env` in that directory works the same way (same commands, `.env`
+instead of `~/.config/aura/.env`). Or store the secret in the **OS keychain**
+(service `aura`, entry `XAI_API_KEY`) with your platform's tool (`secret-tool` /
+macOS `security` / Windows Credential Manager) — also directory-independent, with
+nothing written to disk.
 
-> `stat -c` is GNU/Linux; `stat -f '%Lp'` is macOS/BSD — the line above tries
-> both so it works on either OS.
-
-**Option B — environment variable for the current session only** (does not
-survive a reboot; do **not** write it into a shell rc where it would leak into
-process listings of other tools):
-
-```bash
-# The user pastes the key; it is read from stdin, never argv:
-read -rs XAI_API_KEY && export XAI_API_KEY && unset HISTFILE
-```
-
-Either way, **never** run `echo "$XAI_API_KEY"`, never paste the key into a
-command argument, and never write it into a log or a file other than the
-`0600` `./.env`.
+**Never** run `echo "$XAI_API_KEY"`, never put the key on a command line, and
+never write it anywhere but a `0600` `.env` (or the keychain).
 
 ---
 

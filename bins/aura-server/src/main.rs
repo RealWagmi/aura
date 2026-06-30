@@ -235,10 +235,55 @@ async fn maybe_start_feeder(cwd: &std::path::Path) -> Option<Arc<dyn AmbientFeed
     }
 }
 
-/// Minimal `.env` loader: `KEY=VALUE` from `./.env`, quotes stripped, never
-/// overriding an already-set var. Keeps `XAI_API_KEY` out of argv/shell history.
+/// Minimal `.env` loader. Loads `KEY=VALUE` lines (quotes stripped) and never
+/// overrides an already-set variable, from two files in order:
+///   1. `./.env` in the current working directory (where the server was started);
+///   2. a fixed user-global file — `$AURA_HOME/.env`, else
+///      `${XDG_CONFIG_HOME:-~/.config}/aura/.env`.
+///
+/// The working-directory file wins (loaded first; the global never overrides a
+/// key already set), and a real environment variable beats both. The global
+/// file is what lets one onboarding-written key resolve no matter which
+/// directory the host launches `aura-server` from. Keeps `XAI_API_KEY` out of
+/// argv / shell history.
 fn load_dotenv() {
-    let Ok(content) = std::fs::read_to_string(".env") else {
+    load_dotenv_file(std::path::Path::new(".env"));
+    if let Some(dir) = global_config_dir() {
+        load_dotenv_file(&dir.join(".env"));
+    }
+}
+
+/// The fixed user-global aura config directory (where a CWD-independent `.env`
+/// lives). Reads the environment, then defers to [`global_config_dir_from`].
+fn global_config_dir() -> Option<std::path::PathBuf> {
+    global_config_dir_from(
+        std::env::var_os("AURA_HOME"),
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
+    )
+}
+
+/// Pure resolution rule (no process-env access, so it is race-free to test):
+/// `AURA_HOME` wins outright; else `XDG_CONFIG_HOME/aura`; else
+/// `<home>/.config/aura`. Empty values are ignored.
+fn global_config_dir_from(
+    aura_home: Option<std::ffi::OsString>,
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    if let Some(h) = aura_home.filter(|s| !s.is_empty()) {
+        return Some(std::path::PathBuf::from(h));
+    }
+    if let Some(x) = xdg_config_home.filter(|s| !s.is_empty()) {
+        return Some(std::path::PathBuf::from(x).join("aura"));
+    }
+    home.filter(|s| !s.is_empty())
+        .map(|h| std::path::PathBuf::from(h).join(".config").join("aura"))
+}
+
+/// Load one `.env` file if it exists; never override an already-set variable.
+fn load_dotenv_file(path: &std::path::Path) {
+    let Ok(content) = std::fs::read_to_string(path) else {
         return;
     };
     for line in content.lines() {
@@ -260,5 +305,46 @@ fn load_dotenv() {
         if std::env::var_os(key).is_none() {
             std::env::set_var(key, value);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    #[test]
+    fn global_config_dir_precedence() {
+        // AURA_HOME wins outright.
+        assert_eq!(
+            global_config_dir_from(
+                Some(OsString::from("/srv/aura")),
+                Some(OsString::from("/x")),
+                Some(OsString::from("/home/u")),
+            ),
+            Some(PathBuf::from("/srv/aura"))
+        );
+        // else XDG_CONFIG_HOME/aura.
+        assert_eq!(
+            global_config_dir_from(
+                None,
+                Some(OsString::from("/x")),
+                Some(OsString::from("/home/u")),
+            ),
+            Some(PathBuf::from("/x/aura"))
+        );
+        // else <home>/.config/aura.
+        assert_eq!(
+            global_config_dir_from(None, None, Some(OsString::from("/home/u"))),
+            Some(PathBuf::from("/home/u/.config/aura"))
+        );
+        // empty values are skipped.
+        assert_eq!(
+            global_config_dir_from(Some(OsString::new()), None, Some(OsString::from("/home/u"))),
+            Some(PathBuf::from("/home/u/.config/aura"))
+        );
+        // nothing resolvable → None.
+        assert_eq!(global_config_dir_from(None, None, None), None);
     }
 }
