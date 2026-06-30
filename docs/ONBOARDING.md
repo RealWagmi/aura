@@ -225,9 +225,10 @@ test -f "$f" && [ "$(stat -c '%a' "$f" 2>/dev/null || stat -f '%Lp' "$f")" = "60
 **Alternatives.** For a dedicated server you always start from one fixed directory,
 a `chmod 600 ./.env` in that directory works the same way (same commands, `.env`
 instead of `~/.config/aura/.env`). Or store the secret in the **OS keychain**
-(service `aura`, entry `XAI_API_KEY`) with your platform's tool (`secret-tool` /
-macOS `security` / Windows Credential Manager) — also directory-independent, with
-nothing written to disk.
+(service `aura`, entry `XAI_API_KEY`) on macOS (`security`) or Windows (Credential
+Manager) — directory-independent, nothing on disk. On Linux the keychain backend
+is the kernel keyring (keyutils), which does not reliably persist for a
+long-running server, so prefer `.env` there.
 
 **Never** run `echo "$XAI_API_KEY"`, never put the key on a command line, and
 never write it anywhere but a `0600` `.env` (or the keychain).

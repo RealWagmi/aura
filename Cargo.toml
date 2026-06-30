@@ -40,10 +40,12 @@ snow = "0.9"
 # hole-punching + blind relay fallback. Pure Rust; behind aura-tunnel's `iroh`
 # feature (off by default → does not touch the base build).
 iroh = "1.0"
-# Native OS keychains for the BYOK key fallback. On headless Linux (no
-# secret-service) the probe fails soft and env is the supported source;
-# `sync-secret-service` uses a pure-Rust D-Bus client (no system libdbus).
-keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+# Native OS keychains for the BYOK key fallback — Apple Keychain, Windows
+# Credential Manager, and the Linux kernel keyring (keyutils, pure Rust). NO
+# system libdbus / secret-service, so the server build stays C-free on Linux.
+# `.env` / env is the primary key source; the keychain is a soft fallback (the
+# probe fails soft when a backend is unavailable, e.g. on a headless server).
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"] }
 # ring-only: `default-features = false` drops rustls's default `aws_lc_rs`
 # provider (which would pull `aws-lc-sys` — a C/cmake/nasm build that hard-fails
 # on common gcc, breaking source builds). We install the ring provider at
