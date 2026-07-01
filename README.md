@@ -80,7 +80,7 @@ sequenceDiagram
     SRV->>XAI: realtime audio (no STT/TTS)
     XAI-->>SRV: model voice
     SRV-->>CLI: audio out
-    Note over Host,SRV: in-call tasks dispatched to host; post-call recap to chat
+    Note over Host,SRV: in-call tasks dispatched to host, post-call recap to chat
 ```
 
 ## Install the client
