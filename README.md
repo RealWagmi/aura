@@ -28,7 +28,13 @@ macOS (CoreAudio) and Windows (WASAPI) need no extra audio package.
 
 ### One-line install
 
-Build the thin client straight from the published source:
+**Fastest — prebuilt binary (Linux / macOS), no toolchain, no compile:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RealWagmi/aura/main/install_bin.sh | bash -s -- --client
+```
+
+**Or build from source** (any platform; the only option on Windows, via `install.ps1`):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/RealWagmi/aura/main/install.sh | bash -s -- --client
@@ -77,17 +83,19 @@ When the call ends, the server posts a short recap of the in-call transcript bac
 
 You don't run `aura-server` by hand — you ask **your own AI agent** to set it up once, and from then on it launches the server for you on every call. To start, paste this to your agent:
 
-> Let's set up the aura voice server. Run `curl -fsSL https://raw.githubusercontent.com/RealWagmi/aura/main/install.sh | bash -s -- --server`, then read and follow `https://raw.githubusercontent.com/RealWagmi/aura/main/docs/ONBOARDING.md`.
+> **Linux / macOS (fastest — prebuilt binary):** Let's set up the aura voice server. Run `curl -fsSL https://raw.githubusercontent.com/RealWagmi/aura/main/install_bin.sh | bash -s -- --server`, then read and follow `https://raw.githubusercontent.com/RealWagmi/aura/main/docs/ONBOARDING_BIN.md`.
 
-On **Windows**, ask it to use PowerShell:
+> **From source (any platform):** Let's set up the aura voice server. Run `curl -fsSL https://raw.githubusercontent.com/RealWagmi/aura/main/install.sh | bash -s -- --server`, then read and follow `https://raw.githubusercontent.com/RealWagmi/aura/main/docs/ONBOARDING.md`.
 
-> Let's set up the aura voice server. Run `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/RealWagmi/aura/main/install.ps1))) -Server`, then read and follow the onboarding guide above.
+On **Windows** (source only), ask it to use PowerShell:
 
-The installer is self-contained: it clones the source into `~/aura`, sets up Rust if it's missing, builds `aura-server`, and puts it — plus the `aura-call` call helpers — on your `PATH`. Your agent then follows the onboarding guide to finish.
+> Let's set up the aura voice server. Run `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/RealWagmi/aura/main/install.ps1))) -Server`, then read and follow the source onboarding guide above.
+
+The **binary** installer downloads a verified prebuilt archive and puts `aura-server` + the `aura-call` helpers on your `PATH` in seconds (Linux/macOS). The **source** installer clones into `~/aura`, sets up Rust, and builds. Either way, your agent then follows the onboarding guide to finish.
 
 ### What you'll need
 - **An xAI API key** — aura is BYOK (bring your own key): it uses *your* key to reach the voice model directly, with no third party in between.
-- **A few minutes** for the first build (it compiles from source and may download the Rust toolchain).
+- **Time:** seconds via the prebuilt binary; a few minutes if building from source (it compiles and may fetch the Rust toolchain).
 - **For a remote server only** — a host reachable over the network (e.g. a VPS) and the ability to open one UDP port on it.
 
 ### What your agent will ask you

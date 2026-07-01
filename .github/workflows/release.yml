@@ -1,0 +1,113 @@
+# aura release — build prebuilt binaries for Linux + macOS on a version tag and
+# publish them to a GitHub Release. Windows is intentionally NOT built here: it
+# stays source-build (install.ps1 / docs/ONBOARDING.md). Each archive carries
+# BOTH binaries (aura-cli + aura-server) plus the on-PATH helper scripts and the
+# host skill, so `install_bin.sh` can set up a full client or server with no
+# toolchain and no compile step.
+#
+# Trigger: push a version tag, e.g. `git tag v0.1.0 && git push origin v0.1.0`.
+# Uploads run with the built-in GITHUB_TOKEN (Settings -> Actions -> Workflow
+# permissions must allow "Read and write"); no extra secret is needed.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  # --- 1. Build one archive per Linux/macOS target on a native runner ---------
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: build on 22.04 (glibc 2.35) for wide forward-compatibility.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          # macOS: the arm64 runner builds both slices (x86_64 via cross codegen).
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # aura-cli links libasound (cpal) on Linux — needed to BUILD the client.
+      - name: Install ALSA dev headers (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+          rustflags: ''          # a release build should not fail on warnings
+          cache: false
+
+      - name: Build aura-cli + aura-server (release)
+        run: cargo build --release --target ${{ matrix.target }} -p aura-cli -p aura-server
+
+      - name: Package archive + checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          triple="${{ matrix.target }}"
+          bin="target/$triple/release"
+          stage="aura-$triple"
+          mkdir -p "$stage"
+          # Both binaries + the on-PATH helpers + the host skill, so one archive
+          # sets up a full client or server.
+          cp "$bin/aura-cli" "$bin/aura-server" "$stage/"
+          cp scripts/launch-call.sh    "$stage/aura-call"
+          cp scripts/call-status.sh    "$stage/aura-call-status"
+          cp scripts/aura-open-port.sh "$stage/aura-open-port"
+          cp skills/SKILL.md           "$stage/SKILL.md"
+          chmod +x "$stage/aura-cli" "$stage/aura-server" \
+                   "$stage/aura-call" "$stage/aura-call-status" "$stage/aura-open-port"
+          # Flat archive (files at the top level; no wrapping dir).
+          tar -czf "$stage.tar.gz" -C "$stage" .
+          # Bare-hash sidecar (portable; install_bin.sh compares it directly).
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$stage.tar.gz" | awk '{print $1}' > "$stage.tar.gz.sha256"
+          else
+            shasum -a 256 "$stage.tar.gz" | awk '{print $1}' > "$stage.tar.gz.sha256"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aura-${{ matrix.target }}
+          path: |
+            aura-${{ matrix.target }}.tar.gz
+            aura-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+  # --- 2. Collect all archives and publish them to one GitHub Release ---------
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # create the Release and upload assets
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: true
