@@ -151,6 +151,8 @@ fn persist(path: &Path, event: &CheckpointEvent) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the Unix permission tests touch `fs`; unused on other targets.
+    #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;

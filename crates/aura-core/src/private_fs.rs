@@ -20,11 +20,16 @@
 //!   an unrelated file.
 
 use std::{
-    fs::{self, DirBuilder, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Write},
     path::Path,
 };
 
+// `DirBuilder` is only used through `DirBuilderExt::mode` on Unix; on non-Unix
+// the directory path falls back to `create_dir_all`, so importing it there
+// would be an unused import.
+#[cfg(unix)]
+use std::fs::DirBuilder;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
@@ -233,6 +238,9 @@ fn prepare_private_write_target(path: &Path) -> Result<(), String> {
     reject_symlink_for_write(path)
 }
 
+// `opts` is only mutated inside the `#[cfg(unix)]` block below; on non-Unix it
+// is used as-is, so the `mut` would be flagged unused there.
+#[cfg_attr(not(unix), allow(unused_mut))]
 fn open_private(path: &Path, mut opts: OpenOptions) -> Result<fs::File, String> {
     #[cfg(unix)]
     {
@@ -296,10 +304,12 @@ pub(crate) fn write_private_truncated(
     secure_file(path)
 }
 
-#[cfg(test)]
+// Every test here exercises Unix permission semantics (0o600/0o700), so the
+// whole module is Unix-only; on other targets it would be dead code with
+// unused imports/helpers.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
