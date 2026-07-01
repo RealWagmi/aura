@@ -26,8 +26,16 @@
 name: CI
 
 "on":
+  # Doc-only changes don't affect the build/tests, so skip CI for a push/PR that
+  # touches ONLY markdown — saves the full 3-OS matrix on a README/docs/skill edit.
+  # Any non-.md change (code, Cargo.toml, rust-toolchain, workflows, scripts) still
+  # triggers CI, because `paths-ignore` skips a run only when EVERY changed file matches.
   push:
+    paths-ignore:
+      - '**.md'
   pull_request:
+    paths-ignore:
+      - '**.md'
 
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
