@@ -53,13 +53,29 @@ const DEFAULT_PORT: u16 = 47821;
 
 #[tokio::main]
 async fn main() {
-    // Scheme 2 orchestrator helper: `aura-server inbox <cmd>` is the live host
-    // chat session's side of the in-call dispatch inbox. It is a short-lived
-    // synchronous-style subcommand that must NOT stand up a call, so handle it
-    // before any call setup and exit.
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("inbox") {
-        std::process::exit(run_inbox_cli(&args[2..]).await);
+    match args.get(1).map(String::as_str) {
+        // `--version` / `--help` must be handled BEFORE any call setup, so an
+        // unrecognized flag never silently boots a call server.
+        Some("-v" | "-V" | "--version") => {
+            println!("aura-server {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        Some("-h" | "--help") => {
+            print_server_help();
+            std::process::exit(0);
+        }
+        // Scheme 2 orchestrator helper: `aura-server inbox <cmd>` is the live
+        // host chat session's side of the in-call dispatch inbox — a short-lived
+        // subcommand that must NOT stand up a call.
+        Some("inbox") => std::process::exit(run_inbox_cli(&args[2..]).await),
+        // Any other flag is a mistake — do NOT fall through to launching a call.
+        Some(other) if other.starts_with('-') => {
+            eprintln!("aura-server: unknown option {other:?}; try `aura-server --help`.");
+            std::process::exit(2);
+        }
+        // No args → normal launch (configured entirely via env vars).
+        _ => {}
     }
     if let Err(err) = run().await {
         eprintln!("aura-server: {err}");
@@ -70,6 +86,31 @@ async fn main() {
     // tasks / OS threads (relay, magicsock) that can keep the process alive after
     // `run()` returns, so exit explicitly instead of waiting on them.
     std::process::exit(0);
+}
+
+/// Short usage. The server takes no positional arguments — a call is configured
+/// entirely via environment variables (the host launches it) — so this only
+/// documents the flags, the `inbox` subcommand, and the key env knobs.
+fn print_server_help() {
+    println!(
+        "aura-server {} — the unified voice-call server (holds the key, engine, context, tools).\n\n\
+         The host launches it per call; you don't normally run it by hand. It is\n\
+         configured via environment variables, not arguments.\n\n\
+         Usage:\n  \
+         aura-server                 launch a call server (config read from the environment)\n  \
+         aura-server inbox <cmd>     orchestrator inbox helper: wait | done | stall | alive\n\n\
+         Options:\n  \
+         -V, --version   print the version and exit\n  \
+         -h, --help      show this help and exit\n\n\
+         Key environment variables:\n  \
+         XAI_API_KEY           BYOK key (env / OS keychain / ./.env) — required\n  \
+         AURA_PUBLIC_HOST      host clients dial (default 127.0.0.1 = LOCAL)\n  \
+         AURA_PORT             UDP port (default 47821)\n  \
+         AURA_TRANSPORT=iroh   NAT/CGNAT P2P transport\n  \
+         AURA_DISPATCH_MODEL   pin the in-call dispatch model\n  \
+         AURA_FEEDER=1         opt in to the live ambient feeder",
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {

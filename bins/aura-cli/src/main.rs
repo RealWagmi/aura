@@ -12,9 +12,39 @@ use aura_tunnel::{
 
 #[tokio::main]
 async fn main() {
+    // Handle `--version` / `--help` before touching the mic or stdin.
+    if let Some(code) = handle_cli_flags() {
+        std::process::exit(code);
+    }
     if let Err(err) = run().await {
         eprintln!("aura-cli: {err}");
         std::process::exit(1);
+    }
+}
+
+/// Early `-v`/`-V`/`--version` and `-h`/`--help` handling. Returns the exit code
+/// to use, or `None` to proceed with a normal call. The connection string is
+/// never read from argv (only `AURA_CONNECT`/stdin), so no other flags exist.
+fn handle_cli_flags() -> Option<i32> {
+    match std::env::args().nth(1).as_deref() {
+        Some("-v" | "-V" | "--version") => {
+            println!("aura-cli {}", env!("CARGO_PKG_VERSION"));
+            Some(0)
+        }
+        Some("-h" | "--help") => {
+            println!(
+                "aura-cli {} — the thin voice client (mic/speaker only; holds no key).\n\n\
+                 Give the connection string via the AURA_CONNECT env var, or run with no\n\
+                 arguments and paste it on the first line of stdin. The single-use secret is\n\
+                 never taken from the command line.\n\n\
+                 Options:\n  \
+                 -V, --version   print the version and exit\n  \
+                 -h, --help      show this help and exit",
+                env!("CARGO_PKG_VERSION")
+            );
+            Some(0)
+        }
+        _ => None,
     }
 }
 
