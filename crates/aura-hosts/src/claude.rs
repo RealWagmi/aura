@@ -209,6 +209,38 @@ fn parse_transcript_messages(text: &str) -> Vec<RecentMessage> {
     messages
 }
 
+/// Extract the model the host Claude session is using — the `message.model` of
+/// the most recent assistant event in the transcript. Lets the in-call dispatch
+/// run `claude -p` with the SAME model the developer was chatting with (Scheme 1,
+/// see docs/DISPATCH.md) instead of the CLI default. Returns None if the
+/// transcript is unreadable or records no model.
+fn latest_transcript_model(path: &Path) -> Option<String> {
+    let text = read_transcript_tail_text(path).ok()?;
+    let mut model: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        // Cheap pre-filter before the JSON parse.
+        if line.is_empty() || !line.contains("\"model\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if let Some(m) = value
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(Value::as_str)
+            .filter(|m| !m.trim().is_empty())
+        {
+            model = Some(m.to_owned());
+        }
+    }
+    model
+}
+
 // --- Adapter -----------------------------------------------------------------
 
 /// The Claude Code host adapter.
@@ -241,6 +273,18 @@ impl ClaudeAdapter {
     /// dispatch path: `start_task` runs `claude -p` in `cwd`, giving the voice
     /// model Claude Code's repo + tool access (read/edit/bash).
     pub fn executing(cwd: impl Into<PathBuf>) -> Self {
+        Self::executing_with_dispatch_model(cwd, None)
+    }
+
+    /// Like [`executing`](Self::executing) but pinning the in-call dispatch model
+    /// (`ClaudeConfig::dispatch_model`). `None` keeps the per-dispatch transcript
+    /// auto-detection (Scheme 1); `Some(m)` forces `claude -p --model <m>`. The
+    /// server threads this from the `AURA_DISPATCH_MODEL` env at
+    /// [`build_host`](crate::build_host).
+    pub fn executing_with_dispatch_model(
+        cwd: impl Into<PathBuf>,
+        dispatch_model: Option<String>,
+    ) -> Self {
         let cwd = cwd.into();
         // Default the hooks dir to `<cwd>/.aura/hooks` so the post-call summary
         // (and in-call dispatch callbacks) are actually written somewhere the
@@ -251,6 +295,7 @@ impl ClaudeAdapter {
         let config = ClaudeConfig {
             execute_tasks: true,
             hooks_dir: Some(cwd.join(".aura").join("hooks")),
+            dispatch_model,
             ..ClaudeConfig::default()
         };
         Self::with_config(cwd, &config)
@@ -348,7 +393,14 @@ impl AgentRuntime for ClaudeAdapter {
         // Run `claude -p` in the project dir (full repo + tool access) on a
         // blocking thread so the long subprocess doesn't stall the async
         // runtime. The summary it returns is spoken back to the user.
-        let exec = self.execution.clone();
+        // Scheme 1: dispatch `claude -p` with the SAME model the developer's chat
+        // session is using (read from the transcript), not the CLI default.
+        let mut exec = self.execution.clone();
+        if exec.model.is_none() {
+            exec.model = self
+                .resolve_transcript()
+                .and_then(|p| latest_transcript_model(&p));
+        }
         let cwd = self.cwd.clone();
         let env_for_run = envelope.clone();
         let run = tokio::task::spawn_blocking(move || run_claude_task(&exec, &cwd, &env_for_run))
@@ -541,6 +593,10 @@ struct ClaudeExecutionOptions {
     permission_mode: String,
     allowed_tools: Vec<String>,
     max_budget_usd: Option<String>,
+    /// Model to pass to `claude -p --model` (Scheme 1: match the host chat
+    /// session's model). None → resolved from the transcript at dispatch time;
+    /// if still None, the `claude` CLI default is used.
+    model: Option<String>,
 }
 
 impl From<&ClaudeConfig> for ClaudeExecutionOptions {
@@ -551,6 +607,10 @@ impl From<&ClaudeConfig> for ClaudeExecutionOptions {
             permission_mode: config.permission_mode.clone(),
             allowed_tools: config.allowed_tools.clone(),
             max_budget_usd: config.max_budget_usd.clone(),
+            // A config override (`dispatch_model`) pins the model outright; when
+            // unset it stays `None` and is resolved per-dispatch from the live
+            // transcript (Scheme 1), else the `claude` CLI default.
+            model: config.dispatch_model.clone(),
         }
     }
 }
@@ -627,6 +687,10 @@ fn run_claude_task(
         .arg(&exec.permission_mode)
         .arg("--append-system-prompt")
         .arg(CLAUDE_APPEND_SYSTEM_PROMPT);
+    // Scheme 1: match the host chat session's model when we could resolve it.
+    if let Some(model) = &exec.model {
+        command.arg("--model").arg(model);
+    }
     if !exec.allowed_tools.is_empty() {
         command
             .arg("--allowedTools")
@@ -842,5 +906,74 @@ mod tests {
         assert_eq!(result.handoff_state, TaskHandoffState::EnvelopePrepared);
         assert!(!result.accepted());
         assert!(result.task_id.starts_with("claude-"));
+    }
+
+    #[test]
+    fn latest_transcript_model_reads_most_recent_assistant_model() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"type":"user","message":{{"content":"hi"}}}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"model":"claude-sonnet-5","content":[{{"type":"text","text":"a"}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"model":"claude-opus-4-8","content":[{{"type":"text","text":"b"}}]}}}}"#
+        )
+        .unwrap();
+        f.flush().unwrap();
+        // Most recent assistant model wins.
+        assert_eq!(
+            latest_transcript_model(&path).as_deref(),
+            Some("claude-opus-4-8")
+        );
+    }
+
+    #[test]
+    fn latest_transcript_model_none_when_absent() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"type":"user","message":{{"content":"hi"}}}}"#).unwrap();
+        f.flush().unwrap();
+        // No model recorded → None; missing file → None (never panics).
+        assert_eq!(latest_transcript_model(&path), None);
+        assert_eq!(
+            latest_transcript_model(&tmp.path().join("nope.jsonl")),
+            None
+        );
+    }
+
+    #[test]
+    fn dispatch_model_config_pins_the_execution_model() {
+        // Unset → no pin; the model is resolved from the transcript at dispatch
+        // time (`start_task` only auto-detects when `model.is_none()`).
+        let exec = ClaudeExecutionOptions::from(&ClaudeConfig::default());
+        assert_eq!(exec.model, None);
+        // Set → pinned outright, so it wins over transcript auto-detection.
+        let cfg = ClaudeConfig {
+            dispatch_model: Some("claude-opus-4-8".to_owned()),
+            ..ClaudeConfig::default()
+        };
+        let exec = ClaudeExecutionOptions::from(&cfg);
+        assert_eq!(exec.model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn executing_constructor_threads_the_dispatch_model_pin() {
+        // No pin → transcript auto-detection (model stays None at construction).
+        let none = ClaudeAdapter::executing("/tmp/aura-dm-test");
+        assert_eq!(none.execution.model, None);
+        // Pinned → forced regardless of the chat session's model.
+        let pinned = ClaudeAdapter::executing_with_dispatch_model(
+            "/tmp/aura-dm-test",
+            Some("claude-opus-4-8".to_owned()),
+        );
+        assert_eq!(pinned.execution.model.as_deref(), Some("claude-opus-4-8"));
     }
 }

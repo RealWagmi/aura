@@ -287,6 +287,12 @@ pub struct ClaudeConfig {
     pub permission_mode: String,
     pub allowed_tools: Vec<String>,
     pub max_budget_usd: Option<String>,
+    /// Optional pin for the in-call dispatch model (`claude -p --model <m>`).
+    /// `None` (default) → the model is resolved per-dispatch from the live chat
+    /// transcript (Scheme 1); set this to force a specific model regardless of
+    /// what the chat session is using. An explicit value always wins over the
+    /// transcript auto-detection.
+    pub dispatch_model: Option<String>,
     // ---------------- Feeder parity (Codex feeder mirror) ----------------
     // Claude path's `start_context_feeder` previously hardcoded model
     // names + cycle interval + research max-in-flight. The Codex path
@@ -360,6 +366,7 @@ impl Default for ClaudeConfig {
                 "Bash(git diff *)".to_owned(),
             ],
             max_budget_usd: Some("1.00".to_owned()),
+            dispatch_model: None,
             // Parity defaults — must match the pre-parity hardcoded
             // constants in `aura-cli::feeder_setup` so a config that
             // omits these keys keeps its old behaviour.

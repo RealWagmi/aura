@@ -191,10 +191,10 @@ SELECTED=""
 SELECTED="${SELECTED# }"
 
 if [ "$DO_UNINSTALL" -eq 1 ]; then
-  # The server ships two on-PATH shell helpers (aura-call / aura-call-status);
-  # remove them too when uninstalling the server.
+  # The server ships on-PATH shell helpers (aura-call / aura-call-status /
+  # aura-inbox); remove them too when uninstalling the server.
   REMOVE="$SELECTED"
-  [ "$WANT_SERVER" -eq 1 ] && REMOVE="$REMOVE aura-call aura-call-status"
+  [ "$WANT_SERVER" -eq 1 ] && REMOVE="$REMOVE aura-call aura-call-status aura-inbox"
   uninstall "$REMOVE"
   exit 0
 fi
@@ -345,13 +345,15 @@ install_one() {
 
 # The server-side launch helpers are shell scripts (not built artifacts). Install
 # them on PATH next to the server so the host skill's `aura-call` /
-# `aura-call-status` commands resolve. A client-only install does not need them.
+# `aura-call-status` / `aura-inbox` commands resolve. A client-only install does
+# not need them.
 install_helpers() {
   install -d "$BIN_DIR" 2>/dev/null || mkdir -p "$BIN_DIR"
   cp -f "$REPO_ROOT/scripts/launch-call.sh" "$BIN_DIR/aura-call"
   cp -f "$REPO_ROOT/scripts/call-status.sh" "$BIN_DIR/aura-call-status"
-  chmod 0755 "$BIN_DIR/aura-call" "$BIN_DIR/aura-call-status"
-  ok "installed $BIN_DIR/aura-call and $BIN_DIR/aura-call-status (host call helpers)"
+  cp -f "$REPO_ROOT/scripts/inbox.sh" "$BIN_DIR/aura-inbox"
+  chmod 0755 "$BIN_DIR/aura-call" "$BIN_DIR/aura-call-status" "$BIN_DIR/aura-inbox"
+  ok "installed $BIN_DIR/aura-call, $BIN_DIR/aura-call-status and $BIN_DIR/aura-inbox (host call helpers)"
 }
 
 # --------------------------------------------------------------------------
@@ -468,7 +470,7 @@ main() {
   for pkg in $SELECTED; do
     install_one "$pkg"
   done
-  # The server ships the on-PATH call helpers (aura-call / aura-call-status).
+  # The server ships the on-PATH call helpers (aura-call / aura-call-status / aura-inbox).
   [ "$WANT_SERVER" -eq 1 ] && install_helpers
 
   ensure_on_path
@@ -482,6 +484,7 @@ main() {
   if [ "$WANT_SERVER" -eq 1 ]; then
     printf '      %s\n' "$BIN_DIR/aura-call"
     printf '      %s\n' "$BIN_DIR/aura-call-status"
+    printf '      %s\n' "$BIN_DIR/aura-inbox"
   fi
   echo
 
@@ -505,9 +508,9 @@ ${C_BOLD}NEXT — do not stop here.${C_RESET} The binaries + call helpers are in
       * store the xAI key (BYOK)                         — onboarding step 3
       * (REMOTE only) open the one UDP port, once        — onboarding step 4
       * drop the host skill (skills/SKILL.md) in place   — onboarding step 5
-  The aura-call / aura-call-status helpers are already on your PATH (the skill
-  uses them). The host/AI launches aura-server per call; it needs XAI_API_KEY in
-  its environment (or the OS keychain, or a ./.env in its working dir).
+  The aura-call / aura-call-status / aura-inbox helpers are already on your PATH
+  (the skill uses them). The host/AI launches aura-server per call; it needs
+  XAI_API_KEY in its environment (or the OS keychain, or a ./.env in its working dir).
       ${ONBOARDING_URL}
 EOF
     echo

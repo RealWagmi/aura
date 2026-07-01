@@ -41,8 +41,12 @@ use aura_voice::{
 };
 
 pub mod barge_in;
+pub mod inbox;
+pub mod orchestrator;
 
 use barge_in::speech_started_decision;
+use inbox::Inbox;
+use orchestrator::{OrchestratedRuntime, OrchestratorConfig};
 
 /// The tool that lets the model hang the call up by voice (no dispatch).
 const END_VOICE_SESSION_TOOL: &str = "end_voice_session";
@@ -260,7 +264,23 @@ impl CallSession {
         // In-call dispatch: the model's tool calls route through the
         // `ToolRouter` voice-approval boundary to the host, which executes with
         // full repo + tool access; results are spoken back.
-        let agent: Arc<dyn AgentRuntime> = host.clone();
+        //
+        // Scheme 2: wrap the host runtime in the orchestrator decorator, which
+        // routes dispatch through the `.aura/inbox/` coordination layer to the
+        // LIVE host chat session (if its watch-loop is running) and only falls
+        // back to a direct spawn otherwise. The wrap is a no-op — a single
+        // heartbeat stat per dispatch — when no orchestrator loop is live, so it
+        // is always safe to apply; the inbox roots at cwd like `.aura/call-status.json`.
+        let raw_agent: Arc<dyn AgentRuntime> = host.clone();
+        let agent: Arc<dyn AgentRuntime> = match Inbox::open(std::path::Path::new(".")) {
+            Ok(inbox) => Arc::new(OrchestratedRuntime::new(
+                raw_agent,
+                inbox,
+                OrchestratorConfig::default(),
+            )),
+            // Can't create the inbox dir → dispatch directly (unchanged behaviour).
+            Err(_) => raw_agent,
+        };
         let router = Arc::new(ToolRouter::with_safety(
             agent,
             CallbackMode::SpeakImmediately,

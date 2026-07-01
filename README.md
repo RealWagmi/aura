@@ -4,6 +4,85 @@ Voice calls for AI chats: type "call me" in a chat with an AI agent and get a re
 
 The voice is a realtime audio-native model (xAI Grok voice): **direct audio, no STT/TTS** — your speech goes to the model and the model's voice comes back, with no speech-to-text in between. There is **no intermediary broker** — the AI's own server is the call endpoint. Audio rides a single **Noise (NNpsk0) tunnel over UDP**: the per-call session secret is the pre-shared key, so the link is mutually authenticated and forward-secret with no certificates, no domain, and no firewall punching beyond one UDP port. A call runs in one of two modes. **LOCAL** — the server runs on `127.0.0.1` on the same machine as the client, mic and model on one device. **REMOTE** — the AI server runs on a VPS and a thin client on your machine connects to it over the tunnel. Two binaries: `aura-cli` (the thin client: mic/speaker only, holds no key) and `aura-server` (the server the AI launches: holds the key, the engine, the chat context, and the tools). All-Rust, cross-platform (Linux / macOS / Windows).
 
+## Connection Schemes
+
+How audio flows in each mode. In every case the only content egress is the xAI
+Grok voice model, and the media path has no intermediary broker; the tunnel is
+**Noise (NNpsk0) over UDP** with the per-call session secret as the pre-shared
+key.
+
+### 1. Local call
+
+Client and server on the same machine. The server binds `127.0.0.1`, so the
+tunnel never leaves the box — your mic and the model are one loopback hop apart.
+
+```mermaid
+flowchart LR
+    Mic["Mic / Speaker"] <--> CLI["aura-cli (thin client)"]
+    CLI <-->|"Noise NNpsk0 over UDP (loopback)"| SRV["aura-server (key + engine + context)"]
+    SRV <-->|"realtime audio, TLS"| XAI["xAI Grok voice"]
+```
+
+### 2. Remote call to a VPS server
+
+The server runs on a VPS; a thin client on your machine dials it over one open
+UDP port. The client holds no key — only your mic and speaker.
+
+```mermaid
+flowchart LR
+    subgraph you["Your machine"]
+        Mic["Mic / Speaker"] <--> CLI["aura-cli (no key)"]
+    end
+    subgraph vps["VPS"]
+        SRV["aura-server (key + engine + context)"]
+    end
+    CLI <-->|"Noise NNpsk0 over UDP"| SRV
+    SRV <-->|"realtime audio, TLS"| XAI["xAI Grok voice"]
+```
+
+### 3. Remote call when the server is behind NAT/CGNAT (iroh)
+
+When the server has no openable port, `AURA_TRANSPORT=iroh` switches the
+transport to an iroh QUIC P2P link (hole-punching, with a blind encrypted relay
+as fallback). **Noise NNpsk0 still runs _inside_ the iroh stream**, so the relay
+only ever sees ciphertext and is used for fallback only.
+
+```mermaid
+flowchart LR
+    CLI["aura-cli"] <-->|"iroh QUIC P2P (hole-punch)"| SRV["aura-server (behind NAT)"]
+    CLI -. "blind relay: ciphertext only, fallback" .-> Relay["iroh relay"]
+    Relay -.-> SRV
+    SRV <-->|"realtime audio, TLS"| XAI["xAI Grok voice"]
+```
+
+### 4. Overall architecture
+
+The launching chat is the server's identity: the host agent starts `aura-server`
+(holding your xAI key, the engine, the chat Brief, and the tools), which mints a
+single-use session secret and prints a connection string. The secret travels
+over the same chat/gateway you already use; the client connects with it and the
+server bridges audio to the model. When the call ends, a post-call summary is
+delivered back into the chat.
+
+```mermaid
+sequenceDiagram
+    participant U as You (chat)
+    participant Host as Host agent (Claude / Codex / ...)
+    participant SRV as aura-server
+    participant CLI as aura-cli
+    participant XAI as xAI Grok voice
+    U->>Host: "call me"
+    Host->>SRV: launch (key + engine + Brief + tools)
+    SRV->>SRV: mint session secret + connection string
+    SRV-->>U: connection string (over the chat)
+    U->>CLI: AURA_CONNECT=... aura-cli
+    CLI->>SRV: Noise NNpsk0 tunnel (audio)
+    SRV->>XAI: realtime audio (no STT/TTS)
+    XAI-->>SRV: model voice
+    SRV-->>CLI: audio out
+    Note over Host,SRV: in-call tasks dispatched to host; post-call recap to chat
+```
+
 ## Install the client
 
 You only ever build **`aura-cli`** on your own machine — it is the thin client with your mic and speaker. It holds no API key, no engine, and no chat context. There are no prebuilt binaries; you build from source.

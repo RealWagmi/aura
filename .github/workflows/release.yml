@@ -67,10 +67,11 @@ jobs:
           cp "$bin/aura-cli" "$bin/aura-server" "$stage/"
           cp scripts/launch-call.sh    "$stage/aura-call"
           cp scripts/call-status.sh    "$stage/aura-call-status"
+          cp scripts/inbox.sh          "$stage/aura-inbox"
           cp scripts/aura-open-port.sh "$stage/aura-open-port"
           cp skills/SKILL.md           "$stage/SKILL.md"
           chmod +x "$stage/aura-cli" "$stage/aura-server" \
-                   "$stage/aura-call" "$stage/aura-call-status" "$stage/aura-open-port"
+                   "$stage/aura-call" "$stage/aura-call-status" "$stage/aura-inbox" "$stage/aura-open-port"
           # Flat archive (files at the top level; no wrapping dir).
           tar -czf "$stage.tar.gz" -C "$stage" .
           # Bare-hash sidecar (portable; install_bin.sh compares it directly).

@@ -41,6 +41,17 @@ const CODEX_AGENT_VALUE: &str = "codex";
 const OPENCLAW_SESSION_VAR: &str = "OPENCLAW_SESSION_KEY";
 /// OpenClaw account identity (identity-env.js) — the other half.
 const OPENCLAW_ACCOUNT_VAR: &str = "OPENCLAW_ACCOUNT_ID";
+/// Optional pin for the in-call dispatch model (`dispatch_model`): Claude →
+/// `claude -p --model`, Codex → app-server `params.model`. When UNSET, Claude
+/// auto-matches the live chat session's model (from the transcript); Codex does
+/// NOT auto-match (it runs on the app-server default), so this env is the only
+/// way to control the Codex dispatch model. The server is env-driven (no config
+/// file is loaded), so this env is how the otherwise-dormant
+/// `ClaudeConfig::dispatch_model` field is populated at runtime.
+const DISPATCH_MODEL_VAR: &str = "AURA_DISPATCH_MODEL";
+/// Default `codex` app-server binary (mirrors `CodexAdapter::new`), so a
+/// dispatch-model pin can be applied without changing the binary.
+const CODEX_DEFAULT_BIN: &str = "codex";
 
 /// Parse an `AURA_HOST` override value into a [`HostKind`]. Returns `None` for
 /// an unset/blank/unrecognized value (the caller then falls through to the
@@ -84,9 +95,22 @@ fn resolve_kind(
 /// already dispatch-ready. `HostKind::Other` falls back to Claude.
 pub fn build_host(kind: HostKind, cwd: impl Into<PathBuf>) -> Arc<dyn HostAdapter> {
     let cwd = cwd.into();
+    // Optional dispatch-model pin (`AURA_DISPATCH_MODEL`). Empty/whitespace is
+    // treated as unset. Meaningful only for the hosts with a per-call model knob
+    // (Claude, Codex); OpenClaw runs the consult in its live session (its own
+    // model) and Hermes bakes the model into its worker command, so both ignore it.
+    let dispatch_model = std::env::var(DISPATCH_MODEL_VAR)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
     match kind {
-        HostKind::Claude | HostKind::Other => Arc::new(ClaudeAdapter::executing(cwd)),
-        HostKind::Codex => Arc::new(CodexAdapter::new(cwd)),
+        HostKind::Claude | HostKind::Other => Arc::new(
+            ClaudeAdapter::executing_with_dispatch_model(cwd, dispatch_model),
+        ),
+        HostKind::Codex => Arc::new(match dispatch_model {
+            Some(model) => CodexAdapter::with_binary_and_model(cwd, CODEX_DEFAULT_BIN, Some(model)),
+            None => CodexAdapter::new(cwd),
+        }),
         HostKind::Hermes => Arc::new(HermesAdapter::new(cwd)),
         HostKind::OpenClaw => Arc::new(OpenClawAdapter::new(cwd)),
     }

@@ -348,6 +348,10 @@ required on the same machine for a LOCAL call.
 
 ```bash
 command -v aura-server && echo "server: OK" || echo "server MISSING — redo step 2"
+# The on-PATH host helpers the skill drives (call + status + the orchestrator inbox):
+for h in aura-call aura-call-status aura-inbox; do
+  command -v "$h" >/dev/null && echo "$h: OK" || echo "$h MISSING — redo step 2"
+done
 # LOCAL only (client lives on the user's machine for REMOTE):
 command -v aura-cli && echo "client present (LOCAL ready)" || echo "client not here (expected for REMOTE)"
 ```
@@ -379,7 +383,7 @@ reachability from inside the VM. Remind the user that step 4 must be complete on
 **✅ Self-check — do NOT report "done" until every box is checked:**
 
 - [ ] `aura-server` is on `PATH` (6a) — and `aura-cli` too if this is a LOCAL host
-- [ ] `aura-call` and `aura-call-status` are on `PATH` (Step 2)
+- [ ] `aura-call`, `aura-call-status`, and `aura-inbox` are on `PATH` (Step 2)
 - [ ] the `XAI_API_KEY` resolves — the server reaches the connection-string line (6b)
 - [ ] (REMOTE) UDP 47821 was opened once — OS firewall **and** cloud SG / NAT (Step 4)
 - [ ] `skills/SKILL.md` was copied into your skills directory (Step 5)
@@ -425,6 +429,21 @@ seconds** — if it expires, just start another call. After the call ends, the
 server posts a short recap of the conversation back into the chat through the
 host callback (for Claude this is a file under `.aura/` in the repo that the
 skill reads and summarizes).
+
+### Optional server knobs (environment)
+
+The server is env-driven (no config file is loaded); the skill launches it and
+`aura-call` passes the environment through. All optional:
+
+- `AURA_DISPATCH_MODEL=<model>` — pin the in-call dispatch model for delegated
+  work. By default **Claude** auto-matches the dispatched sub-agent to the live
+  chat session's model (read from the transcript); **Codex** does NOT auto-match —
+  without a pin it runs on the app-server's default model. Set this to force a
+  specific model on either, e.g. `AURA_DISPATCH_MODEL=claude-opus-4-8`. Only Claude
+  and Codex have a per-call model knob; OpenClaw/Hermes ignore it.
+- `AURA_PORT` / `AURA_PUBLIC_HOST` / `AURA_TRANSPORT=iroh` — UDP port, the public
+  host clients dial, and the optional P2P transport (all covered above).
+- `AURA_FEEDER=1` — opt in to the live ambient-context feeder (needs `claude` on `PATH`).
 
 ---
 

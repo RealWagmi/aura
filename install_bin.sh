@@ -8,7 +8,7 @@
 # compile:
 #   * aura-cli    — the thin client (mic/speaker).
 #   * aura-server — the server the host/AI launches.
-#   * aura-call / aura-call-status / aura-open-port — the on-PATH host helpers.
+#   * aura-call / aura-call-status / aura-inbox / aura-open-port — on-PATH host helpers.
 #   * SKILL.md    — the universal host skill (to ~/.local/share/aura/).
 #
 # Windows is NOT covered here — build it from source with install.ps1. If no
@@ -138,7 +138,7 @@ source_fallback() {
 # --------------------------------------------------------------------------
 
 ITEMS_CLIENT="aura-cli"
-ITEMS_SERVER="aura-server aura-call aura-call-status aura-open-port"
+ITEMS_SERVER="aura-server aura-call aura-call-status aura-inbox aura-open-port"
 
 if [ "$DO_UNINSTALL" -eq 1 ]; then
   info "Uninstalling aura from $BIN_DIR"
@@ -260,6 +260,7 @@ main() {
     install_file aura-server
     install_file aura-call
     install_file aura-call-status
+    install_file aura-inbox
     install_file aura-open-port
     mkdir -p "$SHARE_DIR"
     cp -f "$TMP/x/SKILL.md" "$SHARE_DIR/SKILL.md"
@@ -288,7 +289,7 @@ ${C_BOLD}NEXT — do not stop here.${C_RESET} The binaries + helpers are install
       * (REMOTE only) open the one UDP port, once (run: aura-open-port)
       * drop the host skill: cp $SHARE_DIR/SKILL.md into your skills dir
       * run the self-check
-  The aura-call / aura-call-status helpers are on your PATH.
+  The aura-call / aura-call-status / aura-inbox helpers are on your PATH.
       ${ONBOARDING_URL}
 EOF
     echo
