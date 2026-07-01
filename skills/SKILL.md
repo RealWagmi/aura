@@ -182,6 +182,7 @@ and Codex have a per-call model knob; OpenClaw/Hermes ignore it.
 | no `aura-cli` (user side) | `install.sh --client` (Linux needs ALSA dev headers; macOS/Windows none) |
 | no `aura-server` / `aura-call` / `aura-inbox` | `install.sh --server` (needs no audio package; installs all three helpers) |
 | `XAI_API_KEY` not found | the server exits with a clear error → ask the user for their xAI key |
+| Step 4 loop stalls — `aura-inbox`/edits/dispatch hang, dispatches all cold-fallback | your framework is prompting for tool approval the user can't give mid-call. Set it to **auto-approve** the orchestrator's tool calls (Claude: allow `Bash(aura-inbox*)` / `--permission-mode acceptEdits`; Hermes: `hermes config set approvals.cron_mode approve`; OpenClaw: `openclaw config set tools.exec.ask off`) — one-time, see onboarding Step 5b. |
 | REMOTE launch fails: `Address already in use` | LOCAL self-heals (the server reaps a stale server or hops to a free port). On a VPS it reaps a stale `aura-server` but **cannot hop** (the firewall is opened for one port). If it still fails, kill whatever holds the port — `kill <pid>` from `.aura/call-status.json`, else `ss -lunp \| grep <port>` to find it — then relaunch on the **same** port. Use `pkill -x aura-server`, never `pkill -f <path>` (that also matches your own shell and kills it). |
 
 Full server setup (build, key, the one-time firewall, installing this skill) is in **`docs/ONBOARDING.md`**.

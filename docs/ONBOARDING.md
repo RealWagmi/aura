@@ -23,8 +23,9 @@ You are the AI setting up the server. Read this whole file first, then execute:
 4. **Get the `XAI_API_KEY`** — the ONE time you stop and ask the user → Step 3
 5. **(REMOTE only) Open the one UDP port, once** (`scripts/aura-open-port.sh`); LOCAL → skip → Step 4
 6. **Copy the skill** `skills/SKILL.md` into your framework's skills dir (`mkdir -p` first) → Step 5
-7. **Self-check** — verify binaries, key, port, skill BEFORE you report done → Step 6
-8. **Tell the user how to start a call** → Step 7
+7. **Set your framework to auto-approve** the orchestrator's tool calls + raise the turn/timeout budget → Step 5b
+8. **Self-check** — verify binaries, key, port, skill, framework prep BEFORE you report done → Step 6
+9. **Tell the user how to start a call** → Step 7
 
 ## 🚫 Common mistakes — DO NOT do these
 
@@ -320,12 +321,12 @@ For another runtime, substitute its skills directory — e.g.
 `~/.codex/skills/aura/`, `~/.hermes/skills/aura/`, `~/.openclaw/skills/aura/`, or
 wherever your host scans. The file you copy is the same in every case.
 
-The `aura-call` and `aura-call-status` helpers the skill uses are **already on
-your `PATH`** — `install.sh` installed them next to `aura-server` in step 2 (the
-server install ships them; a client-only install does not). Confirm:
+The `aura-call`, `aura-call-status`, and `aura-inbox` helpers the skill uses are
+**already on your `PATH`** — `install.sh` installed them next to `aura-server` in
+step 2 (the server install ships them; a client-only install does not). Confirm:
 
 ```bash
-command -v aura-call && command -v aura-call-status && echo "helpers on PATH: OK"
+command -v aura-call && command -v aura-call-status && command -v aura-inbox && echo "helpers on PATH: OK"
 ```
 
 Reload your host (e.g. restart Claude Code) so it picks up the new skill. The
@@ -334,6 +335,57 @@ host launch `aura-server` (via `aura-call --host <kind>`) and relay the connecti
 string. The server resolves the host adapter automatically where it can — Claude
 is the default; Codex and OpenClaw also auto-resolve from their own launch env;
 Hermes needs `--host hermes`, which `aura-call` passes for you.
+
+---
+
+## Step 5b — Let the orchestrator run unattended (auto-approve + budget)
+
+During a call the **user is on the voice line, not watching the chat**. So the
+host session that orchestrates the call — the skill's Step 4 `aura-inbox`
+watch-loop, plus any edits/bash and delegated sub-agents — must run its tool calls
+**without blocking on an approval prompt**, and the session must be allowed to run
+long enough for a whole call. If tool calls need manual approval, the loop
+silently freezes on a confirmation nobody can give mid-call, and every dispatch
+falls back to a cold worker. Configure your framework **once**:
+
+**1. Auto-approve the orchestrator's tool calls.**
+
+- **Claude Code** — aura already runs the dispatched `claude -p` sub-agent in
+  `acceptEdits`; additionally allow the on-PATH helpers for the live session
+  (permit `Bash(aura-inbox*)`, `Bash(aura-call*)`, `Bash(aura-call-status*)`, or
+  run the orchestrating session with `--permission-mode acceptEdits`).
+- **Codex** — set the approval policy so the loop's commands don't block, e.g.
+  `--dangerously-bypass-approvals-and-sandbox` (or the equivalent `approval_policy`
+  setting). *Verify the exact knob for your Codex version.*
+- **Hermes** — the dispatch runs as an unattended worker (`delegate_task`), so
+  auto-approve its commands:
+  ```
+  hermes config set approvals.cron_mode approve
+  ```
+- **OpenClaw** — auto-approve exec so the consult is not gated:
+  ```
+  openclaw config set tools.exec.security full
+  openclaw config set tools.exec.ask off
+  ```
+
+**2. Raise the time / turn budget** so a multi-minute call's watch-loop is not
+cut off mid-way.
+
+- **Hermes**:
+  ```
+  hermes config set agent.gateway_timeout 1800
+  hermes config set delegation.child_timeout_seconds 1800
+  hermes config set max_turns 200
+  ```
+- **Claude Code / Codex / OpenClaw** — make sure the session/turn cap and any
+  sub-agent timeout are high enough for a full call (no single command; raise
+  whatever limit your runtime enforces).
+
+> The **Hermes** and **OpenClaw** commands above are the proven settings from the
+> heyarp Hermes/OpenClaw setup, and map to aura's dispatch (Hermes = an unattended
+> `delegate_task` worker; OpenClaw = a gateway consult). aura's Hermes/OpenClaw
+> paths are not yet live-verified, so confirm the exact config keys against your
+> installed framework version. Claude Code is the live-verified default.
 
 ---
 
@@ -387,6 +439,7 @@ reachability from inside the VM. Remind the user that step 4 must be complete on
 - [ ] the `XAI_API_KEY` resolves — the server reaches the connection-string line (6b)
 - [ ] (REMOTE) UDP 47821 was opened once — OS firewall **and** cloud SG / NAT (Step 4)
 - [ ] `skills/SKILL.md` was copied into your skills directory (Step 5)
+- [ ] your framework is set to **auto-approve** the orchestrator's tool calls and has a high enough turn/timeout budget for a full call (Step 5b)
 - [ ] you did NOT re-ask the user beyond the key (and at most the one mode question), and did NOT stop at the build
 
 Any unchecked box → go back to that step and fix it. Only when **all** boxes are
