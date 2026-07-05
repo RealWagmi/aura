@@ -69,13 +69,19 @@ async fn main() {
         // host chat session's side of the in-call dispatch inbox — a short-lived
         // subcommand that must NOT stand up a call.
         Some("inbox") => std::process::exit(run_inbox_cli(&args[2..]).await),
-        // Any other flag is a mistake — do NOT fall through to launching a call.
-        Some(other) if other.starts_with('-') => {
-            eprintln!("aura-server: unknown option {other:?}; try `aura-server --help`.");
+        // No args → normal launch (configured entirely via env vars).
+        None => {}
+        // ANY other argument — a stray flag OR a positional typo (e.g. `inbxo`) —
+        // is a mistake. Do NOT fall through to launching a call: a booted server
+        // would clobber a live call's `call-status.json` and could reap it. The
+        // server takes no positional arguments; the only subcommand is `inbox`.
+        Some(other) => {
+            eprintln!(
+                "aura-server: unrecognized argument {other:?}; the server takes no positional \
+                 arguments (only the `inbox` subcommand). Try `aura-server --help`."
+            );
             std::process::exit(2);
         }
-        // No args → normal launch (configured entirely via env vars).
-        _ => {}
     }
     if let Err(err) = run().await {
         eprintln!("aura-server: {err}");
@@ -142,10 +148,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let call_id = mint_call_id();
     let secret = SessionSecret::generate()?;
-    // Capture the PREVIOUS call's server pid BEFORE we overwrite call-status.json
-    // below — otherwise the busy-port self-heal would read our own just-written
-    // pid and reap ourselves. This is the pid of a possibly-stale predecessor.
-    let stale_pid = read_stale_server_pid(&cwd);
     write_status("ringing", &call_id, None);
 
     // Transport selection. Default `direct` = Noise/UDP (needs a
@@ -197,7 +199,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 "0.0.0.0"
             };
-            bind_direct_udp(bind_ip, port, is_loopback_host(&public_host), stale_pid).await?
+            bind_direct_udp(bind_ip, port, is_loopback_host(&public_host)).await?
         };
         let local = server.local_addr()?;
         let authority = format!("{public_host}:{}", local.port());
@@ -254,6 +256,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 ///   * `stall <id> <speech...>` — report a task abandoned (aura then dispatches it directly).
 ///   * `alive`                  — refresh the heartbeat once (arm the orchestrator at call start).
 async fn run_inbox_cli(args: &[String]) -> i32 {
+    // Validate the subcommand FIRST — before creating `.aura/inbox/` — so a typo
+    // or `--help` prints usage and exits WITHOUT mutating the filesystem.
+    let sub = args.first().map(String::as_str);
+    match sub {
+        Some("wait" | "done" | "stall" | "alive") => {}
+        Some("-h" | "--help") => {
+            print_inbox_help();
+            return 0;
+        }
+        other => {
+            eprintln!(
+                "aura-server inbox: unknown subcommand {other:?}; expected wait|done|stall|alive"
+            );
+            return 2;
+        }
+    }
     let inbox = match Inbox::open(std::path::Path::new(".")) {
         Ok(inbox) => inbox,
         Err(e) => {
@@ -261,40 +279,76 @@ async fn run_inbox_cli(args: &[String]) -> i32 {
             return 1;
         }
     };
-    match args.first().map(String::as_str) {
+    match sub {
         Some("wait") => inbox_wait(&inbox, &args[1..]).await,
         Some("done") => inbox_terminal(&inbox, &args[1..], false),
         Some("stall") => inbox_terminal(&inbox, &args[1..], true),
         Some("alive") => match inbox.touch_heartbeat() {
-            Ok(()) => 0,
+            Ok(()) => {
+                // Print the ABSOLUTE inbox dir the loop is arming: it MUST match
+                // the directory the running call server posts to (the same cwd),
+                // so an operator can spot a cwd mismatch instead of silent no-ops.
+                let shown = std::fs::canonicalize(inbox.dir())
+                    .unwrap_or_else(|_| inbox.dir().to_path_buf());
+                println!("ALIVE {}", shown.display());
+                0
+            }
             Err(e) => {
                 eprintln!("aura-server inbox alive: {e}");
                 1
             }
         },
-        other => {
-            eprintln!(
-                "aura-server inbox: unknown subcommand {other:?}; expected wait|done|stall|alive"
-            );
-            2
-        }
+        // Unreachable: the subcommand was validated above.
+        _ => 2,
     }
+}
+
+/// Usage for the `inbox` subcommand family (the orchestrator's watch-loop side).
+fn print_inbox_help() {
+    println!(
+        "aura-server inbox <cmd> — the live orchestrator's side of the in-call dispatch inbox.\n\n\
+         Subcommands:\n  \
+         wait [--timeout SECS]   block until a task is pending (claiming it), refreshing the\n                          \
+         heartbeat each tick; prints the task, or NO_TASK on timeout (default 30s)\n  \
+         done <id> <speech...>   report a task finished (spoken back into the call)\n  \
+         stall <id> <speech...>  report a task abandoned (aura then dispatches it directly)\n  \
+         alive                   refresh the heartbeat once and print the inbox directory"
+    );
 }
 
 /// Block until a task is pending (claiming it), refreshing the heartbeat each
 /// tick, or until `--timeout SECS` elapses. Prints the claimed task, else `NO_TASK`.
 async fn inbox_wait(inbox: &Inbox, args: &[String]) -> i32 {
-    let timeout_secs = parse_timeout_secs(args).unwrap_or(30);
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.max(1));
+    /// Cap the wait so an absurd `--timeout` (e.g. `u64::MAX`) cannot overflow
+    /// `Instant + Duration` (a panic) and no single `wait` blocks the loop for
+    /// more than an hour — well beyond any live call.
+    const MAX_WAIT_SECS: u64 = 3600;
+    let timeout_secs = parse_timeout_secs(args)
+        .unwrap_or(30)
+        .clamp(1, MAX_WAIT_SECS);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         // Declare/refresh liveness so the running call server routes to us.
         let _ = inbox.touch_heartbeat();
-        if let Some(task) = inbox.pending_tasks().into_iter().next() {
-            if let Err(e) = inbox.claim(&task.id) {
-                eprintln!("aura-server inbox wait: claim failed ({e})");
-                return 1;
+        let mut claimed = None;
+        for task in inbox.pending_tasks() {
+            match inbox.claim(&task.id) {
+                // Won the O_EXCL arbiter — this task is ours to execute.
+                Ok(true) => {
+                    claimed = Some(task);
+                    break;
+                }
+                // Lost the race: aura recovered it (or another waiter took it)
+                // between our pending read and the claim. Executing it anyway
+                // would be a double execution — try the next pending task.
+                Ok(false) => continue,
+                Err(e) => {
+                    eprintln!("aura-server inbox wait: claim failed ({e})");
+                    return 1;
+                }
             }
+        }
+        if let Some(task) = claimed {
             print_inbox_task(&task);
             return 0;
         }
@@ -308,15 +362,36 @@ async fn inbox_wait(inbox: &Inbox, args: &[String]) -> i32 {
 
 /// Print a claimed task in a format the orchestrator can act on (and that keeps
 /// the id on its own line for the follow-up `done`/`stall` call).
+///
+/// Every field is flattened to a single physical line: an embedded newline in a
+/// task field would otherwise forge extra `TASK`/`INTENT:`/`DONE` lines in the
+/// orchestrator's stdout parse (a protocol-injection → wrong-`DONE` / stalled
+/// call). The fields are already `redact_secrets`'d upstream; this closes the
+/// structural (newline) channel.
 fn print_inbox_task(task: &InboxTask) {
-    println!("TASK {}", task.id);
-    println!("INTENT: {}", task.user_intent);
+    println!("TASK {}", one_line(&task.id));
+    println!("INTENT: {}", one_line(&task.user_intent));
     if !task.constraints.is_empty() {
-        println!("CONSTRAINTS: {}", task.constraints.join(" | "));
+        let joined = task
+            .constraints
+            .iter()
+            .map(|c| one_line(c))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        println!("CONSTRAINTS: {joined}");
     }
     if !task.project.is_empty() {
-        println!("PROJECT: {}", task.project);
+        println!("PROJECT: {}", one_line(&task.project));
     }
+}
+
+/// Collapse any newline/carriage-return (and other ASCII control chars) in a task
+/// field to a single space, so a field can never inject a forged protocol line
+/// into the orchestrator's line-oriented stdout parse.
+fn one_line(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 /// `done <id> <speech...>` / `stall <id> <speech...>`. The speech is
@@ -358,24 +433,27 @@ fn parse_timeout_secs(args: &[String]) -> Option<u64> {
 }
 
 /// Bind the direct UDP tunnel socket, self-healing a busy port at startup so
-/// neither the operator nor the launching AI ever has to clear it by hand:
-///   1. try the requested `port`;
-///   2. on `AddrInUse`, best-effort reap a stale `aura-server` we ourselves
-///      recorded holding it (`.aura/call-status.json` pid), then retry the SAME
-///      port — preferred, as it keeps the firewall-opened / default port;
-///   3. still busy AND `allow_hop` (loopback only) → hop to the next free port
-///      (`port+1`, `port+2`, …). The connection string carries the actually-bound
-///      port, so the client always dials the right one.
+/// neither the operator nor the launching AI ever has to clear it by hand. The
+/// two modes are deliberately asymmetric:
 ///
-/// Hopping is loopback-only on purpose: a REMOTE VPS has the firewall opened for
-/// exactly ONE port, so hopping would make the server unreachable — there it
-/// fails with a clear, actionable error instead. (The iroh transport has no
-/// fixed-port constraint and never reaches this path.)
+/// * **Loopback (`allow_hop = true`, LOCAL):** on a busy port, HOP to the next
+///   free port (`port+1`, `port+2`, …). The connection string carries the
+///   actually-bound port, so the client always dials the right one. A loopback
+///   server NEVER reaps: hopping is free and always available, so killing a
+///   process would be gratuitous — and it removes every "racing launchers
+///   SIGTERM each other" / "kill a live local call" hazard.
+/// * **REMOTE (`allow_hop = false`):** the firewall is opened for exactly ONE
+///   port, so hopping would make the server unreachable. Only here do we reclaim
+///   the port, and ONLY from a process `lsof` PROVES is currently holding it AND
+///   [`pid_is_aura_server`] positively confirms is an `aura-server` (never our
+///   own pid). A pid we cannot prove holds the port is never signalled. If the
+///   port can't be reclaimed, fail with a clear, actionable error.
+///
+/// (The iroh transport has no fixed-port constraint and never reaches this path.)
 async fn bind_direct_udp(
     bind_ip: &str,
     port: u16,
     allow_hop: bool,
-    stale_pid: Option<u32>,
 ) -> Result<TunnelServer, Box<dyn std::error::Error>> {
     use std::io::ErrorKind;
     /// How many consecutive ports to probe when hopping on loopback.
@@ -390,29 +468,7 @@ async fn bind_direct_udp(
         Err(e) => return Err(e.into()),
     }
 
-    // (2) Best-effort reap of a stale predecessor server (its recorded pid, plus
-    // any aura-server lsof finds holding this port), then retry the SAME port.
-    // The reaped predecessor releases its socket during kernel teardown — usually
-    // sub-10ms, but scheduling latency is nondeterministic and UDP has no
-    // SO_REUSEADDR here — so retry a few times over a short bounded window rather
-    // than a single shot. This matters most on REMOTE, where there is no hop
-    // fallback: the fixed firewall port must come back.
-    if reap_stale_server(stale_pid, Some(port)).await {
-        const REBIND_ATTEMPTS: u32 = 5;
-        for attempt in 1..=REBIND_ATTEMPTS {
-            tokio::time::sleep(std::time::Duration::from_millis(200 * attempt as u64)).await;
-            match TunnelServer::bind(&format!("{bind_ip}:{port}")).await {
-                Ok(server) => {
-                    eprintln!("aura-server: reaped a stale server; rebound port {port}.");
-                    return Ok(server);
-                }
-                Err(TunnelError::Io(e)) if e.kind() == ErrorKind::AddrInUse => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-    }
-
-    // (3) Loopback → hop to the next free port.
+    // (2) Loopback → hop to the next free port. No process is ever reaped here.
     if allow_hop {
         let last = port.saturating_add(MAX_HOPS);
         for candidate in port.saturating_add(1)..=last {
@@ -430,35 +486,43 @@ async fn bind_direct_udp(
         return Err(format!("no free UDP port found in {port}..={last} on {bind_ip}").into());
     }
 
+    // (3) REMOTE → reclaim the fixed port from a PROVEN aura-server holder, then
+    // retry the SAME port. The reaped holder releases its socket during kernel
+    // teardown — usually sub-10ms, but scheduling latency is nondeterministic and
+    // UDP has no SO_REUSEADDR here — so retry a few times over a short bounded
+    // window rather than a single shot.
+    if reap_port_holder(port).await {
+        const REBIND_ATTEMPTS: u32 = 5;
+        for attempt in 1..=REBIND_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(200 * attempt as u64)).await;
+            match TunnelServer::bind(&format!("{bind_ip}:{port}")).await {
+                Ok(server) => {
+                    eprintln!(
+                        "aura-server: reclaimed the port from a stale server; rebound {port}."
+                    );
+                    return Ok(server);
+                }
+                Err(TunnelError::Io(e)) if e.kind() == ErrorKind::AddrInUse => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
     Err(format!(
-        "UDP port {port} on {bind_ip} is already in use and a stale server could not be reaped. \
-         Free the port: kill the process holding it — the pid in .aura/call-status.json if it is a \
-         stale aura-server, else find it with `ss -lunp | grep {port}` — then relaunch on THIS same \
-         port (the firewall is opened for it; only change AURA_PORT if you also re-open the firewall)."
+        "UDP port {port} on {bind_ip} is already in use and no stale aura-server holding it could \
+         be reclaimed. Find the process holding it with `ss -lunp 'sport = :{port}'` (or \
+         `lsof -iUDP:{port}`) and stop it, then relaunch on THIS same port (the firewall is opened \
+         for it; only change AURA_PORT if you also re-open the firewall)."
     )
     .into())
 }
 
-/// The pid of a possibly-stale predecessor server, read from
-/// `.aura/call-status.json` — but ONLY if that call is in a non-terminal state
-/// (`ringing`/`active`); a terminal state means it already exited, so there is
-/// nothing to reap. Must be called BEFORE the current server overwrites
-/// call-status.json, or it would return our own pid.
-fn read_stale_server_pid(cwd: &std::path::Path) -> Option<u32> {
-    let body = std::fs::read_to_string(cwd.join(".aura").join("call-status.json")).ok()?;
-    let state = json_str_field(&body, "state").unwrap_or_default();
-    if matches!(state.as_str(), "ended" | "failed" | "dropped") {
-        return None;
-    }
-    json_u32_field(&body, "pid")
-}
-
-/// Async wrapper over [`try_reap_stale_server`]: runs the blocking `ps`/`lsof`/
+/// Async wrapper over [`try_reap_port_holder`]: runs the blocking `ps`/`lsof`/
 /// `kill` probing off the runtime and bounds it with a timeout, so a hung
 /// `ps`/`lsof` can never stall server startup. Returns false on timeout/join
-/// error (treated as "did not reap" — the caller then hops / errors).
-async fn reap_stale_server(stale_pid: Option<u32>, busy_port: Option<u16>) -> bool {
-    let work = tokio::task::spawn_blocking(move || try_reap_stale_server(stale_pid, busy_port));
+/// error (treated as "did not reap" — the caller then errors).
+async fn reap_port_holder(busy_port: u16) -> bool {
+    let work = tokio::task::spawn_blocking(move || try_reap_port_holder(busy_port));
     match tokio::time::timeout(std::time::Duration::from_secs(3), work).await {
         Ok(Ok(reaped)) => reaped,
         _ => false,
@@ -553,31 +617,26 @@ fn udp_port_holder_pids(port: u16) -> Vec<u32> {
         .collect()
 }
 
-/// Best-effort: SIGTERM a stale predecessor `aura-server`. Candidates are the
-/// recorded predecessor pid (from [`read_stale_server_pid`]) plus any pid `lsof`
-/// finds holding `busy_port`. **Fail-safe:** never our own pid, and only a pid
-/// that [`pid_is_aura_server`] positively confirms — every uncertainty resolves
-/// to "do nothing". `SIGTERM` only (graceful; no `SIGKILL` escalation — a wedged
-/// predecessor falls through to hop/error, safer than force-killing a possibly
-/// mislabelled process). Returns true only if a kill was issued.
+/// Best-effort: SIGTERM the `aura-server` currently holding `busy_port`.
+/// Candidates come SOLELY from `lsof` (proof the pid actually holds the port);
+/// an unproven recorded pid is never signalled, so we can't kill a live server
+/// that has merely hopped to a different port. **Fail-safe:** never our own pid,
+/// and only a pid that [`pid_is_aura_server`] positively confirms — every
+/// uncertainty resolves to "do nothing". `SIGTERM` only (graceful; no `SIGKILL`
+/// escalation — a wedged holder falls through to the error, safer than
+/// force-killing a possibly mislabelled process). Returns true only if a kill was
+/// issued.
 #[cfg(unix)]
-fn try_reap_stale_server(stale_pid: Option<u32>, busy_port: Option<u16>) -> bool {
+fn try_reap_port_holder(busy_port: u16) -> bool {
     let me = std::process::id();
-    let mut candidates: Vec<u32> = Vec::new();
-    if let Some(pid) = stale_pid {
-        candidates.push(pid);
-    }
-    if let Some(port) = busy_port {
-        candidates.extend(udp_port_holder_pids(port));
-    }
-    for pid in candidates {
+    for pid in udp_port_holder_pids(busy_port) {
         if pid == me {
             continue; // never reap ourselves
         }
         if !pid_is_aura_server(pid) {
             continue; // fail-safe: only a positively-verified aura-server
         }
-        eprintln!("aura-server: reaping stale server pid {pid}.");
+        eprintln!("aura-server: reclaiming port {busy_port} from stale server pid {pid}.");
         let _ = std::process::Command::new("kill")
             .arg("-TERM")
             .arg(pid.to_string())
@@ -588,28 +647,8 @@ fn try_reap_stale_server(stale_pid: Option<u32>, busy_port: Option<u16>) -> bool
 }
 
 #[cfg(not(unix))]
-fn try_reap_stale_server(_stale_pid: Option<u32>, _busy_port: Option<u16>) -> bool {
+fn try_reap_port_holder(_busy_port: u16) -> bool {
     false // Windows: hard no-op (no portable process-name/port introspection here)
-}
-
-/// Read `"key":<digits>` out of the tiny hand-rolled call-status JSON.
-fn json_u32_field(body: &str, key: &str) -> Option<u32> {
-    let needle = format!("\"{key}\":");
-    let start = body.find(&needle)? + needle.len();
-    let rest = body[start..].trim_start();
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    rest.get(..end)?.parse().ok()
-}
-
-/// Read `"key":"<value>"` out of the tiny hand-rolled call-status JSON.
-fn json_str_field(body: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":\"");
-    let start = body.find(&needle)? + needle.len();
-    let rest = &body[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_owned())
 }
 
 /// Best-effort write of the call's lifecycle state to `.aura/call-status.json`
@@ -785,50 +824,49 @@ mod tests {
         assert_eq!(global_config_dir_from(None, None, None), None);
     }
 
-    #[test]
-    fn json_fields_parse_from_call_status() {
-        let body = r#"{"call_id":"call-abc","pid":200424,"state":"active","reason":""}"#;
-        assert_eq!(json_u32_field(body, "pid"), Some(200424));
-        assert_eq!(json_str_field(body, "state").as_deref(), Some("active"));
-        assert_eq!(json_str_field(body, "call_id").as_deref(), Some("call-abc"));
-        // Missing keys and a malformed number degrade to None (never panic).
-        assert_eq!(json_u32_field(body, "nope"), None);
-        assert_eq!(json_str_field(body, "nope"), None);
-        assert_eq!(json_u32_field(r#"{"pid":"x"}"#, "pid"), None);
-    }
-
     #[tokio::test]
     async fn bind_hops_to_a_free_port_on_loopback() {
-        // Occupy a loopback port, then bind_direct_udp on it with hop allowed and
-        // no stale pid: it must land on a DIFFERENT, free port within the range.
+        // Occupy a loopback port, then bind_direct_udp on it with hop allowed: it
+        // must land on a DIFFERENT, free port within the range (never reaping).
         let occupied = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let port = occupied.local_addr().unwrap().port();
-        let server = bind_direct_udp("127.0.0.1", port, true, None)
+        let server = bind_direct_udp("127.0.0.1", port, true)
             .await
             .expect("hops to a free port");
         let got = server.local_addr().unwrap().port();
         assert_ne!(got, port, "must not reuse the occupied port");
-        assert!(got > port && got <= port + 16, "hopped within range: {got}");
+        // `saturating_add` guards the assert itself against overflow when the OS
+        // hands out a port near 65535 (e.g. macOS's high ephemeral range).
+        assert!(
+            got > port && got <= port.saturating_add(16),
+            "hopped within range: {got}"
+        );
     }
 
     #[tokio::test]
     async fn bind_refuses_to_hop_when_not_allowed() {
-        // Same occupied port, but hop disallowed (REMOTE semantics) and no stale
-        // server to reap → it must fail rather than silently move to another port
-        // (which the firewall would not have opened).
+        // Same occupied port, but hop disallowed (REMOTE semantics). The occupier
+        // is THIS test process, so the reaper finds it via lsof yet refuses to
+        // signal our own pid → nothing is reaped and the bind fails, rather than
+        // silently moving to another port (which the firewall would not have opened).
         let occupied = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let port = occupied.local_addr().unwrap().port();
-        let result = bind_direct_udp("127.0.0.1", port, false, None).await;
+        let result = bind_direct_udp("127.0.0.1", port, false).await;
         assert!(result.is_err(), "must not hop when hopping is disallowed");
     }
 
     #[test]
-    fn reap_never_targets_self_or_none() {
-        // The self-reap guard: our own pid (the bug the smoke test caught — the
-        // server overwriting call-status with its own pid then reaping itself)
-        // and an absent pid must both be refused, without touching any process.
-        assert!(!try_reap_stale_server(None, None));
-        assert!(!try_reap_stale_server(Some(std::process::id()), None));
+    fn reap_never_targets_self() {
+        // Hold a UDP port ourselves; the reaper must find us via lsof (where
+        // present) yet refuse to signal our own pid — so it never reaps and
+        // returns false. Guards the exact self-kill bug the live-call smoke test
+        // caught.
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = sock.local_addr().unwrap().port();
+        assert!(
+            !try_reap_port_holder(port),
+            "must never SIGTERM our own process"
+        );
     }
 
     #[test]
@@ -840,29 +878,5 @@ mod tests {
         assert!(!pid_is_aura_server(std::process::id()));
         // A pid that cannot exist is likewise never verified.
         assert!(!pid_is_aura_server(u32::MAX));
-    }
-
-    #[test]
-    fn read_stale_pid_only_for_a_live_predecessor() {
-        let tmp = tempfile::tempdir().unwrap();
-        let aura = tmp.path().join(".aura");
-        std::fs::create_dir_all(&aura).unwrap();
-        let status = aura.join("call-status.json");
-        // A live (ringing/active) predecessor → its pid is returned.
-        std::fs::write(
-            &status,
-            r#"{"call_id":"c","pid":4242,"state":"active","reason":""}"#,
-        )
-        .unwrap();
-        assert_eq!(read_stale_server_pid(tmp.path()), Some(4242));
-        // A terminal predecessor already exited → nothing to reap.
-        std::fs::write(
-            &status,
-            r#"{"call_id":"c","pid":4242,"state":"ended","reason":"HangUp"}"#,
-        )
-        .unwrap();
-        assert_eq!(read_stale_server_pid(tmp.path()), None);
-        // No file at all → None.
-        assert_eq!(read_stale_server_pid(&tmp.path().join("nope")), None);
     }
 }

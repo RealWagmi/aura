@@ -270,16 +270,40 @@ impl CallSession {
         // LIVE host chat session (if its watch-loop is running) and only falls
         // back to a direct spawn otherwise. The wrap is a no-op — a single
         // heartbeat stat per dispatch — when no orchestrator loop is live, so it
-        // is always safe to apply; the inbox roots at cwd like `.aura/call-status.json`.
+        // is always safe to apply.
+        //
+        // The inbox roots at the process cwd, which MUST match the directory the
+        // host's `aura-inbox` watch-loop runs in (the skill's convention) — a
+        // mismatch silently degrades every dispatch to the direct fallback. Log
+        // the ABSOLUTE inbox dir once so an operator can diagnose a cwd mismatch
+        // instead of guessing. `open_for_call` resets the inbox for this fresh
+        // call (see its docs), so a prior call's orphaned task can't resurface.
         let raw_agent: Arc<dyn AgentRuntime> = host.clone();
-        let agent: Arc<dyn AgentRuntime> = match Inbox::open(std::path::Path::new(".")) {
-            Ok(inbox) => Arc::new(OrchestratedRuntime::new(
-                raw_agent,
-                inbox,
-                OrchestratorConfig::default(),
-            )),
+        let agent: Arc<dyn AgentRuntime> = match Inbox::open_for_call(std::path::Path::new(".")) {
+            Ok(inbox) => {
+                // Best-effort absolute path so the log is diagnostic regardless of
+                // the process cwd; fall back to the relative path if canonicalize
+                // fails (e.g. a transient FS error).
+                let shown = std::fs::canonicalize(inbox.dir())
+                    .unwrap_or_else(|_| inbox.dir().to_path_buf());
+                eprintln!(
+                    "aura-engine: in-call dispatch inbox at {} (the host's `aura-inbox` \
+                     watch-loop must run in this directory)",
+                    shown.display()
+                );
+                Arc::new(OrchestratedRuntime::new(
+                    raw_agent,
+                    inbox,
+                    OrchestratorConfig::default(),
+                ))
+            }
             // Can't create the inbox dir → dispatch directly (unchanged behaviour).
-            Err(_) => raw_agent,
+            Err(e) => {
+                eprintln!(
+                    "aura-engine: in-call dispatch inbox unavailable ({e}); dispatching directly"
+                );
+                raw_agent
+            }
         };
         let router = Arc::new(ToolRouter::with_safety(
             agent,
@@ -609,9 +633,36 @@ fn build_callback_result(meta: CallbackMeta, speech: &str) -> TaskResult {
     }
 }
 
+/// Decide whether a dispatch's result should be posted back into the host chat,
+/// from the sanitized `ToolResponse.content` (a serialized `ProviderTaskResult`).
+/// True only for a genuine cold-worker completion: `accepted == true` AND a
+/// task id that is NOT orchestrator-owned (`vt-*`). An orchestrator-owned id was
+/// run by the live chat session itself (no re-post), and a non-accepted handoff
+/// never executed (no phantom post). Missing/garbled fields are treated as
+/// "don't deliver" — fail closed on the redundant/false-post side.
+fn dispatch_ran_in_cold_worker(content: &serde_json::Value) -> bool {
+    let accepted = content
+        .get("accepted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let task_id = content
+        .get("task_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    accepted && !task_id.starts_with("vt-")
+}
+
 /// Best-effort delivery of a finished dispatch back into the host chat. Always
 /// fail-open: a host with no callback sink returns `delivered: false` and a
 /// delivery error is swallowed — neither must disturb the live call.
+///
+/// Delivery is SKIPPED when the work did not actually complete in a cold worker:
+/// * a non-`accepted` handoff (e.g. the orchestrator-busy hand-back) never ran,
+///   so posting it would announce a phantom result; and
+/// * an orchestrator-owned task (`vt-*` task id) was executed by the LIVE chat
+///   session itself, which already holds the result in its own context — posting
+///   it back would be a duplicate. Only a genuine direct-worker completion (a
+///   non-`vt-` id the chat session did NOT run) is delivered.
 fn deliver_chat_callback(
     host: &Arc<dyn HostAdapter>,
     callback: Option<CallbackMeta>,
@@ -620,6 +671,9 @@ fn deliver_chat_callback(
     let (Some(meta), Ok(resp)) = (callback, result) else {
         return;
     };
+    if !dispatch_ran_in_cold_worker(&resp.content) {
+        return;
+    }
     let host = host.clone();
     let task_result = build_callback_result(meta, &resp.speech);
     // Deliver on a detached task: a host sink can be a network WS (OpenClaw) or
@@ -1441,6 +1495,25 @@ mod tests {
         // task_id is opaque, stable per intent, and never empty.
         assert!(result.task_id.starts_with("voice-task-"));
         assert!(result.accepted());
+    }
+
+    #[test]
+    fn only_cold_worker_completions_deliver_to_chat() {
+        // A genuine direct-worker completion (accepted, non-`vt-` id) delivers.
+        assert!(dispatch_ran_in_cold_worker(&serde_json::json!({
+            "task_id": "worker-7", "accepted": true
+        })));
+        // An orchestrator-owned task (`vt-*`) ran in the live chat session already
+        // — do NOT re-post.
+        assert!(!dispatch_ran_in_cold_worker(&serde_json::json!({
+            "task_id": "vt-abc-1-2", "accepted": true
+        })));
+        // A non-accepted handoff (orchestrator-busy) never executed — no phantom post.
+        assert!(!dispatch_ran_in_cold_worker(&serde_json::json!({
+            "task_id": "worker-7", "accepted": false
+        })));
+        // Missing fields fail closed.
+        assert!(!dispatch_ran_in_cold_worker(&serde_json::json!({})));
     }
 
     #[tokio::test]

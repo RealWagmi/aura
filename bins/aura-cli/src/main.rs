@@ -39,12 +39,41 @@ fn handle_cli_flags() -> Option<i32> {
                  never taken from the command line.\n\n\
                  Options:\n  \
                  -V, --version   print the version and exit\n  \
-                 -h, --help      show this help and exit",
+                 -h, --help      show this help and exit\n\n\
+                 Environment:\n  \
+                 AURA_CONNECT    the connection string (aura://HOST:PORT#k=...&c=...)\n  \
+                 AURA_AEC        echo handling on the mic: on (default, AEC3 echo\n                  \
+                 cancellation — speakers + barge-in work), gate (mute mic while\n                  \
+                 the model speaks; no barge-in), off (raw mic; headsets only)",
                 env!("CARGO_PKG_VERSION")
             );
             Some(0)
         }
-        _ => None,
+        // No arguments → proceed to a normal call (connection string from
+        // AURA_CONNECT / stdin).
+        None => None,
+        // Any other argument is a mistake. Most dangerously, a pasted connection
+        // string (with its single-use secret) on argv would ALREADY have leaked to
+        // `ps` and shell history — refuse loudly and point at the safe channels,
+        // rather than silently ignoring it and dialing anyway. The argument is
+        // NEVER echoed back: near-miss pastes (`AURA_CONNECT=aura://…`,
+        // `--connect=aura://…`, a quote-wrapped string) still carry the secret,
+        // and echoing would copy it into stderr/session logs a second time.
+        Some(other) => {
+            if other.contains("aura://") || other.contains("#k=") {
+                eprintln!(
+                    "aura-cli: refusing a connection string on the command line — its single-use \
+                     secret would leak to `ps` and shell history. Pass it via the AURA_CONNECT env \
+                     var, or run `aura-cli` with no arguments and paste it on the first line of stdin."
+                );
+            } else {
+                eprintln!(
+                    "aura-cli: unexpected argument (not shown; it may contain sensitive data); \
+                     aura-cli takes no arguments (see `aura-cli --help`)."
+                );
+            }
+            Some(2)
+        }
     }
 }
 

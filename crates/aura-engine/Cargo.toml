@@ -13,6 +13,11 @@ thiserror.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 
+# Unix-only: `kill(pid, 0)` liveness probe scoping inbox leftovers to their
+# originating (possibly still-live) call — see `inbox::pid_is_alive`.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
 serde_json.workspace = true

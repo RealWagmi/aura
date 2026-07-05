@@ -12,5 +12,6 @@ publish = false
 cpal.workspace = true
 crossbeam-queue.workspace = true
 serde.workspace = true
+sonora.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }

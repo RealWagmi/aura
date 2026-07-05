@@ -233,12 +233,26 @@ fn latest_transcript_model(path: &Path) -> Option<String> {
             .get("message")
             .and_then(|m| m.get("model"))
             .and_then(Value::as_str)
-            .filter(|m| !m.trim().is_empty())
+            .filter(|m| is_plausible_model_id(m))
         {
             model = Some(m.to_owned());
         }
     }
     model
+}
+
+/// Is `s` a plausible model id to pass to `claude -p --model`? Real ids are
+/// short slug-like tokens (`claude-sonnet-4-5`, `gpt-4o`, a date-suffixed
+/// variant). This REJECTS the placeholders that appear in real transcripts —
+/// most importantly `<synthetic>` (Claude Code's marker for synthesized
+/// assistant turns), which is NOT a dispatchable model and would make the worker
+/// fail. Guard: non-empty, no whitespace, no angle brackets, and only the
+/// characters a model slug uses (`[A-Za-z0-9._:-]`).
+fn is_plausible_model_id(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
 }
 
 // --- Adapter -----------------------------------------------------------------
@@ -298,7 +312,18 @@ impl ClaudeAdapter {
             dispatch_model,
             ..ClaudeConfig::default()
         };
-        Self::with_config(cwd, &config)
+        let mut adapter = Self::with_config(cwd, &config);
+        // Pin the developer's chat transcript AS OF call start. Model auto-detect
+        // otherwise re-scans newest-by-mtime on every dispatch — and an in-call
+        // `claude -p` worker writes its OWN transcript, which would then be the
+        // newest, making detection self-referential (the worker's model, not the
+        // developer's). Capturing it once here freezes the reference to the
+        // session that launched the call. (An explicit configured path wins and
+        // is left as-is.)
+        if adapter.transcript_path.is_none() {
+            adapter.transcript_path = adapter.resolve_transcript();
+        }
+        adapter
     }
 
     /// Build with default config for a working directory (transcript is then
@@ -931,6 +956,45 @@ mod tests {
             latest_transcript_model(&path).as_deref(),
             Some("claude-opus-4-8")
         );
+    }
+
+    #[test]
+    fn latest_transcript_model_skips_synthetic_placeholder() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // A real model, then a `<synthetic>` placeholder as the NEWEST assistant
+        // turn. The placeholder must be skipped, keeping the last REAL model —
+        // otherwise `claude -p --model '<synthetic>'` would fail the dispatch.
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"model":"claude-sonnet-5","content":[{{"type":"text","text":"a"}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"model":"<synthetic>","content":[{{"type":"text","text":"b"}}]}}}}"#
+        )
+        .unwrap();
+        f.flush().unwrap();
+        assert_eq!(
+            latest_transcript_model(&path).as_deref(),
+            Some("claude-sonnet-5"),
+            "synthetic placeholder must not be picked as the dispatch model"
+        );
+    }
+
+    #[test]
+    fn plausible_model_id_filters_placeholders() {
+        assert!(is_plausible_model_id("claude-sonnet-5"));
+        assert!(is_plausible_model_id("claude-opus-4-8"));
+        assert!(is_plausible_model_id("gpt-4o-realtime-2025-06-01"));
+        // Placeholders / junk are rejected.
+        assert!(!is_plausible_model_id("<synthetic>"));
+        assert!(!is_plausible_model_id(""));
+        assert!(!is_plausible_model_id("  "));
+        assert!(!is_plausible_model_id("has space"));
     }
 
     #[test]

@@ -151,8 +151,16 @@ if [ "$DO_UNINSTALL" -eq 1 ]; then
   done
   set -u
   if [ "$WANT_SERVER" -eq 1 ] && [ -e "$SHARE_DIR/SKILL.md" ]; then
-    rm -f "$SHARE_DIR/SKILL.md"; rmdir "$SHARE_DIR" 2>/dev/null || true; ok "removed $SHARE_DIR/SKILL.md"
+    rm -f "$SHARE_DIR/SKILL.md"; ok "removed $SHARE_DIR/SKILL.md"
   fi
+  # The third-party license notice must accompany any INSTALLED binary that
+  # statically links the BSD-3-Clause sonora/WebRTC code (aura-cli). Remove it
+  # only when no aura binary remains after this (possibly partial) uninstall.
+  if [ ! -e "$BIN_DIR/aura-cli" ] && [ ! -e "$BIN_DIR/aura-server" ] \
+     && [ -e "$SHARE_DIR/THIRD_PARTY_LICENSES.md" ]; then
+    rm -f "$SHARE_DIR/THIRD_PARTY_LICENSES.md"; ok "removed $SHARE_DIR/THIRD_PARTY_LICENSES.md"
+  fi
+  rmdir "$SHARE_DIR" 2>/dev/null || true
   [ "$removed" -eq 0 ] && note "nothing to remove."
   note "PATH was not modified."
   exit 0
@@ -248,6 +256,14 @@ EOF
 main() {
   [ "$WANT_SERVER" -eq 1 ] && onboarding_banner
 
+  # UPDATE vs fresh install: a previous aura binary in BIN_DIR means this run
+  # replaces an existing install (used for the post-install skill notice).
+  IS_UPDATE=0
+  if [ -e "$BIN_DIR/aura-server" ] || [ -e "$BIN_DIR/aura-cli" ]; then
+    IS_UPDATE=1
+    info "Existing aura install detected in $BIN_DIR — this run is an UPDATE."
+  fi
+
   info "aura binary installer — prefix: $PREFIX, selecting:$([ "$WANT_CLIENT" -eq 1 ] && printf ' aura-cli')$([ "$WANT_SERVER" -eq 1 ] && printf ' aura-server')"
 
   detect_triple
@@ -265,6 +281,14 @@ main() {
     mkdir -p "$SHARE_DIR"
     cp -f "$TMP/x/SKILL.md" "$SHARE_DIR/SKILL.md"
     ok "installed $SHARE_DIR/SKILL.md (the host skill)"
+  fi
+  # Third-party license texts must accompany the installed binaries (a
+  # BSD-3-Clause binary-redistribution condition for the statically linked
+  # sonora / WebRTC audio-processing code). Keep a copy outside $TMP.
+  if [ -e "$TMP/x/THIRD_PARTY_LICENSES.md" ]; then
+    mkdir -p "$SHARE_DIR"
+    cp -f "$TMP/x/THIRD_PARTY_LICENSES.md" "$SHARE_DIR/THIRD_PARTY_LICENSES.md"
+    ok "installed $SHARE_DIR/THIRD_PARTY_LICENSES.md (third-party license notices)"
   fi
 
   ensure_on_path
@@ -293,6 +317,17 @@ ${C_BOLD}NEXT — do not stop here.${C_RESET} The binaries + helpers are install
       ${ONBOARDING_URL}
 EOF
     echo
+    if [ "$IS_UPDATE" -eq 1 ]; then
+      cat <<EOF
+${C_BOLD}${C_YELLOW}UPDATE detected — refresh the host skill.${C_RESET}
+  *** AI AGENT: the skill may have changed in this release, and the copy in
+  YOUR skills directory is NOT updated automatically. Re-copy it NOW: ***
+      cp $SHARE_DIR/SKILL.md ~/.claude/skills/aura/SKILL.md
+  (substitute your framework's skills dir if not Claude Code), then re-read it
+  before the next call. The onboarding config (key, port) needs NO redo.
+EOF
+      echo
+    fi
   fi
   ok "all set."
 }

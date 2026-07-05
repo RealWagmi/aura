@@ -351,9 +351,15 @@ falls back to a cold worker. Configure your framework **once**:
 **1. Auto-approve the orchestrator's tool calls.**
 
 - **Claude Code** — aura already runs the dispatched `claude -p` sub-agent in
-  `acceptEdits`; additionally allow the on-PATH helpers for the live session
-  (permit `Bash(aura-inbox*)`, `Bash(aura-call*)`, `Bash(aura-call-status*)`, or
-  run the orchestrating session with `--permission-mode acceptEdits`).
+  `acceptEdits`; for the live orchestrating session, add Bash **allow-rules** for
+  the on-PATH helpers: `Bash(aura-inbox:*)`, `Bash(aura-call:*)`,
+  `Bash(aura-call-status:*)` (note the `:` before `*` — that is the Claude Code
+  rule syntax; `Bash(aura-inbox*)` does NOT match). Run the session under
+  `--permission-mode acceptEdits` so its file edits don't prompt — but
+  `acceptEdits` does **not** auto-approve Bash, so those allow-rules are required
+  (not an alternative) or `aura-inbox wait` freezes on a prompt nobody can answer
+  mid-call. For a fully unattended loop, `--dangerously-skip-permissions` bypasses
+  all prompts instead.
 - **Codex** — set the approval policy so the loop's commands don't block, e.g.
   `--dangerously-bypass-approvals-and-sandbox` (or the equivalent `approval_policy`
   setting). *Verify the exact knob for your Codex version.*

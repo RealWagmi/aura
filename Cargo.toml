@@ -5,7 +5,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["aura"]
 description = "Voice calls for AI chats — all-Rust, no broker (xAI Grok voice realtime)."
 publish = false
@@ -54,6 +54,14 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # --- audio (LOCAL: aura-audio) ---
 cpal = "0.16"
 crossbeam-queue = "0.3"
+# Pure-Rust WebRTC audio processing (AEC3 echo cancellation + noise
+# suppression) — the client's anti-echo stage, so an open speaker can't make
+# the model barge-in on itself. Git-pinned: the crates.io 0.1.0 release
+# predates the adaptive-FIR shrink panic fix (dec6a07), which is reachable in
+# exactly our live full-duplex use. Zero C/C++ (keeps the pure-Rust base
+# build). BSD-3-Clause — full text in THIRD_PARTY_LICENSES.md (a binary
+# redistribution condition).
+sonora = { git = "https://github.com/dignifiedquire/sonora", rev = "70c673606e1db8442a8ba20659b2bc7355555274" }
 # --- optional audio codec (aura-tunnel `opus` feature; default = raw PCM) ---
 opus = "0.3"
 rubato = "0.16"

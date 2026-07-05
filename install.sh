@@ -437,6 +437,18 @@ ensure_repo() {
   local dest="${AURA_SRC_DIR:-$HOME/aura}"
   if [ -f "$dest/Cargo.toml" ]; then
     info "Using the existing aura checkout at $dest"
+    # Re-running the installer must UPDATE, not silently rebuild the old
+    # checkout. Pull only when it is a clean git clone (never clobber local
+    # edits); on any failure fall back to building the checkout as-is.
+    if [ -d "$dest/.git" ]; then
+      if [ -z "$(git -C "$dest" status --porcelain 2>/dev/null)" ]; then
+        info "Updating the checkout (git pull --ff-only)"
+        git -C "$dest" pull --ff-only \
+          || warn "git pull failed; building the existing checkout as-is."
+      else
+        warn "local changes in $dest — skipping git pull; building the checkout as-is."
+      fi
+    fi
   else
     info "Fetching the aura source into $dest (git clone)"
     git clone --depth 1 "$REPO_URL" "$dest" || die "git clone failed: $REPO_URL"
@@ -456,6 +468,14 @@ main() {
   [ "$WANT_SERVER" -eq 1 ] && onboarding_banner
 
   info "aura installer  - target: $OS, prefix: $PREFIX, selecting:$([ "$WANT_CLIENT" -eq 1 ] && printf ' aura-cli')$([ "$WANT_SERVER" -eq 1 ] && printf ' aura-server')"
+
+  # UPDATE vs fresh install: a previous aura binary in BIN_DIR means this run
+  # replaces an existing install (used for the post-install skill notice).
+  IS_UPDATE=0
+  if [ -e "$BIN_DIR/aura-server" ] || [ -e "$BIN_DIR/aura-cli" ]; then
+    IS_UPDATE=1
+    info "Existing aura install detected in $BIN_DIR — this run is an UPDATE."
+  fi
 
   # Ensure we have the source: an existing checkout, or clone it (curl | bash).
   ensure_repo
@@ -514,6 +534,17 @@ ${C_BOLD}NEXT — do not stop here.${C_RESET} The binaries + call helpers are in
       ${ONBOARDING_URL}
 EOF
     echo
+    if [ "$IS_UPDATE" -eq 1 ]; then
+      cat <<EOF
+${C_BOLD}${C_YELLOW}UPDATE detected — refresh the host skill.${C_RESET}
+  *** AI AGENT: the skill may have changed in this release, and the copy in
+  YOUR skills directory is NOT updated automatically. Re-copy it NOW: ***
+      cp $REPO_ROOT/skills/SKILL.md ~/.claude/skills/aura/SKILL.md
+  (substitute your framework's skills dir if not Claude Code), then re-read it
+  before the next call. The onboarding config (key, port) needs NO redo.
+EOF
+      echo
+    fi
   fi
 
   ok "all set."

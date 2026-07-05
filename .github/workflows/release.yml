@@ -39,6 +39,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Guard: the pushed tag must match [workspace.package] version, or the
+      # published binaries would report a different `--version` than the
+      # release they came from (a silent support headache). Fail fast with the
+      # exact fix. Runs before any toolchain/build cost.
+      - name: Verify tag matches the workspace version
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="$(awk -F'"' '/^\[workspace\.package\]/{s=1} s && /^version *=/{print $2; exit}' Cargo.toml)"
+          tag="${GITHUB_REF_NAME}"
+          if [ "v$ver" != "$tag" ]; then
+            echo "::error::release tag '$tag' does not match [workspace.package] version '$ver' in Cargo.toml." \
+                 " Bump the version in the root Cargo.toml, commit, then re-tag (expected tag: v$ver)."
+            exit 1
+          fi
+          echo "tag $tag matches workspace version $ver"
+
       # aura-cli links libasound (cpal) on Linux — needed to BUILD the client.
       - name: Install ALSA dev headers (Linux)
         if: runner.os == 'Linux'
@@ -70,6 +87,10 @@ jobs:
           cp scripts/inbox.sh          "$stage/aura-inbox"
           cp scripts/aura-open-port.sh "$stage/aura-open-port"
           cp skills/SKILL.md           "$stage/SKILL.md"
+          # Third-party license texts: the BSD-3-Clause components we
+          # statically link (sonora/WebRTC APM) require their notice to
+          # accompany binary redistributions.
+          cp THIRD_PARTY_LICENSES.md   "$stage/THIRD_PARTY_LICENSES.md"
           chmod +x "$stage/aura-cli" "$stage/aura-server" \
                    "$stage/aura-call" "$stage/aura-call-status" "$stage/aura-inbox" "$stage/aura-open-port"
           # Flat archive (files at the top level; no wrapping dir).

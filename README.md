@@ -85,7 +85,7 @@ sequenceDiagram
 
 ## Install the client
 
-You only ever build **`aura-cli`** on your own machine — it is the thin client with your mic and speaker. It holds no API key, no engine, and no chat context. There are no prebuilt binaries; you build from source.
+You only ever install **`aura-cli`** on your own machine — it is the thin client with your mic and speaker. It holds no API key, no engine, and no chat context. Install it the fast way from a prebuilt binary (Linux / macOS), or build it from source (any platform) — both one-liners are below.
 
 You need Rust. If you don't have it, the installer below sets it up via `rustup`; the repo pins Rust 1.92.0 (`rust-toolchain.toml`), which `rustup` selects automatically. To install Rust by hand:
 
@@ -135,7 +135,7 @@ cd aura
 ./install.sh --client
 ```
 
-Run via the `curl | bash` one-liner, `install.sh` first clones the source into `~/aura` (set `AURA_SRC_DIR` to change that); from a clone it builds in place. Either way it builds with `cargo build --release` and installs to `~/.local/bin` (override with `--prefix DIR`). No `sudo` is used. If `~/.local/bin` is not already on your `PATH`, the installer appends it to your shell rc and tells you to restart your shell or `source` it. On Windows use `install.ps1` from PowerShell instead. Re-running the installer is safe — it rebuilds and overwrites. Flags: `--client`, `--server`, `--prefix DIR`, `--uninstall`, `-h/--help`.
+Run via the `curl | bash` one-liner, `install.sh` first clones the source into `~/aura` (set `AURA_SRC_DIR` to change that); from a clone it builds in place. Either way it builds with `cargo build --release` and installs to `~/.local/bin` (override with `--prefix DIR`). No `sudo` is used. If `~/.local/bin` is not already on your `PATH`, the installer appends it to your shell rc and tells you to restart your shell or `source` it. On Windows use `install.ps1` from PowerShell instead. **Updating = re-running the installer**: it pulls the latest source (`git pull --ff-only`, skipped if you have local edits), rebuilds, and overwrites — same for the prebuilt `install_bin.sh`, which always fetches the latest release. Flags: `--client`, `--server`, `--prefix DIR`, `--uninstall`, `-h/--help`.
 
 ## Make a call
 
@@ -155,6 +155,8 @@ Or run `aura-cli` with no arguments and paste the string on its first line of st
 
 - **LOCAL call** — the AI runs the server on `127.0.0.1` on your machine and runs the `aura-cli` command for you; your mic opens and you talk.
 - **REMOTE call** — the AI runs the server on its VPS and sends you the connection string over the chat; you run `AURA_CONNECT='aura://...' aura-cli` on your own machine.
+
+**Open speakers / echo.** The client runs echo cancellation (WebRTC AEC3) on the mic by default, so you can talk — and interrupt the model mid-sentence — on open speakers without the model hearing itself. Headphones remain the zero-processing option. Tunables via the `AURA_AEC` environment variable: `on` (default), `gate` (no AEC — the mic is muted while the model speaks, so no barge-in), `off` (raw mic, headset users only).
 
 When the call ends, the server posts a short recap of the in-call transcript back into the chat, so the AI can pick the conversation back up where the voice call left off.
 
@@ -188,6 +190,9 @@ After that, just say "call me" in your chat and your agent places the call. The 
 ## Documents
 - Onboarding / self-hosting the server: [docs/ONBOARDING.md](docs/ONBOARDING.md)
 - Working guide for contributors: [CLAUDE.md](CLAUDE.md)
+
+## Third-party licenses
+aura statically links open-source components; notably the client's echo-cancel stage uses [sonora](https://github.com/dignifiedquire/sonora) — a pure-Rust port of the WebRTC audio-processing module (BSD-3-Clause, © The WebRTC Project Authors, Arun Raghavan and contributors, dignifiedquire). The full license texts ship with every release archive and live in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 
 ## Repository layout
 | Directory | Purpose |

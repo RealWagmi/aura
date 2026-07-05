@@ -152,9 +152,12 @@ and delegated sub-agents) must run its tool calls **without an approval prompt**
 and be allowed to run long enough for a whole call. Otherwise the loop freezes on
 a confirmation nobody can give and every dispatch cold-falls-back. Set it **once**:
 
-- **Claude Code** — allow the on-PATH helpers for the live session (`Bash(aura-inbox*)`,
-  `Bash(aura-call*)`, `Bash(aura-call-status*)`, or `--permission-mode acceptEdits`).
-  aura already runs the dispatched `claude -p` in `acceptEdits`.
+- **Claude Code** — add Bash allow-rules for the on-PATH helpers: `Bash(aura-inbox:*)`,
+  `Bash(aura-call:*)`, `Bash(aura-call-status:*)` (the `:` before `*` is required —
+  `Bash(aura-inbox*)` does not match). `--permission-mode acceptEdits` covers file
+  edits but NOT Bash, so the allow-rules are required, not an alternative (or use
+  `--dangerously-skip-permissions` to bypass all prompts). aura already runs the
+  dispatched `claude -p` in `acceptEdits`.
 - **Codex** — bypass approvals for the loop, e.g. `--dangerously-bypass-approvals-and-sandbox`
   (verify the exact knob for your version).
 - **Hermes** — `hermes config set approvals.cron_mode approve` (the dispatch is an

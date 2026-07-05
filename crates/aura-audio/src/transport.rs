@@ -3,13 +3,19 @@
 //!
 //! A thin wrapper over [`start_live_audio`]: the mic side is the input receiver
 //! (480-sample / 20 ms frames @ 24k), the speaker side is the lock-free
-//! [`PlaybackHandle`]. It exposes plain inherent methods (no engine trait) so
-//! the client binary does not pull `aura-engine`; the REMOTE client pumps these
-//! frames straight into/out of the `aura-tunnel` endpoint.
+//! [`PlaybackHandle`]. Every outgoing mic frame passes through the
+//! [`EchoStage`] (AEC3 echo cancellation — see [`crate::aec`]) so an open
+//! speaker can't feed the model's own voice back into the server-side VAD. It
+//! exposes plain inherent methods (no engine trait) so the client binary does
+//! not pull `aura-engine`; the REMOTE client pumps these frames straight
+//! into/out of the `aura-tunnel` endpoint.
 
 use tokio::sync::mpsc;
 
-use crate::{start_live_audio, AudioError, AudioSettings, LiveAudioSession, PlaybackHandle};
+use crate::{
+    start_live_audio, AecMode, AudioError, AudioSettings, EchoStage, LiveAudioSession,
+    PlaybackHandle,
+};
 
 /// Frames: PCM16 mono LE @ 24 kHz, ~20 ms chunks.
 const TARGET_SAMPLE_RATE: u32 = 24_000;
@@ -24,12 +30,15 @@ pub struct CpalTransport {
     mic: mpsc::Receiver<Vec<i16>>,
     /// Lock-free playout queue for incoming audio.
     playback: PlaybackHandle,
+    /// Anti-echo stage on the mic uplink (mode from `AURA_AEC`, default on).
+    aec: EchoStage,
 }
 
 impl CpalTransport {
     /// Acquire the default (or configured) mic + speaker and start streaming at
     /// 24 kHz / 20 ms. Surfaces device/permission errors synchronously.
     pub fn start(settings: AudioSettings) -> Result<Self, AudioError> {
+        let noise = settings.noise_suppression;
         let mut session = start_live_audio(TARGET_SAMPLE_RATE, CHUNK_MS, settings)?;
         let mic = session.take_input_audio().ok_or_else(|| {
             // Unreachable on a fresh session (the receiver is only taken once),
@@ -37,17 +46,21 @@ impl CpalTransport {
             AudioError::Stream("input audio receiver already taken".to_owned())
         })?;
         let playback = session.playback.clone();
+        let aec = EchoStage::new(playback.farend(), noise, AecMode::from_env());
         Ok(Self {
             _session: session,
             mic,
             playback,
+            aec,
         })
     }
 
-    /// Next 20 ms mic frame (24k mono), or `None` when the device/channel
-    /// closes (the client treats that as the end of the call).
+    /// Next 20 ms mic frame (24k mono) with echo cancellation applied, or
+    /// `None` when the device/channel closes (the client treats that as the
+    /// end of the call).
     pub async fn recv_pcm24(&mut self) -> Option<Vec<i16>> {
-        self.mic.recv().await
+        let chunk = self.mic.recv().await?;
+        Some(self.aec.process_capture(chunk, self.playback.queued_ms()))
     }
 
     /// Play a 24k frame to the speaker. Infallible: `push_pcm_24k` drops the

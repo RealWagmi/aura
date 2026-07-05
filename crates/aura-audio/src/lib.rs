@@ -4,9 +4,13 @@
 //! device-follower, and the integer nearest-resample. `CpalTransport` (see
 //! [`transport`]) exposes inherent 24 kHz frame I/O (`recv_pcm24`/`send_pcm24`)
 //! that the thin client pumps into/out of the `aura-tunnel` endpoint — no
-//! `aura-engine` dependency.
+//! `aura-engine` dependency. The [`aec`] module is the client's anti-echo
+//! stage (AEC3 echo cancellation over the mic uplink) fed its far-end
+//! reference by the [`FarEndTap`] wired into the playback pop path.
 
+pub mod aec;
 pub mod transport;
+pub use aec::{AecMode, EchoStage};
 pub use transport::CpalTransport;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -57,17 +61,15 @@ impl Default for AudioSettings {
 
 /// Requested noise-suppression level.
 ///
-/// `Off` is a pure pass-through.  `Soft`, `Medium`, and `Strong` are
-/// currently **no-ops** — the field is accepted and logged at startup so
-/// operators can confirm the setting was received, but no actual filtering
-/// is applied to the captured audio. A real RNNoise-based integration is a
-/// separate follow-up (see CODE BACKLOG).
+/// `Off` is a pure pass-through. `Soft`, `Medium`, and `Strong` map to the
+/// WebRTC APM noise-suppression levels (Low/Moderate/High) applied by the
+/// client's echo-cancel stage ([`aec::EchoStage`]) on the mic uplink. NS runs
+/// only while that stage's canceller is live (`AURA_AEC=on`, the default): in
+/// `gate`/`off` modes — and after a mid-call APM-error demotion to the gate —
+/// no APM exists, so no noise filtering is applied and the levels are inert
+/// (the startup notice says so).
 ///
-/// `Medium` is the [`Default`] variant, so callers using
-/// [`AudioSettings::default`] silently request a no-op filter. This is
-/// intentional: the default is "user-visible preference stored; filter
-/// not yet wired" rather than "Off" (which would suppress the startup
-/// notice and make it harder to discover the gap during QA).
+/// `Medium` is the [`Default`] variant, matching the APM default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum NoiseSuppression {
     Off,
@@ -198,6 +200,93 @@ pub fn doctor() -> AudioDeviceReport {
     }
 }
 
+/// The AEC far-end reference tap: a lock-free mirror of what the speaker is
+/// ACTUALLY playing, written by the cpal output callback at the moment each
+/// sample is popped for playout.
+///
+/// The tap point matters: the model streams a whole answer in a few seconds
+/// while the playback queue holds up to 30 s, so a reference taken at
+/// `push_pcm_24k` time would lead the acoustic echo by tens of seconds — far
+/// beyond the echo canceller's delay-estimation window. Popped samples (data
+/// or silence) lag the sound from the speaker only by the device's output
+/// latency, which AEC3's delay estimator absorbs.
+///
+/// Disarmed by default (zero cost when no [`aec::EchoStage`] consumes it);
+/// the AEC stage arms it at construction.
+#[derive(Debug)]
+pub struct FarEndTap {
+    queue: ArrayQueue<i16>,
+    /// The output-device sample rate the tapped samples are at.
+    sample_rate: AtomicU32,
+    /// Only an armed tap records; keeps the output callback overhead at one
+    /// atomic load when AEC is off.
+    armed: AtomicBool,
+}
+
+/// Tap capacity: ~2 s at 96 kHz (or ~4 s at 48 kHz). The AEC stage drains it
+/// every mic chunk (~20 ms); the headroom covers a stalled mic stream during
+/// a device rebuild without unbounded memory.
+const FAREND_TAP_CAPACITY: usize = 192_000;
+
+impl FarEndTap {
+    pub(crate) fn new(sample_rate: u32) -> Self {
+        Self {
+            queue: ArrayQueue::new(FAREND_TAP_CAPACITY),
+            sample_rate: AtomicU32::new(sample_rate),
+            armed: AtomicBool::new(false),
+        }
+    }
+
+    /// Start recording playout samples (called once by the AEC stage).
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    /// The sample rate the tapped samples are at (the output-device rate).
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate.load(Ordering::Acquire)
+    }
+
+    /// Record one played-out sample. Called from the realtime output callback:
+    /// lock-free, never blocks; on overflow the oldest sample is dropped (the
+    /// AEC stage resynchronizes via its delay estimator).
+    pub(crate) fn push(&self, sample: i16) {
+        if !self.armed.load(Ordering::Acquire) {
+            return;
+        }
+        if self.queue.push(sample).is_err() {
+            let _ = self.queue.pop();
+            let _ = self.queue.push(sample);
+        }
+    }
+
+    /// Drain up to `out`'s spare capacity of tapped samples (oldest first).
+    /// Returns how many were appended. Consumer side (AEC stage) only.
+    pub fn drain_into(&self, out: &mut Vec<i16>, max: usize) -> usize {
+        let mut n = 0;
+        while n < max {
+            match self.queue.pop() {
+                Some(s) => {
+                    out.push(s);
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        n
+    }
+
+    /// Forget everything tapped so far (rate change / rebuild).
+    fn clear(&self) {
+        while self.queue.pop().is_some() {}
+    }
+
+    pub(crate) fn reconfigure(&self, sample_rate: u32) {
+        self.sample_rate.store(sample_rate, Ordering::Release);
+        self.clear();
+    }
+}
+
 /// Lock-free playback queue shared between the producer (tokio task that
 /// receives Grok audio deltas and drives barge-in) and the cpal output
 /// callback that runs on a real-time audio thread.
@@ -210,6 +299,8 @@ pub struct PlaybackHandle {
     queue: Arc<ArrayQueue<i16>>,
     output_sample_rate: Arc<AtomicU32>,
     max_live_frames: Arc<AtomicUsize>,
+    /// AEC far-end reference: mirrors every sample the output callback pops.
+    farend: Arc<FarEndTap>,
 }
 
 impl PlaybackHandle {
@@ -219,7 +310,13 @@ impl PlaybackHandle {
             queue: Arc::new(ArrayQueue::new(capacity.max(1))),
             output_sample_rate: Arc::new(AtomicU32::new(output_sample_rate)),
             max_live_frames: Arc::new(AtomicUsize::new(max_live_frames)),
+            farend: Arc::new(FarEndTap::new(output_sample_rate)),
         }
+    }
+
+    /// The AEC far-end tap fed by this handle's playout pops.
+    pub fn farend(&self) -> Arc<FarEndTap> {
+        Arc::clone(&self.farend)
     }
 
     pub fn push_pcm_24k(&self, samples: &[i16]) {
@@ -267,11 +364,18 @@ impl PlaybackHandle {
             live_playback_max_frames(output_sample_rate),
             Ordering::Release,
         );
+        // Stale far-end samples were tapped at the OLD rate — drop them so the
+        // AEC drain never mixes rates within one converter run.
+        self.farend.reconfigure(output_sample_rate);
         self.clear_for_barge_in()
     }
 
     fn pop_or_silence(&self) -> i16 {
-        self.queue.pop().unwrap_or(0)
+        let sample = self.queue.pop().unwrap_or(0);
+        // Mirror what is ACTUALLY played (data or silence) into the AEC
+        // far-end tap — see `FarEndTap` for why the tap lives at pop time.
+        self.farend.push(sample);
+        sample
     }
 }
 
@@ -817,21 +921,16 @@ fn build_streams_for_current_default(
         emit_bluetooth_pair_warning();
     }
 
-    // Noise suppression: currently a no-op for all non-Off levels.
-    // The flag is accepted, stored in AudioSettings, and logged once at
-    // startup, but no filter is applied to the captured samples —
-    // effectively identical to NoiseSuppression::Off at runtime.
-    // A real RNNoise-based integration would insert a frame-by-frame filter
-    // here (operating on the i16 chunks before they reach the Grok encoder).
-    // CODE BACKLOG: replace the Once log with actual filter initialization
-    // once an RNNoise crate (e.g. rnnoise-sys) is vendored; see the
-    // NoiseSuppression enum doc for the full context.
+    // Noise suppression is applied by the client's echo-cancel stage
+    // (`aec::EchoStage`, WebRTC APM) on the mic uplink — not by these cpal
+    // streams, and only while the canceller itself is live (AEC on). Log once
+    // so operators can confirm where the setting acts.
     if settings.noise_suppression != NoiseSuppression::Off {
         static NOISE_SUPPRESSION_NOTICE: std::sync::Once = std::sync::Once::new();
         let level = settings.noise_suppression;
         NOISE_SUPPRESSION_NOTICE.call_once(move || {
             eprintln!(
-                "Aura: noise suppression '{}' requested; runtime placeholder (real RNNoise integration is a follow-up).",
+                "Aura: noise suppression '{}' is applied by the echo-cancel stage on the mic uplink (active only while AURA_AEC=on, the default).",
                 level
             );
         });
