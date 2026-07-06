@@ -28,6 +28,12 @@ jobs:
     # Debian 11 machines. (GitHub retired the ubuntu-20.04 runners; the
     # container is the supported way to keep the old floor.)
     container: ${{ matrix.container }}
+    # Inside a job container the runner's default `run:` shell is plain `sh`
+    # (dash) — `set -o pipefail` and other bashisms fail there. Force bash for
+    # every step (present in ubuntu:20.04 and on the macOS runners alike).
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
