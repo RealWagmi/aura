@@ -15,8 +15,12 @@
 //!
 //! Dispatch: EXACTLY ONE `openclaw_agent_consult` frame, built by
 //! [`dispatch::build_openclaw_consult_dispatch`] (the security gate runs first),
-//! sent over the gateway WS. Callback: an AES-256-GCM `tool_result` frame over
-//! the runtime-inbox WS. Both WS legs degrade gracefully when unreachable.
+//! sent over the gateway WS (`talk.client.toolCall` accepts ONLY this tool
+//! name upstream). Callback: an AES-256-GCM `tool_result` frame over the
+//! runtime-inbox WS — an AURA-CUSTOM channel (no first-party OpenClaw
+//! equivalent; upstream's nearest seam, `talk.session.submitToolResult`, is
+//! realtime-relay-only). Both WS legs degrade gracefully when unreachable; the
+//! post-call recap additionally always lands in `.aura/aura-last-call-recap.md`.
 
 pub mod card;
 pub mod crypto;
@@ -71,11 +75,17 @@ const WS_TIMEOUT: Duration = Duration::from_secs(20);
 const DETECT_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 // =============================================================================
-// Identity resolution (mirrors OpenClaw's identity-env.js env vars)
+// Identity resolution (OpenClaw's real spawn-env vars, source-verified)
 // =============================================================================
 
-/// Resolve the OpenClaw session identity from the environment. Mirrors
-/// `identity-env.js` `IDENTITY_EXPORTS`. Fail-open: missing fields stay `None`.
+/// Resolve the OpenClaw session identity from the environment.
+///
+/// Upstream OpenClaw injects the `OPENCLAW_MCP_*` family into CLI-backend agent
+/// runs (`src/agents/cli-runner/prepare.ts`) and only `OPENCLAW_SHELL=exec` +
+/// `OPENCLAW_CHANNEL_CONTEXT` (`{sender:{id},chat:{id}}`) into exec-tool
+/// spawns (`src/agents/bash-tools.exec.ts`). The bare legacy names
+/// (`OPENCLAW_SESSION_KEY` etc.) do not exist upstream but are kept as a
+/// fallback for custom launcher shims. Fail-open: missing fields stay `None`.
 fn resolve_identity_from_env() -> HostSessionIdentity {
     let get = |k: &str| {
         std::env::var(k)
@@ -83,11 +93,15 @@ fn resolve_identity_from_env() -> HostSessionIdentity {
             .map(|v| v.trim().to_owned())
             .filter(|v| !v.is_empty())
     };
-    let session_key = get("OPENCLAW_SESSION_KEY");
-    let agent_id = get("OPENCLAW_AGENT_ID");
-    let account_id = get("OPENCLAW_ACCOUNT_ID");
-    let channel = get("OPENCLAW_CHANNEL");
-    let reply_to = get("OPENCLAW_REPLY_TARGET");
+    // MCP family first (the real upstream names), then the legacy shim names.
+    let pick = |mcp: &str, legacy: &str| get(mcp).or_else(|| get(legacy));
+    let session_key = pick("OPENCLAW_MCP_SESSION_KEY", "OPENCLAW_SESSION_KEY");
+    let agent_id = pick("OPENCLAW_MCP_AGENT_ID", "OPENCLAW_AGENT_ID");
+    let account_id = pick("OPENCLAW_MCP_ACCOUNT_ID", "OPENCLAW_ACCOUNT_ID");
+    let channel = pick("OPENCLAW_MCP_MESSAGE_CHANNEL", "OPENCLAW_CHANNEL");
+    // Reply target: no upstream env carries it directly; exec spawns provide
+    // the chat id inside OPENCLAW_CHANNEL_CONTEXT. Legacy shim name last.
+    let reply_to = channel_context_chat_id().or_else(|| get("OPENCLAW_REPLY_TARGET"));
     let principal = account_id.clone().unwrap_or_default();
 
     HostSessionIdentity {
@@ -100,6 +114,19 @@ fn resolve_identity_from_env() -> HostSessionIdentity {
         channel,
         reply_to,
         account_id,
+    }
+}
+
+/// The chat id from `OPENCLAW_CHANNEL_CONTEXT` (`{"sender":{"id":..},"chat":{"id":..}}`)
+/// — the narrow context OpenClaw's exec tool injects into spawned processes.
+fn channel_context_chat_id() -> Option<String> {
+    let raw = std::env::var("OPENCLAW_CHANNEL_CONTEXT").ok()?;
+    let value: Value = serde_json::from_str(raw.trim()).ok()?;
+    let chat = value.get("chat")?.get("id")?;
+    match chat {
+        Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_owned()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
     }
 }
 
@@ -858,6 +885,66 @@ impl HostAdapter for OpenClawAdapter {
             Err(e) => Err(HostError::Callback(e.to_string())),
         }
     }
+
+    async fn deliver_call_summary(&self, transcript: &str) -> Result<CallbackAck, HostError> {
+        // The trait default routes the recap through `deliver_callback`, which
+        // needs a configured runtime-inbox WS — absent one (the common local
+        // case), a whole call's transcript silently disappears. Write the full
+        // redacted transcript to a local file ALWAYS (the skill's Step 5 reads
+        // and summarizes it), and additionally push the speech-capped frame
+        // over the runtime inbox when it is configured.
+        let recap = redact_secrets(transcript);
+        let recap = recap.trim();
+        if recap.is_empty() {
+            return Ok(CallbackAck {
+                delivered: false,
+                detail: "empty call; nothing to recap".to_owned(),
+            });
+        }
+        let capped: String = recap.chars().take(crate::CALL_SUMMARY_MAX_CHARS).collect();
+        let dir = self.cwd.join(".aura");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| HostError::Callback(e.to_string()))?;
+        let path = dir.join("aura-last-call-recap.md");
+        let body = format!(
+            "# Voice call transcript (developer + Aura) - summarize this for the chat\n\n{capped}\n"
+        );
+        tokio::fs::write(&path, body)
+            .await
+            .map_err(|e| HostError::Callback(e.to_string()))?;
+
+        // Best-effort hosted delivery on top of the file (never fails the ack:
+        // the file already landed).
+        let mut detail = format!("wrote the call transcript to {}", path.display());
+        if self.inbox_endpoint.is_some() {
+            let result = TaskResult {
+                task_id: "voice-call-summary".to_owned(),
+                handoff_state: TaskHandoffState::Accepted,
+                speech_update: format!(
+                    "Voice call transcript (developer + Aura) — summarize this for the chat:\n{capped}"
+                ),
+                envelope: TaskEnvelope::new(
+                    "voice call summary",
+                    Vec::new(),
+                    "aura",
+                    CallbackMode::default(),
+                    String::new(),
+                ),
+            };
+            match self.deliver_callback(&result).await {
+                Ok(ack) if ack.delivered => {
+                    detail.push_str("; also delivered over the runtime-inbox WS")
+                }
+                Ok(_) => {}
+                Err(e) => detail.push_str(&format!("; runtime-inbox delivery failed ({e})")),
+            }
+        }
+        Ok(CallbackAck {
+            delivered: true,
+            detail,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1037,6 +1124,70 @@ mod tests {
         let brief = block_on(adapter.read_context()).unwrap();
         assert_eq!(brief.host_kind.as_deref(), Some("open_claw"));
         assert!(brief.context.recent_messages_verbatim.is_empty());
+    }
+
+    #[test]
+    fn identity_prefers_upstream_mcp_names_over_legacy_shim_names() {
+        let _guard = env_lock();
+        let all = [
+            "OPENCLAW_MCP_SESSION_KEY",
+            "OPENCLAW_MCP_AGENT_ID",
+            "OPENCLAW_MCP_ACCOUNT_ID",
+            "OPENCLAW_MCP_MESSAGE_CHANNEL",
+            "OPENCLAW_CHANNEL_CONTEXT",
+            "OPENCLAW_SESSION_KEY",
+            "OPENCLAW_ACCOUNT_ID",
+            "OPENCLAW_AGENT_ID",
+            "OPENCLAW_CHANNEL",
+            "OPENCLAW_REPLY_TARGET",
+        ];
+        for k in all {
+            std::env::remove_var(k);
+        }
+        // Upstream MCP names win over the legacy shim names.
+        std::env::set_var("OPENCLAW_MCP_SESSION_KEY", "mcp-sess");
+        std::env::set_var("OPENCLAW_SESSION_KEY", "legacy-sess");
+        std::env::set_var("OPENCLAW_MCP_ACCOUNT_ID", "mcp-acct");
+        std::env::set_var("OPENCLAW_MCP_MESSAGE_CHANNEL", "telegram");
+        // Exec-spawn channel context supplies the reply target (chat id).
+        std::env::set_var(
+            "OPENCLAW_CHANNEL_CONTEXT",
+            r#"{"sender":{"id":"u1"},"chat":{"id":12345}}"#,
+        );
+        let id = resolve_identity_from_env();
+        for k in all {
+            std::env::remove_var(k);
+        }
+        assert_eq!(id.session_key.as_deref(), Some("mcp-sess"));
+        assert_eq!(id.account_id.as_deref(), Some("mcp-acct"));
+        assert_eq!(id.channel.as_deref(), Some("telegram"));
+        assert_eq!(id.reply_to.as_deref(), Some("12345"));
+    }
+
+    #[test]
+    fn legacy_shim_names_still_resolve_when_mcp_absent() {
+        let _guard = env_lock();
+        for k in [
+            "OPENCLAW_MCP_SESSION_KEY",
+            "OPENCLAW_MCP_ACCOUNT_ID",
+            "OPENCLAW_CHANNEL_CONTEXT",
+        ] {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("OPENCLAW_SESSION_KEY", "legacy-sess");
+        std::env::set_var("OPENCLAW_ACCOUNT_ID", "legacy-acct");
+        std::env::set_var("OPENCLAW_REPLY_TARGET", "chat-9");
+        let id = resolve_identity_from_env();
+        for k in [
+            "OPENCLAW_SESSION_KEY",
+            "OPENCLAW_ACCOUNT_ID",
+            "OPENCLAW_REPLY_TARGET",
+        ] {
+            std::env::remove_var(k);
+        }
+        assert_eq!(id.session_key.as_deref(), Some("legacy-sess"));
+        assert_eq!(id.account_id.as_deref(), Some("legacy-acct"));
+        assert_eq!(id.reply_to.as_deref(), Some("chat-9"));
     }
 
     #[test]

@@ -41,7 +41,9 @@ fn handle_cli_flags() -> Option<i32> {
                  -V, --version   print the version and exit\n  \
                  -h, --help      show this help and exit\n\n\
                  Environment:\n  \
-                 AURA_CONNECT    the connection string (aura://HOST:PORT#k=...&c=...)\n  \
+                 AURA_CONNECT    the connection string — either form:\n                  \
+                 direct: aura://HOST:PORT#k=...&c=...\n                  \
+                 iroh:   aura://<node-id>#k=...&c=...&t=iroh (server behind NAT)\n  \
                  AURA_AEC        echo handling on the mic: on (default, AEC3 echo\n                  \
                  cancellation — speakers + barge-in work), gate (mute mic while\n                  \
                  the model speaks; no barge-in), off (raw mic; headsets only)",

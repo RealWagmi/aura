@@ -131,6 +131,19 @@ if (-not $haveCheckout) {
     $dest = if ($env:AURA_SRC_DIR) { $env:AURA_SRC_DIR } else { Join-Path $env:USERPROFILE 'aura' }
     if (Test-Path -LiteralPath (Join-Path $dest 'Cargo.toml')) {
         Write-Info "Using the existing aura checkout at $dest"
+        # Re-running the installer must UPDATE, not silently rebuild the old
+        # checkout. Pull only when it is a clean git clone (never clobber local
+        # edits); on any failure fall back to building the checkout as-is.
+        if (Test-Path -LiteralPath (Join-Path $dest '.git')) {
+            $dirty = git -C $dest status --porcelain 2>$null
+            if ([string]::IsNullOrWhiteSpace(($dirty -join ''))) {
+                Write-Info 'Updating the checkout (git pull --ff-only)'
+                git -C $dest pull --ff-only
+                if ($LASTEXITCODE -ne 0) { Write-Warn 'git pull failed; building the existing checkout as-is.' }
+            } else {
+                Write-Warn "local changes in $dest - skipping git pull; building the checkout as-is."
+            }
+        }
     } else {
         Write-Info "Fetching the aura source into $dest (git clone)"
         git clone --depth 1 https://github.com/RealWagmi/aura $dest
@@ -177,7 +190,7 @@ if ($Uninstall) {
         }
     }
     if ($BuildServer) {
-        foreach ($h in @('aura-call', 'aura-call-status')) {
+        foreach ($h in @('aura-call', 'aura-call-status', 'aura-inbox')) {
             $hp = Join-Path $BinDir $h
             if (Test-Path -LiteralPath $hp) { Remove-Item -LiteralPath $hp -Force; Write-Ok "removed $hp"; $removed++ }
         }
@@ -188,6 +201,14 @@ if ($Uninstall) {
     Write-Note "PATH entry '$BinDir' (if added) was left in place; remove it manually if you want it gone."
     exit 0
 }
+
+# --- update vs fresh install -------------------------------------------------
+
+# A previous aura binary in BinDir means this run replaces an existing install
+# (used for the post-install skill notice).
+$IsUpdate = (Test-Path -LiteralPath (Join-Path $BinDir 'aura-server.exe')) -or
+            (Test-Path -LiteralPath (Join-Path $BinDir 'aura-cli.exe'))
+if ($IsUpdate) { Write-Info "Existing aura install detected in $BinDir - this run is an UPDATE." }
 
 # --- onboarding pointer (server = the AI-driven side) -----------------------
 
@@ -321,7 +342,7 @@ foreach ($t in $Targets) {
 # `aura-call-status` commands resolve. They require a POSIX shell (git-bash /
 # WSL / MSYS) to run on Windows.
 if ($BuildServer) {
-    foreach ($h in @(@('launch-call.sh', 'aura-call'), @('call-status.sh', 'aura-call-status'))) {
+    foreach ($h in @(@('launch-call.sh', 'aura-call'), @('call-status.sh', 'aura-call-status'), @('inbox.sh', 'aura-inbox'))) {
         $hsrc = Join-Path $RepoRoot (Join-Path 'scripts' $h[0])
         $hdst = Join-Path $BinDir $h[1]
         Copy-Item -LiteralPath $hsrc -Destination $hdst -Force
@@ -390,10 +411,19 @@ if ($BuildServer) {
     Write-Note '    * store the xAI key (BYOK)                  - onboarding step 3'
     Write-Note '    * (REMOTE only) open the one UDP port, once - onboarding step 4'
     Write-Note '    * drop the host skill (skills/SKILL.md)     - onboarding step 5'
-    Write-Note 'The aura-call / aura-call-status helpers are on your PATH (POSIX shell;'
-    Write-Note 'run the host under git-bash/WSL on Windows). The host launches aura-server'
-    Write-Note 'per call; it needs XAI_API_KEY in its'
+    Write-Note 'The aura-call / aura-call-status / aura-inbox helpers are on your PATH'
+    Write-Note '(POSIX shell; run the host under git-bash/WSL on Windows). The host launches'
+    Write-Note 'aura-server per call; it needs XAI_API_KEY in its'
     Write-Note 'environment (BYOK; never on the command line). It prints the'
     Write-Note '`AURA_CONNECT=... aura-cli` line to STDERR for the caller to use.'
     Write-Note '    https://raw.githubusercontent.com/RealWagmi/aura/main/docs/ONBOARDING.md'
+    if ($IsUpdate) {
+        Write-Host ''
+        Write-Host 'UPDATE detected - refresh the host skill.' -ForegroundColor Yellow
+        Write-Note '*** AI AGENT: the skill may have changed in this release, and the copy in'
+        Write-Note 'YOUR skills directory is NOT updated automatically. Re-copy it NOW: ***'
+        Write-Note "    Copy-Item '$RepoRoot\skills\SKILL.md' `"$env:USERPROFILE\.claude\skills\aura\SKILL.md`""
+        Write-Note '(substitute your framework''s skills dir if not Claude Code), then re-read it'
+        Write-Note 'before the next call. The onboarding config (key, port) needs NO redo.'
+    }
 }

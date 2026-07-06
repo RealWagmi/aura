@@ -19,7 +19,7 @@ is itself the call endpoint.
 1. **Detect OS + arch + decide LOCAL vs REMOTE** — from the environment → Step 0
 2. **Install the binaries** (`install_bin.sh --server`) — downloads + verifies + puts on PATH → Step 1
 3. **Get the `XAI_API_KEY`** — the ONE time you stop and ask the user → Step 2
-4. **(REMOTE only) Open the one UDP port, once** (`aura-open-port`); LOCAL → skip → Step 3
+4. **(REMOTE only) NAT check first**, then open the UDP port once (`aura-open-port`) — or, behind NAT, set `AURA_TRANSPORT=iroh` and open nothing; LOCAL → skip → Step 3
 5. **Drop the host skill** into your framework's skills dir → Step 4
 6. **Set your framework to auto-approve** the orchestrator's tool calls + raise the budget → Step 4b
 7. **Self-check** — verify binaries, key, port, skill, framework prep BEFORE you report done → Step 5
@@ -105,25 +105,51 @@ you may instead store it in the OS keychain (service `aura`, entry `XAI_API_KEY`
 
 ---
 
-## Step 3 — (REMOTE only) Open the one UDP port, once
+## Step 3 — (REMOTE only) NAT check, then open the port OR choose iroh
 
-A LOCAL call binds loopback and needs **no** open port — **skip this step**. For
-a REMOTE server, open the fixed UDP port (default **47821**) **once**:
+A LOCAL call binds loopback and needs **no** open port — **skip this step**.
+For a REMOTE server, first determine whether the machine is directly reachable
+— do NOT open a firewall port before knowing this:
 
-**3a.** Find the public address and use it as `AURA_PUBLIC_HOST` when launching:
+**3a. NAT check (do not skip).** Compare the machine's interface IPs with its
+public IP:
 ```bash
 PUBLIC_IP="$(curl -fsS ifconfig.me || curl -fsS https://api.ipify.org)"; echo "public IP = $PUBLIC_IP"
+LOCAL_IPS="$( (ip -4 addr show 2>/dev/null || ifconfig 2>/dev/null) | awk '/inet /{sub("/.*","",$2); print $2}' )"
+case " $(echo $LOCAL_IPS) " in
+  *" $PUBLIC_IP "*) echo "DIRECT: the public IP is on an interface" ;;
+  *)                echo "BEHIND NAT: no interface has $PUBLIC_IP (local: $(echo $LOCAL_IPS))" ;;
+esac
 ```
+- **DIRECT** (typical VPS) → continue with 3b + 3c below; `AURA_PUBLIC_HOST=$PUBLIC_IP`.
+- **BEHIND NAT** (home server, VM with a private 10.x/192.168.x address) —
+  opening the OS firewall would be useless; pick ONE of:
+  1. **iroh transport (recommended — zero network config).** Persist it next to
+     the key and **skip 3b/3c entirely**:
+     ```bash
+     printf 'AURA_TRANSPORT=iroh\n' >> ~/.config/aura/.env
+     ```
+     iroh hole-punches through NAT (blind encrypted relay as fallback); the
+     connection string then carries a node id instead of `host:port`
+     (`aura://<node-id>#k=...&t=iroh`), and `aura-call remote` needs **no**
+     public host argument. No port is ever opened.
+  2. **Router port-forwarding** — only if the user controls the router AND has a
+     real public IP on it: forward WAN UDP 47821 → this machine's LAN IP, use
+     the router's WAN IP as `AURA_PUBLIC_HOST`, then do 3b + 3c. **CGNAT** (the
+     router's WAN address is itself private / differs from `$PUBLIC_IP`) makes
+     inbound impossible — use option 1.
 
-**3b.** Open the port with the bundled helper (now on your PATH):
+**3b. (DIRECT only)** Use the public address found above as `AURA_PUBLIC_HOST`
+when launching.
+
+**3c. (DIRECT only)** Open the port with the bundled helper (now on your PATH):
 ```bash
 aura-open-port            # opens UDP 47821 (or: aura-open-port <PORT>)
 ```
 If it runs as root it opens the port and says so; if not, it prints the exact
 `sudo` commands — relay them to the user. It also always prints a note about
-filters **outside** the machine (cloud security group / NAT / home router
-port-forwarding; CGNAT → use `AURA_TRANSPORT=iroh`, a VPS, or a VPN overlay) —
-relay it. Opening the port is a **one-time** action; never per call.
+filters **outside** the machine (cloud security group etc.) — relay it. Opening
+the port is a **one-time** action; never per call.
 
 ---
 
@@ -163,10 +189,17 @@ a confirmation nobody can give and every dispatch cold-falls-back. Set it **once
 - **Hermes** — `hermes config set approvals.cron_mode approve` (the dispatch is an
   unattended `delegate_task` worker), plus raise the budget:
   `hermes config set agent.gateway_timeout 1800` · `hermes config set delegation.child_timeout_seconds 1800` · `hermes config set max_turns 200`.
-- **OpenClaw** — `openclaw config set tools.exec.security full` · `openclaw config set tools.exec.ask off`.
+  Also enable aura's direct-dispatch fallback: `printf 'AURA_HERMES_WORKER=hermes -z\n' >> ~/.config/aura/.env`
+  (`hermes -z` = oneshot mode: answer-only stdout, approvals bypassed; aura appends
+  the task as the last argument). Run the in-call watch-loop via
+  `terminal(background=true, notify_on_complete=true)` — Hermes kills foreground
+  tools on any incoming user message (see the skill's Step 4).
+- **OpenClaw** — `openclaw config set tools.exec.security full` · `openclaw config set tools.exec.ask off`
+  (already the gateway-host defaults; shortcut: `openclaw exec-policy preset yolo`, then `openclaw gateway restart`).
 
-> Hermes/OpenClaw values are the proven heyarp settings; aura's Hermes/OpenClaw
-> paths are not yet live-verified — confirm the keys against your framework version.
+> All Hermes/OpenClaw commands and config keys above are source-verified against
+> the upstream repositories (hermes-agent, openclaw); aura's Hermes/OpenClaw call
+> paths themselves are newer than Claude's — report anything that misbehaves.
 > Claude Code is the live-verified default. Also make sure the session/turn cap on
 > any host is high enough for a multi-minute call.
 
@@ -220,5 +253,5 @@ curl -fsSL https://raw.githubusercontent.com/RealWagmi/aura/main/install_bin.sh 
 - **"no prebuilt binary for this platform".** Your OS/arch isn't published (Windows, or an unusual arch). Build from source: `docs/ONBOARDING.md` (or the command the installer printed).
 - **SHA-256 mismatch.** The installer aborts on purpose — do not work around it. Re-run (a partial download), and if it persists, report it; do not install an unverified binary.
 - **`aura-server` exits immediately with `no BYOK xAI key found`.** The key didn't resolve — re-do Step 2 (is `~/.config/aura/.env` present with a `XAI_API_KEY=...` line and `0600`?). Never print the key to debug it.
-- **Client can't reach a REMOTE server.** The UDP port is almost always blocked **outside** the VM by the cloud security group / NAT — add an inbound UDP 47821 rule there. Confirm `AURA_PUBLIC_HOST` is the reachable public IP/DNS.
+- **Client can't reach a REMOTE server.** The UDP port is almost always blocked **outside** the VM by the cloud security group / NAT — add an inbound UDP 47821 rule there. Confirm `AURA_PUBLIC_HOST` is the reachable public IP/DNS. If the server sits behind NAT/CGNAT (Step 3a says BEHIND NAT), switch to `AURA_TRANSPORT=iroh` instead of fighting the firewall.
 - **`aura-server` / `aura-cli` not found after install.** `~/.local/bin` is not on `PATH` yet — restart the shell or `source` your rc, or use the full path.

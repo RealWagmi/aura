@@ -21,7 +21,7 @@ You are the AI setting up the server. Read this whole file first, then execute:
 2. **Clone the repo** into a stable working dir (`~/aura`) → Step 1
 3. **Build + install the server** (`./install.sh --server`) — this also puts `aura-call` / `aura-call-status` on PATH → Step 2
 4. **Get the `XAI_API_KEY`** — the ONE time you stop and ask the user → Step 3
-5. **(REMOTE only) Open the one UDP port, once** (`scripts/aura-open-port.sh`); LOCAL → skip → Step 4
+5. **(REMOTE only) NAT check first**, then open the UDP port once (`scripts/aura-open-port.sh`) — or, behind NAT, set `AURA_TRANSPORT=iroh` and open nothing; LOCAL → skip → Step 4
 6. **Copy the skill** `skills/SKILL.md` into your framework's skills dir (`mkdir -p` first) → Step 5
 7. **Set your framework to auto-approve** the orchestrator's tool calls + raise the turn/timeout budget → Step 5b
 8. **Self-check** — verify binaries, key, port, skill, framework prep BEFORE you report done → Step 6
@@ -236,35 +236,67 @@ never write it anywhere but a `0600` `.env` (or the keychain).
 
 ---
 
-## Step 4 — Decide on the UDP port, then (REMOTE only) open it once
+## Step 4 — (REMOTE only) NAT check, then open the port OR choose iroh
 
 A LOCAL call binds loopback (`127.0.0.1`) and needs **no** open port — loopback is
 never exposed and never touches the firewall. Only a REMOTE call needs the UDP
 port reachable. **Use the mode you already decided in Step 0 — do not re-ask the
 user:**
 
-- **LOCAL → skip 4a and 4b entirely.** Open no port. Tell the user once: "No
+- **LOCAL → skip 4a–4c entirely.** Open no port. Tell the user once: "No
   firewall port was opened — local calls don't need one. To allow remote calls
   later, run `scripts/aura-open-port.sh` once (and, on a cloud host, also add an
   inbound UDP 47821 rule in your provider's security group / NAT)." Continue to
   Step 5.
-- **REMOTE → open the port once** via 4a + 4b below. It is a one-time action; you
-  never touch the firewall again on later calls.
+- **REMOTE → run the NAT check (4a) FIRST**, then either open the port once
+  (4b + 4c) or switch to the iroh transport and open nothing. One-time action;
+  you never touch the firewall again on later calls.
 
-**4a. Find the server's public address** and set `AURA_PUBLIC_HOST` to it. This
-is both what the client dials and what tells the server to bind all interfaces
-(a non-loopback value) instead of loopback-only:
+**4a. NAT check (do not skip).** A REMOTE machine behind NAT (home server, a VM
+with a private 10.x/192.168.x address) cannot accept direct inbound UDP no
+matter what the OS firewall says — detect this BEFORE opening anything:
 
 ```bash
-PUBLIC_IP="$(curl -fsS ifconfig.me || curl -fsS https://api.ipify.org)"
+PUBLIC_IP="$(curl -fsS ifconfig.me || curl -fsS https://api.ipify.org)"; echo "public IP = $PUBLIC_IP"
+LOCAL_IPS="$( (ip -4 addr show 2>/dev/null || ifconfig 2>/dev/null) | awk '/inet /{sub("/.*","",$2); print $2}' )"
+case " $(echo $LOCAL_IPS) " in
+  *" $PUBLIC_IP "*) echo "DIRECT: the public IP is on an interface" ;;
+  *)                echo "BEHIND NAT: no interface has $PUBLIC_IP (local: $(echo $LOCAL_IPS))" ;;
+esac
+```
+
+- **DIRECT** (typical VPS) → continue with 4b + 4c.
+- **BEHIND NAT** → pick ONE:
+  1. **iroh transport (recommended — zero network config).** Persist it in the
+     same `./.env` that holds the key (Step 3), then **skip 4b/4c**:
+     ```bash
+     printf 'AURA_TRANSPORT=iroh\n' >> ./.env
+     ```
+     iroh hole-punches through NAT (blind encrypted relay as fallback); the
+     connection string then carries a node id instead of `host:port`
+     (`aura://<node-id>#k=...&t=iroh`) and `aura-call remote` needs **no**
+     public host argument. No port is ever opened.
+  2. **Router port-forwarding** — only if the user controls the router AND it
+     has a real public WAN IP: forward WAN UDP 47821 → this machine's LAN IP,
+     use the router's WAN IP as `AURA_PUBLIC_HOST`, then do 4b + 4c. Under
+     **CGNAT** (the router's WAN address is itself private) inbound is
+     impossible — use option 1.
+
+**4b. (DIRECT only) Find the server's public address** and set
+`AURA_PUBLIC_HOST` to it. This is both what the client dials and what tells the
+server to bind all interfaces (a non-loopback value) instead of loopback-only —
+you already have it from 4a:
+
+```bash
 echo "public IP = ${PUBLIC_IP}"
 # You will pass AURA_PUBLIC_HOST=${PUBLIC_IP} when you launch the server (step 7).
 ```
 
 If the host has a DNS name the user prefers, use that string instead of the IP.
 
-**4b. Open the UDP port once** with the bundled script. The default port is
-**47821**; pass a different one only if the user overrides `AURA_PORT`.
+**4c. (DIRECT only) Open the UDP port once** with the bundled script. The
+default port is **47821**; pass a different one only if the user overrides
+`AURA_PORT`.
 
 ```bash
 scripts/aura-open-port.sh            # opens UDP 47821 (or:  scripts/aura-open-port.sh <PORT>)
@@ -368,11 +400,26 @@ falls back to a cold worker. Configure your framework **once**:
   ```
   hermes config set approvals.cron_mode approve
   ```
+  Also enable aura's direct-dispatch fallback (used when your watch-loop is not
+  running): persist the worker command next to the key, in the same `./.env`:
+  ```
+  printf 'AURA_HERMES_WORKER=hermes -z\n' >> ./.env
+  ```
+  (`hermes -z` is Hermes' oneshot mode: prints only the final answer to stdout
+  and bypasses approval prompts — exactly what a headless worker needs. aura
+  appends the task text as the last argument.) And run the in-call watch-loop
+  in the background — Hermes kills foreground tools on any incoming user
+  message (`busy_input_mode=interrupt`): use
+  `terminal(background=true, notify_on_complete=true)` as described in the
+  skill's Step 4.
 - **OpenClaw** — auto-approve exec so the consult is not gated:
   ```
   openclaw config set tools.exec.security full
   openclaw config set tools.exec.ask off
   ```
+  (These are already the defaults for the gateway host; the one-command
+  local-only shortcut `openclaw exec-policy preset yolo` sets both the config
+  AND the host approvals file. Restart with `openclaw gateway restart`.)
 
 **2. Raise the time / turn budget** so a multi-minute call's watch-loop is not
 cut off mid-way.
@@ -510,10 +557,11 @@ The server is env-driven (no config file is loaded); the skill launches it and
 
 - **Client can't reach a REMOTE server / call never connects.** The UDP port is
   almost always blocked **outside** the VM by the cloud **security group / NAT**.
-  The in-VM firewall (step 4b) is necessary but **not sufficient** — add an
+  The in-VM firewall (step 4c) is necessary but **not sufficient** — add an
   inbound **UDP 47821** rule in the cloud provider console. Confirm
   `AURA_PUBLIC_HOST` is the *reachable* public IP/DNS name, not a private/loopback
-  address.
+  address. If the server is behind NAT/CGNAT (Step 4a says BEHIND NAT), stop
+  fighting the firewall and switch to `AURA_TRANSPORT=iroh`.
 - **`aura-server` exits immediately with a key error
   (`no BYOK xAI key found`).** The `XAI_API_KEY` did not resolve. Check, in
   order: is the env var exported in *this* shell? is there a `./.env` with a

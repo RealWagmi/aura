@@ -17,6 +17,8 @@
 # Usage:
 #   aura-call local                          LOCAL loopback call (binds 127.0.0.1)
 #   aura-call remote <PUBLIC_HOST>           REMOTE call; clients dial PUBLIC_HOST
+#   aura-call remote                         REMOTE via iroh (AURA_TRANSPORT=iroh):
+#                                            no public host / open port needed
 # Options:
 #   --host <claude|codex|hermes|openclaw>    select the host adapter (default: claude)
 #   -h, --help                               show this help
@@ -24,6 +26,9 @@
 # Env overrides honoured:
 #   AURA_SERVER_BIN   explicit path to aura-server (else PATH, else ~/.local/bin)
 #   AURA_PORT         fixed UDP port (default 47821); read by aura-server itself
+#   AURA_TRANSPORT    'iroh' = NAT/CGNAT-friendly QUIC transport (hole-punch +
+#                     blind relay fallback); the connection string then carries
+#                     the server's node id instead of host:port
 #
 # Portable to Linux and macOS (bash 3.2, BSD tools; no setsid, no GNU timeout).
 
@@ -41,11 +46,14 @@ usage() {
 Usage:
   aura-call local                       Start a LOCAL (loopback) call on 127.0.0.1
   aura-call remote <PUBLIC_HOST>        Start a REMOTE call; clients dial PUBLIC_HOST
+  aura-call remote                      REMOTE via iroh (needs AURA_TRANSPORT=iroh):
+                                        no public host and no open port required
 Options:
   --host <claude|codex|hermes|openclaw> Select the host adapter (default: claude)
   -h, --help                            Show this help and exit
 Prints one line on stdout (the single-use connection string, ~120 s validity):
-  AURA_CONNECT='aura://HOST:PORT#k=...&c=...' aura-cli
+  direct: AURA_CONNECT='aura://HOST:PORT#k=...&c=...' aura-cli
+  iroh:   AURA_CONNECT='aura://<node-id>#k=...&c=...&t=iroh' aura-cli
 EOF
 }
 
@@ -81,12 +89,20 @@ case "$mode" in
   local)
     export AURA_PUBLIC_HOST="127.0.0.1" ;;
   remote)
-    [ -n "$public_host" ] || die "remote mode needs a public host: aura-call remote <PUBLIC_HOST>"
-    case "$public_host" in
-      127.*|localhost|::1|0.0.0.0)
-        die "remote mode needs a real public host, not a loopback/wildcard ($public_host)" ;;
-    esac
-    export AURA_PUBLIC_HOST="$public_host" ;;
+    if [ "${AURA_TRANSPORT:-}" = "iroh" ]; then
+      # iroh transport: the connection string carries the server's node id and
+      # the client resolves it via iroh discovery — no public host, no open
+      # port. A host argument, if given, is accepted but not used.
+      [ -z "$public_host" ] \
+        || printf '%s: note: AURA_TRANSPORT=iroh — ignoring the public host argument (%s)\n' "$prog" "$public_host" >&2
+    else
+      [ -n "$public_host" ] || die "remote mode needs a public host: aura-call remote <PUBLIC_HOST> (or set AURA_TRANSPORT=iroh for a NAT'd server — then no host is needed)"
+      case "$public_host" in
+        127.*|localhost|::1|0.0.0.0)
+          die "remote mode needs a real public host, not a loopback/wildcard ($public_host)" ;;
+      esac
+      export AURA_PUBLIC_HOST="$public_host"
+    fi ;;
 esac
 
 # Host adapter selection (default: Claude). AURA_HOST is the explicit override the

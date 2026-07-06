@@ -451,16 +451,27 @@ impl CallSession {
         );
         // Post-call summary: close the context loop call→chat.
         // Best-effort/fail-open and time-bounded — neither a delivery error nor
-        // a slow host adapter changes the outcome or stalls teardown.
+        // a slow host adapter changes the outcome or stalls teardown. An empty
+        // transcript still delivers a minimal note: "the recap is silently
+        // missing" and "the call produced nothing" must be distinguishable to
+        // the host (a 15-minute call with no recap looks like a delivery bug).
         let recap = transcript.recap();
-        if !recap.is_empty() {
-            match tokio::time::timeout(RECAP_DELIVERY_TIMEOUT, host.deliver_call_summary(&recap))
-                .await
-            {
-                Ok(Err(e)) => eprintln!("aura-engine: call summary delivery failed: {e}"),
-                Err(_) => eprintln!("aura-engine: call summary delivery timed out"),
-                Ok(Ok(_)) => {}
-            }
+        let payload = if recap.is_empty() {
+            format!(
+                "The voice call ended ({:?}) after {:.0} s. No transcript lines were \
+                 captured and no in-call tasks were dispatched.",
+                outcome.reason,
+                call_started.elapsed().as_secs_f64()
+            )
+        } else {
+            recap
+        };
+        match tokio::time::timeout(RECAP_DELIVERY_TIMEOUT, host.deliver_call_summary(&payload))
+            .await
+        {
+            Ok(Err(e)) => eprintln!("aura-engine: call summary delivery failed: {e}"),
+            Err(_) => eprintln!("aura-engine: call summary delivery timed out"),
+            Ok(Ok(_)) => {}
         }
         Ok(outcome)
     }

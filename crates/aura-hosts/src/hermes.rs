@@ -201,7 +201,7 @@ impl HermesAdapter {
             cwd: cwd.into(),
             home: None,
             profile: None,
-            worker_command: None,
+            worker_command: worker_command_from_env(),
             last_envelope: Mutex::new(None),
             task_counter: AtomicU64::new(1),
         }
@@ -224,6 +224,25 @@ impl HermesAdapter {
     fn resolved_home(&self) -> Option<PathBuf> {
         resolve_hermes_home(self.home.as_deref())
     }
+}
+
+/// The direct-dispatch worker command from `AURA_HERMES_WORKER`, whitespace-
+/// split into `cmd + args` (quoted arguments with embedded spaces are not
+/// supported — keep the command simple). The task's user intent is appended as
+/// the FINAL argument at spawn time and `CODEXINI_TASK_ID` is set in the
+/// worker's environment; the spoken result is the worker's `SUMMARY:` line
+/// (else its last non-empty stdout line). Recommended value: `hermes -z` —
+/// hermes-agent's oneshot mode (source-verified): prints ONLY the final answer
+/// to stdout, bypasses approval prompts, exits 0/1/2. Unset/empty → no worker:
+/// dispatch hands the envelope back un-executed (the skill's watch-loop is
+/// then the only executor).
+fn worker_command_from_env() -> Option<Vec<String>> {
+    let raw = std::env::var("AURA_HERMES_WORKER").ok()?;
+    let parts: Vec<String> = raw.split_whitespace().map(str::to_owned).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts)
 }
 
 #[async_trait]
@@ -273,8 +292,11 @@ impl AgentRuntime for HermesAdapter {
             return TaskResult {
                 task_id,
                 handoff_state: TaskHandoffState::EnvelopePrepared,
-                speech_update: "I prepared the task, but no Hermes worker command is configured \
-                                to run it."
+                speech_update: "I prepared the task, but no Hermes worker is configured for \
+                                direct dispatch — the live chat session will need to run it. \
+                                To enable the fallback, launch the server with the \
+                                AURA_HERMES_WORKER environment variable set to the worker \
+                                command."
                     .to_owned(),
                 envelope,
             };
@@ -407,6 +429,38 @@ impl HostAdapter for HermesAdapter {
         Ok(CallbackAck {
             delivered: false,
             detail: "hermes callback delivery is routed through the hosted gateway".to_owned(),
+        })
+    }
+
+    async fn deliver_call_summary(&self, transcript: &str) -> Result<CallbackAck, HostError> {
+        // Claude-style override: the trait default routes the recap through
+        // `deliver_callback`, which for Hermes is a hosted-gateway no-op — a
+        // 15-minute call then looks like "recap=(none)" to the session. Write
+        // the full redacted transcript to a local file instead; the
+        // orchestrating session (the skill's Step 5) reads and summarizes it.
+        let recap = redact_secrets(transcript);
+        let recap = recap.trim();
+        if recap.is_empty() {
+            return Ok(CallbackAck {
+                delivered: false,
+                detail: "empty call; nothing to recap".to_owned(),
+            });
+        }
+        let capped: String = recap.chars().take(crate::CALL_SUMMARY_MAX_CHARS).collect();
+        let dir = self.cwd.join(".aura");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| HostError::Callback(e.to_string()))?;
+        let path = dir.join("aura-last-call-recap.md");
+        let body = format!(
+            "# Voice call transcript (developer + Aura) - summarize this for the chat\n\n{capped}\n"
+        );
+        tokio::fs::write(&path, body)
+            .await
+            .map_err(|e| HostError::Callback(e.to_string()))?;
+        Ok(CallbackAck {
+            delivered: true,
+            detail: format!("wrote the call transcript to {}", path.display()),
         })
     }
 }

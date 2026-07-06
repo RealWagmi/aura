@@ -49,13 +49,18 @@ running. Pass `--host <kind>` so host resolution is deterministic:
 conn="$(aura-call local --host <kind>)"
 # REMOTE (clients dial the VPS public IP):
 conn="$(aura-call remote <VPS_PUBLIC_IP> --host <kind>)"
+# REMOTE behind NAT (AURA_TRANSPORT=iroh was set at onboarding) — no public IP needed:
+conn="$(aura-call remote --host <kind>)"
 ```
 
 `<kind>` = `claude` | `codex` | `hermes` | `openclaw` (the host you are — see the
-table). `conn` holds one line; the secret is the `#k=` fragment, single-use, ~120 s:
+table). `conn` holds one line; the secret is the `#k=` fragment, single-use, ~120 s.
+With iroh the string carries a node id (`&t=iroh`) instead of `HOST:PORT` — hand it
+to the user exactly the same way:
 
 ```
-AURA_CONNECT='aura://HOST:PORT#k=<secret>&c=<call_id>' aura-cli
+AURA_CONNECT='aura://HOST:PORT#k=<secret>&c=<call_id>' aura-cli          # direct
+AURA_CONNECT='aura://<node-id>#k=<secret>&c=<call_id>&t=iroh' aura-cli   # iroh
 ```
 
 The server needs `XAI_API_KEY` (env / OS keychain / `./.env`); if it is missing,
@@ -114,10 +119,31 @@ call ends:
 error), `dropped` (server pid gone — a crash, detected via the recorded pid, so
 you always learn the call ended).
 
-**Can't hold a live loop?** (a host whose session can't keep looping across
-turns) — skip the loop and just monitor: `aura-call-status --wait`. Dispatches
-still execute: when no orchestrator is draining the inbox, aura spawns each task
-directly — you only lose the live-context edge, nothing breaks.
+**Hermes / messenger-gateway hosts (Telegram etc.): never run the loop in the
+foreground.** Hermes' default `busy_input_mode=interrupt` kills an in-flight
+foreground tool the moment the user sends a message, and foreground `terminal`
+timeouts are hard-capped at 600 s — a blocking `aura-inbox wait` loop dies on
+the first user turn (dispatches then all cold-fallback). Instead run each wait
+in the background with completion notification:
+`terminal(command="aura-inbox wait --timeout 300", background=true,
+notify_on_complete=true)` — the `[IMPORTANT: Background process ... completed]`
+notification re-enters as a new turn when you are idle (CLI and gateway alike);
+read its output, handle the TASK (or `NO_TASK` → check `aura-call-status`),
+`aura-inbox done <id> "..."`, and re-arm the next background wait.
+
+**OpenClaw:** its exec tool auto-backgrounds any command that runs past
+`yieldMs` (default 10 s) and wakes you with a system event on exit
+(`tools.exec.notifyOnExit`, on by default) — so `aura-inbox wait --timeout 300`
+naturally becomes a background wait: act on the exit notification, then re-arm.
+Incoming user messages do NOT kill the in-flight run (default queue mode
+`steer` injects them at the next model boundary). Do not re-poll in a tight
+loop — OpenClaw's own docs forbid emulating scheduling with sleep/poll loops.
+
+**Can't hold a live loop at all?** — skip the loop and just monitor:
+`aura-call-status --wait`. Dispatches still execute: when no orchestrator is
+draining the inbox, aura spawns each task directly — you only lose the
+live-context edge, nothing breaks. (On Hermes the direct fallback needs
+`AURA_HERMES_WORKER` set at launch — see the per-host table.)
 
 ## Step 5 — After the call: summarize, don't paste
 
@@ -137,8 +163,8 @@ you handle dispatch yourself (answer live, or delegate to that same executor).
 |---|---|---|---|---|
 | **Claude Code** | `claude` (default) | transcript JSONL `~/.claude/projects/<cwd>/` | `claude -p` in the repo (model matched to your chat) | `.aura/hooks/aura-last-claude-result.json` (`compact_summary`) |
 | **Codex** | `codex` (or auto `AURA_AGENT=codex`) | rollout JSONL `~/.codex/sessions/` | `codex app-server` (`turn/start`) | app-server note, prefixed `Aura voice callback:` |
-| **Hermes** | `hermes` (**required**) | `~/.hermes/profiles/<active>/state.db` | Hermes worker (`PROGRESS:` / `SUMMARY:`) | result-message in the conversation |
-| **OpenClaw** | `openclaw` (or auto via identity env) | host-brief, else workspace fetcher | `openclaw_agent_consult` (gated) | runtime-inbox `tool_result` (AES-GCM when keyed) |
+| **Hermes** | `hermes` (**required**) | `~/.hermes/profiles/<active>/state.db` | worker subprocess from `AURA_HERMES_WORKER` — recommended value `hermes -z` (oneshot: answer-only stdout, approvals bypassed); the intent is appended as the last arg, the `SUMMARY:` line (else last stdout line) is spoken. Unset = no fallback: the Step 4 loop is the only executor | `.aura/aura-last-call-recap.md` (full redacted transcript — read + summarize it) |
+| **OpenClaw** | `openclaw` (or auto via identity env) | host-brief, else workspace fetcher | `openclaw_agent_consult` (gated) | `.aura/aura-last-call-recap.md` (full redacted transcript — read + summarize it); plus a runtime-inbox `tool_result` frame when the gateway inbox is configured (AES-GCM when keyed) |
 
 Claude is the default with no `--host`; Codex/OpenClaw also auto-resolve from
 their own env; **Hermes has no ambient signal — `--host hermes` is mandatory.**
@@ -156,7 +182,7 @@ and match the sub-agent's model to this chat (or pin it — see below):
 | **Claude** | `claude -p "<task>" --model <this chat's model>` (run it in the background; report on completion) |
 | **Codex** | `codex exec "<task>"` (headless), or a fresh app-server `turn/start` |
 | **OpenClaw** | `sessions_send` / `openclaw agent --message "<task>"` to an isolated agent |
-| **Hermes** | `delegate_task` with `background=true`, then `process poll,wait,log`, then relay |
+| **Hermes** | `delegate_task` (always async — its `background` param is deprecated/ignored; the result re-enters as a new message when the subagent finishes), then relay |
 
 **Pinning the dispatch model** *(optional)* — for **Claude**, the direct-spawn
 fallback already matches the model to your chat (auto-detected from the

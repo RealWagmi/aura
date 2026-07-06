@@ -14,9 +14,11 @@
 //!   per-host shim (e.g. the Hermes `codexini-call` skill, which has no ambient
 //!   env of its own) names itself.
 //! - **`AURA_AGENT=codex`** — Codex's documented launcher trigger.
-//! - **OpenClaw identity env** (`OPENCLAW_SESSION_KEY` + `OPENCLAW_ACCOUNT_ID`,
-//!   from `identity-env.js`) — set when the binary runs inside an OpenClaw
-//!   session.
+//! - **OpenClaw identity env** — set when the binary runs inside an OpenClaw
+//!   session: the `OPENCLAW_MCP_SESSION_KEY` + `OPENCLAW_MCP_ACCOUNT_ID` pair
+//!   (CLI-backend agent runs), or `OPENCLAW_SHELL=exec` (exec-tool spawns);
+//!   the legacy `OPENCLAW_SESSION_KEY` + `OPENCLAW_ACCOUNT_ID` pair is still
+//!   honoured for custom shims.
 //! - Otherwise **Claude**, the ambient default and the executing dispatcher.
 //!
 //! Reading context is always fail-open, so even a force-selected host with a
@@ -37,10 +39,19 @@ const HOST_OVERRIDE_VAR: &str = "AURA_HOST";
 const CODEX_AGENT_VAR: &str = "AURA_AGENT";
 /// The value of [`CODEX_AGENT_VAR`] that selects Codex.
 const CODEX_AGENT_VALUE: &str = "codex";
-/// OpenClaw session identity (identity-env.js) — half of the OpenClaw signal.
-const OPENCLAW_SESSION_VAR: &str = "OPENCLAW_SESSION_KEY";
-/// OpenClaw account identity (identity-env.js) — the other half.
-const OPENCLAW_ACCOUNT_VAR: &str = "OPENCLAW_ACCOUNT_ID";
+/// OpenClaw session identity for CLI-backend agent runs (source-verified:
+/// `src/agents/cli-runner/prepare.ts` sets the `OPENCLAW_MCP_*` family).
+const OPENCLAW_MCP_SESSION_VAR: &str = "OPENCLAW_MCP_SESSION_KEY";
+/// OpenClaw account identity — the other half of the CLI-backend signal.
+const OPENCLAW_MCP_ACCOUNT_VAR: &str = "OPENCLAW_MCP_ACCOUNT_ID";
+/// OpenClaw exec-tool spawns carry `OPENCLAW_SHELL=exec`
+/// (`src/agents/bash-tools.exec.ts`) — the signal when aura is launched via the
+/// exec tool rather than a CLI backend.
+const OPENCLAW_SHELL_VAR: &str = "OPENCLAW_SHELL";
+/// Legacy/custom-shim identity pair (kept for integrations that export them;
+/// these names do NOT exist in upstream OpenClaw).
+const OPENCLAW_LEGACY_SESSION_VAR: &str = "OPENCLAW_SESSION_KEY";
+const OPENCLAW_LEGACY_ACCOUNT_VAR: &str = "OPENCLAW_ACCOUNT_ID";
 /// Optional pin for the in-call dispatch model (`dispatch_model`): Claude →
 /// `claude -p --model`, Codex → app-server `params.model`. When UNSET, Claude
 /// auto-matches the live chat session's model (from the transcript); Codex does
@@ -123,8 +134,16 @@ pub fn build_host(kind: HostKind, cwd: impl Into<PathBuf>) -> Arc<dyn HostAdapte
 pub fn resolve_host(cwd: impl Into<PathBuf>) -> Arc<dyn HostAdapter> {
     let override_raw = std::env::var(HOST_OVERRIDE_VAR).ok();
     let codex_agent = std::env::var(CODEX_AGENT_VAR).ok();
-    let openclaw_identity = std::env::var_os(OPENCLAW_SESSION_VAR).is_some()
-        && std::env::var_os(OPENCLAW_ACCOUNT_VAR).is_some();
+    // OpenClaw ambient signals, strongest first: the CLI-backend identity pair
+    // (`OPENCLAW_MCP_*`), an exec-tool spawn (`OPENCLAW_SHELL=exec`), or the
+    // legacy custom-shim pair.
+    let openclaw_identity = (std::env::var_os(OPENCLAW_MCP_SESSION_VAR).is_some()
+        && std::env::var_os(OPENCLAW_MCP_ACCOUNT_VAR).is_some())
+        || std::env::var(OPENCLAW_SHELL_VAR)
+            .map(|v| v.trim().eq_ignore_ascii_case("exec"))
+            .unwrap_or(false)
+        || (std::env::var_os(OPENCLAW_LEGACY_SESSION_VAR).is_some()
+            && std::env::var_os(OPENCLAW_LEGACY_ACCOUNT_VAR).is_some());
     let kind = resolve_kind(
         override_raw.as_deref(),
         codex_agent.as_deref(),

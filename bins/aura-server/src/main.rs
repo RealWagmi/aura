@@ -40,7 +40,16 @@ const PERSONA: &str = "You are Aura, the developer's voice companion. THE CALL I
     about the codebase. Tell the developer briefly what you're doing, dispatch, \
     then paraphrase the result when it comes back. If you dispatch a long task \
     and there's nothing to discuss meanwhile, call `pause_call_until` \
-    (until='task_complete'). Call `end_voice_session` when they say goodbye.";
+    (until='task_complete'). Call `end_voice_session` when they say goodbye.\n\n\
+    STAY GROUNDED. You may speak freely from exactly two sources: the context \
+    you were given (the background below plus what is said on this call) and \
+    general knowledge for casual conversation. For ANYTHING project-specific \
+    that is not in that context — code details, file contents, configs, \
+    current task or repo status, logs, data that would need looking up — do \
+    NOT answer from memory and do NOT improvise: route it to the worker \
+    (`ask_worker_question` for lookups, `start_agent_task` for work) and relay \
+    what comes back. If you are not sure whether you actually know, dispatch \
+    instead of guessing — a short wait beats a confident wrong answer.";
 
 /// Instruction budget in tokens.
 const INSTRUCTION_BUDGET_TOKENS: u32 = 6_000;
@@ -112,9 +121,12 @@ fn print_server_help() {
          XAI_API_KEY           BYOK key (env / OS keychain / ./.env) — required\n  \
          AURA_PUBLIC_HOST      host clients dial (default 127.0.0.1 = LOCAL)\n  \
          AURA_PORT             UDP port (default 47821)\n  \
-         AURA_TRANSPORT=iroh   NAT/CGNAT P2P transport\n  \
+         AURA_TRANSPORT=iroh   NAT/CGNAT P2P transport (no open port needed)\n  \
          AURA_DISPATCH_MODEL   pin the in-call dispatch model\n  \
-         AURA_FEEDER=1         opt in to the live ambient feeder",
+         AURA_FEEDER=1         opt in to the live ambient feeder\n\n\
+         Connection string printed for the caller (single-use, ~120 s):\n  \
+         direct:  aura://HOST:PORT#k=<secret>&c=<call>\n  \
+         iroh:    aura://<node-id>#k=<secret>&c=<call>&t=iroh   (server behind NAT)",
         env!("CARGO_PKG_VERSION")
     );
 }
