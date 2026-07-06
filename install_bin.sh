@@ -225,6 +225,30 @@ install_file() {  # install_file <name> [+x]
   cp -f "$TMP/x/$name" "$BIN_DIR/$name"
   chmod 0755 "$BIN_DIR/$name"
   ok "installed $BIN_DIR/$name"
+  verify_binary_runs "$name"
+}
+
+# A prebuilt binary can install fine yet not RUN on this system (the classic
+# case: the release was built against a newer glibc than the machine has —
+# `GLIBC_X.Y not found`). Catch that here, at install time, instead of at the
+# first call: probe the real aura binaries with --version and hand the user
+# the source-build fallback on failure.
+verify_binary_runs() {
+  local name="$1"
+  case "$name" in
+    aura-cli|aura-server) ;;   # helper scripts need no probe
+    *) return 0 ;;
+  esac
+  if "$BIN_DIR/$name" --version >/dev/null 2>&1; then
+    return 0
+  fi
+  err "$name installed but does NOT run on this system:"
+  "$BIN_DIR/$name" --version 2>&1 | sed 's/^/      /' >&2 || true
+  err "this usually means the prebuilt binary needs a newer glibc than this OS has."
+  note "Build from source instead (compiles against YOUR system libraries):"
+  note "    curl -fsSL ${SOURCE_INSTALL_URL} | bash -s -- ${ORIG_FLAGS:-}"
+  rm -f "$BIN_DIR/$name"
+  die "removed the non-working binary; use the source installer above."
 }
 
 # PATH wiring (append to shell rc only if missing) — same policy as install.sh.

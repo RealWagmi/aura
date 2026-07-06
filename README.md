@@ -113,6 +113,8 @@ macOS (CoreAudio) and Windows (WASAPI) need no extra audio package.
 curl -fsSL https://raw.githubusercontent.com/RealWagmi/aura/main/install_bin.sh | bash -s -- --client
 ```
 
+The Linux prebuilt needs **glibc 2.31+** (Ubuntu 20.04+, Debian 11+; check with `ldd --version`). On an older system — or if the installer reports the binary does not run — use the source build below; it compiles against your own system libraries.
+
 **Or build from source** (any platform; the only option on Windows, via `install.ps1`):
 
 ```bash

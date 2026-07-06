@@ -21,15 +21,25 @@ jobs:
   build:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    # Linux legs build INSIDE an ubuntu:20.04 container so the binaries link
+    # against glibc 2.31 — a binary requires the glibc it was built on, so the
+    # build floor IS the runtime floor. Building on the runner's own 22.04+
+    # image produced binaries needing GLIBC_2.34, which fail on Ubuntu 20.04 /
+    # Debian 11 machines. (GitHub retired the ubuntu-20.04 runners; the
+    # container is the supported way to keep the old floor.)
+    container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux: build on 22.04 (glibc 2.35) for wide forward-compatibility.
-          - os: ubuntu-22.04
+          # Linux: glibc 2.31 floor via the 20.04 container (runner arch picks
+          # the matching image variant).
+          - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            container: ubuntu:20.04
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
+            container: ubuntu:20.04
           # macOS: the arm64 runner builds both slices (x86_64 via cross codegen).
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -56,12 +66,30 @@ jobs:
           fi
           echo "tag $tag matches workspace version $ver"
 
-      # aura-cli links libasound (cpal) on Linux — needed to BUILD the client.
-      - name: Install ALSA dev headers (Linux)
+      # Inside the ubuntu:20.04 container we are root with a minimal image: no
+      # sudo, no compiler, no curl. Install everything the build needs —
+      # including libasound2-dev (cpal links it for aura-cli).
+      - name: Install build prerequisites (Linux container)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config libasound2-dev
 
-      - name: Install Rust toolchain (from rust-toolchain.toml)
+      # Rust inside the container: plain rustup (the setup action is tuned for
+      # the runner image). `--default-toolchain none` + rust-toolchain.toml
+      # keeps the pinned 1.92.0 as the single source of truth.
+      - name: Install Rust toolchain (Linux container, from rust-toolchain.toml)
+        if: runner.os == 'Linux'
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust toolchain (macOS, from rust-toolchain.toml)
+        if: runner.os == 'macOS'
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: ${{ matrix.target }}
@@ -70,6 +98,62 @@ jobs:
 
       - name: Build aura-cli + aura-server (release)
         run: cargo build --release --target ${{ matrix.target }} -p aura-cli -p aura-server
+
+      # Belt-and-braces: fail the release if the produced Linux binary demands
+      # a glibc newer than the 20.04 floor (2.31) — catches a future toolchain
+      # or dependency silently raising the requirement.
+      - name: Verify glibc floor (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          bad=$(objdump -T "target/${{ matrix.target }}/release/aura-cli" \
+                          "target/${{ matrix.target }}/release/aura-server" 2>/dev/null \
+                | grep -oE 'GLIBC_2\.[0-9]+' | sort -Vu \
+                | awk -F. '$2 > 31' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::binaries require glibc symbols above the 2.31 floor: $bad"
+            exit 1
+          fi
+          echo "glibc floor OK (<= 2.31)"
+          # And they must actually run in this (oldest-supported) environment
+          # (libasound2 is present via the dev package installed above).
+          "target/${{ matrix.target }}/release/aura-server" --version
+          "target/${{ matrix.target }}/release/aura-cli" --version
+
+      # Same idea for macOS: the deployment target (minos) embedded in the
+      # Mach-O header IS the runtime floor. Rust's defaults are 11.0 (arm64 —
+      # every Apple Silicon Mac) and 10.12 (Intel); fail the release if a
+      # toolchain/dependency change silently raises it past the ceiling and
+      # would cut off users on older macOS.
+      - name: Verify macOS deployment-target floor
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          case "${{ matrix.target }}" in
+            aarch64-*) ceil="11.0" ;;
+            *)         ceil="10.13" ;;
+          esac
+          for bin in aura-cli aura-server; do
+            f="target/${{ matrix.target }}/release/$bin"
+            minos=$(otool -l "$f" | awk '/LC_BUILD_VERSION/{s=1} s && $1=="minos" {print $2; exit}')
+            if [ -z "$minos" ]; then
+              minos=$(otool -l "$f" | awk '/LC_VERSION_MIN_MACOSX/{s=1} s && $1=="version" {print $2; exit}')
+            fi
+            [ -n "$minos" ] || { echo "::error::$bin: could not read the deployment target"; exit 1; }
+            # Normalize to major.minor ("11.0.0" and "11.0" must compare equal).
+            minos=$(echo "$minos" | cut -d. -f1,2)
+            echo "$bin minos=$minos (ceiling $ceil)"
+            lowest=$(printf '%s\n%s\n' "$minos" "$ceil" | sort -V | head -1)
+            if [ "$lowest" != "$minos" ] && [ "$minos" != "$ceil" ]; then
+              echo "::error::$bin requires macOS $minos — above the $ceil floor ceiling (a toolchain/dependency raised the deployment target)"
+              exit 1
+            fi
+          done
+          # Native-arch smoke: the binaries must actually run on this runner.
+          if [ "$(uname -m)" = "arm64" ] && [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
+            "target/${{ matrix.target }}/release/aura-server" --version
+            "target/${{ matrix.target }}/release/aura-cli" --version
+          fi
 
       - name: Package archive + checksum
         shell: bash
