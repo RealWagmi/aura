@@ -9,6 +9,7 @@ use aura_audio::{AudioSettings, CpalTransport};
 use aura_tunnel::{
     ConnectionString, IrohEndpoint, IrohPreset, TransportKind, TunnelConfig, TunnelEndpoint,
 };
+#[cfg(windows)]
 use std::sync::Arc;
 
 #[cfg(windows)]
@@ -17,9 +18,11 @@ mod hotkey;
 #[derive(Debug, Clone)]
 enum InputMode {
     Voice,
+    #[cfg(windows)]
     TogglePushToTalk(PushToTalkGate),
 }
 
+#[cfg(windows)]
 #[derive(Debug, Clone)]
 struct PushToTalkGate {
     state: Arc<std::sync::atomic::AtomicU64>,
@@ -39,6 +42,7 @@ impl InputMode {
     }
 }
 
+#[cfg(windows)]
 impl PushToTalkGate {
     fn press_count(&self) -> u64 {
         self.state.load(std::sync::atomic::Ordering::Acquire)
@@ -198,13 +202,18 @@ async fn pump<T: VoiceTunnel>(mut tunnel: T) -> Result<(), Box<dyn std::error::E
     eprintln!("aura: tunnel up. Acquiring microphone and speaker…");
     let mut audio = CpalTransport::start(AudioSettings::default())?;
     let input_mode = InputMode::from_env()?;
+    #[cfg(windows)]
     let mut ptt_recording = false;
+    #[cfg(windows)]
     let mut ptt_seen_presses = match &input_mode {
         InputMode::Voice => 0,
         InputMode::TogglePushToTalk(gate) => gate.press_count(),
     };
+    #[cfg(windows)]
     let mut ptt_buffer: Vec<Vec<i16>> = Vec::new();
+    #[cfg(windows)]
     const MAX_PUSH_TO_TALK_BUFFER_FRAMES: usize = 1_500;
+    #[cfg(windows)]
     if let InputMode::TogglePushToTalk(gate) = &input_mode {
         eprintln!(
             "aura: push-to-talk is enabled. Press {} to start talking, then press {} again to send.",
@@ -217,6 +226,7 @@ async fn pump<T: VoiceTunnel>(mut tunnel: T) -> Result<(), Box<dyn std::error::E
             mic = audio.recv_pcm24() => match mic {
                 Some(frame) => match &input_mode {
                     InputMode::Voice => tunnel.send_pcm24(&frame),
+                    #[cfg(windows)]
                     InputMode::TogglePushToTalk(gate) => {
                         let presses = gate.press_count();
                         if presses != ptt_seen_presses {
