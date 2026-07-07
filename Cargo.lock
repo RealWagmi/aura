@@ -164,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "aura-audio"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cpal",
  "crossbeam-queue",
@@ -176,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "aura-cli"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "aura-audio",
  "aura-tunnel",
@@ -185,7 +185,7 @@ dependencies = [
 
 [[package]]
 name = "aura-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -199,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "aura-engine"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "aura-core",
@@ -214,7 +214,7 @@ dependencies = [
 
 [[package]]
 name = "aura-feeder"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "aura-core",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "aura-hosts"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -251,7 +251,7 @@ dependencies = [
 
 [[package]]
 name = "aura-server"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "aura-core",
  "aura-engine",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "aura-tunnel"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "aura-engine",
@@ -282,7 +282,7 @@ dependencies = [
 
 [[package]]
 name = "aura-voice"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "aura-core",

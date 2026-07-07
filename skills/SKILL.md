@@ -1,5 +1,5 @@
 ---
-name: aura
+name: voice-call
 description: >-
   Place an Aura voice call so the user can talk to this chat by voice — direct
   audio, no speech-to-text. Use when the user asks to be called or to talk by
@@ -148,11 +148,11 @@ error), `dropped` (server pid gone — a crash, detected via the recorded pid, s
 you always learn the call ended).
 
 **Messenger hosts — run the wait in the BACKGROUND (see Read-first #3):**
-- **Hermes**: `terminal(command="aura-inbox wait --timeout 300",
+- **Hermes**: `terminal(command="aura-inbox wait --timeout 600",
   background=true, notify_on_complete=true)`. A foreground tool is killed by
   the first user message and capped at 600 s. On the completion notification:
   read the output, handle it, re-arm the next background wait.
-- **OpenClaw**: run the same `aura-inbox wait --timeout 300` — exec
+- **OpenClaw**: run the same `aura-inbox wait --timeout 600` — exec
   auto-backgrounds it after 10 s and notifies on exit; act on the exit event,
   re-arm. Do not tight-poll.
 

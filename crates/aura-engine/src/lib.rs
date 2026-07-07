@@ -247,13 +247,12 @@ impl CallSession {
         // interruptible; detecting an open speaker is a follow-up.
         let echo_risk = false;
 
-        // The reconnect handshake re-establishes the session with the same
-        // composed instructions (no re-inject) but must NOT replay the
-        // cold-start greeting mid-call.
-        let reconnect_cfg = VoiceSessionConfig {
-            cold_start_kick: false,
-            ..cfg.clone()
-        };
+        // Mid-call reconnects rebuild their session config PER ATTEMPT via
+        // `build_reconnect_cfg`: original instructions + the dialogue-so-far
+        // digest + a continuity directive. A static config here (the original
+        // instructions alone) made every reconnect an AMNESIAC fresh session —
+        // the model forgot the conversation of seconds ago and could switch
+        // languages whenever the link blipped.
 
         let (mut sink, mut stream) = provider.connect(&cfg).await?;
         // Call-duration metric: wall-clock from a connected session
@@ -326,7 +325,7 @@ impl CallSession {
                     mic = transport.recv_pcm24() => match mic {
                         Some(pcm) => {
                             if sink.send_audio(&pcm).await.is_err() {
-                                match reconnect(&provider, &reconnect_cfg).await {
+                                match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript)).await {
                                     Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
                                     None => break Transition::Ended(EndReason::ReconnectExhausted),
                                 }
@@ -335,7 +334,7 @@ impl CallSession {
                         None => break Transition::Ended(EndReason::HangUp),
                     },
                     ev = stream.next_event() => match ev {
-                        None => match reconnect(&provider, &reconnect_cfg).await {
+                        None => match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript)).await {
                             Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
                             None => break Transition::Ended(EndReason::ReconnectExhausted),
                         },
@@ -343,7 +342,7 @@ impl CallSession {
                             if e.is_terminal() {
                                 break Transition::Ended(EndReason::ProviderFatal);
                             }
-                            match reconnect(&provider, &reconnect_cfg).await {
+                            match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript)).await {
                                 Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
                                 None => break Transition::Ended(EndReason::ReconnectExhausted),
                             }
@@ -386,7 +385,7 @@ impl CallSession {
                                     let cond = state.pending_pause.take().unwrap_or(PauseCondition::TaskComplete);
                                     break Transition::Pause(cond);
                                 }
-                                Flow::Reconnect => match reconnect(&provider, &reconnect_cfg).await {
+                                Flow::Reconnect => match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript)).await {
                                     Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
                                     None => break Transition::Ended(EndReason::ReconnectExhausted),
                                 },
@@ -803,6 +802,37 @@ async fn run_paused(
             tokio::time::sleep(Duration::from_secs(PAUSE_EVENT_SAFETY_SECS)).await;
             Latched::None
         }
+    }
+}
+
+/// Build the session config for a MID-CALL reconnect: the original composed
+/// instructions + the most recent dialogue lines + a strict continuity
+/// directive. The reconnected session must feel like the same uninterrupted
+/// conversation — same topic, same language, no fresh greeting.
+fn build_reconnect_cfg(
+    cfg: &VoiceSessionConfig,
+    transcript: &InCallTranscript,
+) -> VoiceSessionConfig {
+    let mut instructions = cfg.instructions.clone();
+    let digest = transcript.digest();
+    if !digest.is_empty() {
+        instructions.push_str(
+            "\n\n[Connection recovery: the realtime link dropped for a moment and was \
+             re-established MID-CALL. The conversation so far (most recent lines):\n",
+        );
+        instructions.push_str(&digest);
+        instructions.push_str("\n]");
+    }
+    instructions.push_str(
+        "\n\n[Continue the SAME conversation seamlessly: do NOT greet again, do NOT \
+         restart or re-introduce yourself, do NOT change language — keep speaking \
+         the language the conversation above is in, and pick up exactly where it \
+         left off. The developer may not even have noticed the blip.]",
+    );
+    VoiceSessionConfig {
+        instructions,
+        cold_start_kick: false,
+        ..cfg.clone()
     }
 }
 

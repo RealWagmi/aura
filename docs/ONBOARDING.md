@@ -343,14 +343,14 @@ serves every host.
 
 ```bash
 # Claude Code (the default) scans ~/.claude/skills/<name>/:
-mkdir -p ~/.claude/skills/aura && cp skills/SKILL.md ~/.claude/skills/aura/SKILL.md
+mkdir -p ~/.claude/skills/voice-call && cp skills/SKILL.md ~/.claude/skills/voice-call/SKILL.md
 ```
 
 **Create the directory first** (`mkdir -p`) — otherwise the `cp` (or a `curl -o`
 if you fetch the file instead) fails with `No such file or directory`.
 
 For another runtime, substitute its skills directory — e.g.
-`~/.codex/skills/aura/`, `~/.hermes/skills/aura/`, `~/.openclaw/skills/aura/`, or
+`~/.codex/skills/voice-call/`, `~/.hermes/skills/voice-call/`, `~/.openclaw/skills/voice-call/`, or
 wherever your host scans. The file you copy is the same in every case.
 
 The `aura-call`, `aura-call-status`, and `aura-inbox` helpers the skill uses are

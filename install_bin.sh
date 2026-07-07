@@ -346,7 +346,7 @@ EOF
 ${C_BOLD}${C_YELLOW}UPDATE detected — refresh the host skill.${C_RESET}
   *** AI AGENT: the skill may have changed in this release, and the copy in
   YOUR skills directory is NOT updated automatically. Re-copy it NOW: ***
-      cp $SHARE_DIR/SKILL.md ~/.claude/skills/aura/SKILL.md
+      cp $SHARE_DIR/SKILL.md ~/.claude/skills/voice-call/SKILL.md
   (substitute your framework's skills dir if not Claude Code), then re-read it
   before the next call. The onboarding config (key, port) needs NO redo.
 EOF

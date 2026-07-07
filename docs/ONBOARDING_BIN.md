@@ -161,10 +161,10 @@ or the `cp` fails with `No such file or directory`:
 
 ```bash
 # Claude Code (the default) scans ~/.claude/skills/<name>/:
-mkdir -p ~/.claude/skills/aura && cp ~/.local/share/aura/SKILL.md ~/.claude/skills/aura/SKILL.md
+mkdir -p ~/.claude/skills/voice-call && cp ~/.local/share/aura/SKILL.md ~/.claude/skills/voice-call/SKILL.md
 ```
-For another runtime substitute its skills dir (e.g. `~/.codex/skills/aura/`,
-`~/.hermes/skills/aura/`, `~/.openclaw/skills/aura/`). The file is the same
+For another runtime substitute its skills dir (e.g. `~/.codex/skills/voice-call/`,
+`~/.hermes/skills/voice-call/`, `~/.openclaw/skills/voice-call/`). The file is the same
 everywhere; the per-host details are examples inside it. Reload your host so it
 picks up the skill.
 
