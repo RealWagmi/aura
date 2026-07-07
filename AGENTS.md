@@ -7,9 +7,8 @@ with code in this repository.
 
 ## Codex operating rules
 
-This file intentionally mirrors the project guidance in `CLAUDE.md`; keep both
-files in parity when changing architecture, invariants, setup, or project
-status. Claude Code reads `CLAUDE.md`; Codex reads `AGENTS.md`.
+Keep this file updated when architecture, invariants, setup, or project status
+changes.
 
 - Use PowerShell on Windows.
 - Do not print secrets. Never echo `XAI_API_KEY`, `.env` contents, or
