@@ -1334,8 +1334,7 @@ mod tests {
             "checkpoints": {"log_path": dir.join("not-aura").join("checkpoints.jsonl")},
             "sessions": {"dir": ".aura/../sessions"}
         });
-        fs::write(&config_path, serde_json::to_vec_pretty(&raw).unwrap())
-        .unwrap();
+        fs::write(&config_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
 
         let config = load_or_default(Some(&config_path)).unwrap();
 
