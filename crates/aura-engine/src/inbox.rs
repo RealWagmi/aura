@@ -450,8 +450,10 @@ fn task_pid(id: &str) -> Option<u32> {
 /// still means "exists"). Guards pid 0 / out-of-range values (never signals a
 /// process group). On non-Unix targets liveness cannot be probed cheaply, so
 /// everything reads as alive (conservative: keep data, never double-execute).
+/// Public: `aura-server`'s `inbox wait` also probes the recorded call-server
+/// pid with it to detect a crashed call promptly.
 #[cfg(unix)]
-fn pid_is_alive(pid: u32) -> bool {
+pub fn pid_is_alive(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
     }
@@ -466,7 +468,7 @@ fn pid_is_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn pid_is_alive(_pid: u32) -> bool {
+pub fn pid_is_alive(_pid: u32) -> bool {
     true
 }
 

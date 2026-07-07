@@ -5,7 +5,9 @@ description: >-
   audio, no speech-to-text. Use when the user asks to be called or to talk by
   voice ("call me", "let's talk", "voice", "switch to voice"). Launches
   aura-server, relays the single-use connection string, connects (local) or
-  sends it (remote), monitors the call, then summarizes the recap.
+  sends it (remote), monitors the call, then summarizes the recap. At call time
+  FOLLOW THIS SKILL step by step (do not improvise from onboarding memory), and
+  verify `aura-inbox alive` prints the SAME state dir the server logs.
 trigger: >-
   The user asks for a voice call — "call me", "let's talk", "voice call",
   "switch to voice", or any explicit call intent. Never start a call unprompted.
@@ -13,6 +15,18 @@ allowed-tools: Bash
 ---
 
 # Aura voice call — universal host skill
+
+## ⚠️ Read first — the two ways calls silently break
+
+1. **Do not run this flow from memory.** Onboarding installed aura; it did NOT
+   teach the call flow. Re-open this skill when the user asks for a call.
+2. **State-dir mismatch = failure mode #1.** `aura-inbox alive` prints
+   `ALIVE <DIR>`. That DIR must be the pinned `AURA_STATE_DIR` (else the dir
+   you launch calls from) — anything else means you silently miss every task
+   and read stale status (fix in Step 4, point 1).
+3. **Messenger hosts (Hermes / OpenClaw / any Telegram-style gateway): the
+   Step 4 wait runs in the BACKGROUND** — a foreground loop dies on the first
+   user message.
 
 One skill for every host (Claude Code, Codex, Hermes, OpenClaw, …). The flow is
 identical everywhere; only per-host details differ (host-select, context source,
@@ -92,19 +106,32 @@ real time, so the work runs with *your* live context and model — not a cold
 worker. Run this loop yourself (one command, then act, then repeat) until the
 call ends:
 
-1. `aura-inbox alive` — once, to arm the orchestrator (route dispatch to you).
-   Run every `aura-inbox` command from the **call's project directory** (the same
-   dir you launched the call in) — the inbox lives in `./.aura/inbox` there.
+1. `aura-inbox alive` — arm the orchestrator. It prints `ALIVE <dir>`. The
+   dir must be the **pinned `AURA_STATE_DIR`** (else the dir you launched the
+   call from). Example — pinned root is `/home/u`:
+   - `ALIVE /home/u/.aura/inbox` → proceed to (2).
+   - `ALIVE /home/u/some-project/.aura/inbox` (or ANY other path) → **STOP.
+     Do not loop.** Pin the shared root once, then start a fresh call:
+     ```bash
+     mkdir -p ~/.config/aura && printf 'AURA_STATE_DIR=%s\n' "$HOME" >> ~/.config/aura/.env
+     ```
+     (Everything — inbox, call-status, recap files — roots at
+     `AURA_STATE_DIR`, else at each process's own cwd, which drifts on hosts
+     whose exec starts every command in a fresh cwd.)
 2. `aura-inbox wait --timeout 20` — blocks up to 20 s for the next task,
-   refreshing your liveness. It prints `NO_TASK`, or:
+   refreshing your liveness. It prints exactly ONE of:
+   - `CALL_ENDED state=<ended|failed|dropped>` → the call is over (printed the
+     moment it ends, even mid-wait) — go to Step 5 NOW.
+   - `NO_TASK` → nothing yet: return to (2). (Waits keep printing `NO_TASK`
+     long after the user says the call is over? Pre-0.2.3 or Windows server —
+     run `aura-call-status` manually.)
+   - a task block:
    ```
    TASK <id>
    INTENT: <what the user asked for>
    CONSTRAINTS: <…>   PROJECT: <…>
    ```
-3. On **`NO_TASK`** → run `aura-call-status`; if it shows `ended` / `failed` /
-   `dropped`, the call is over — go to Step 5. Otherwise return to (2).
-4. On **`TASK <id>`** → handle `INTENT` the way you'd handle the same request
+3. On **`TASK <id>`** → handle `INTENT` the way you'd handle the same request
    typed in this chat: do it yourself (read/edit/bash in this repo) when you can,
    or delegate a heavy/long job to a sub-agent. Then report it — spoken back into
    the call, one short speech-safe sentence (no code / paths / line numbers):
@@ -112,38 +139,26 @@ call ends:
    aura-inbox done <id> "Updated the config; tests pass."
    ```
    Return to (2). (Use `aura-inbox stall <id> "<why>"` to hand a task back — aura
-   then runs it directly instead.)
+   then runs it directly instead. `aura-call-status` exists as a manual check,
+   but the loop needs only `CALL_ENDED`.)
 
 `aura-server` exits when the call ends for ANY reason. Terminal verdicts:
 `ended` (clean hang-up / the model's `end_voice_session`), `failed` (provider
 error), `dropped` (server pid gone — a crash, detected via the recorded pid, so
 you always learn the call ended).
 
-**Hermes / messenger-gateway hosts (Telegram etc.): never run the loop in the
-foreground.** Hermes' default `busy_input_mode=interrupt` kills an in-flight
-foreground tool the moment the user sends a message, and foreground `terminal`
-timeouts are hard-capped at 600 s — a blocking `aura-inbox wait` loop dies on
-the first user turn (dispatches then all cold-fallback). Instead run each wait
-in the background with completion notification:
-`terminal(command="aura-inbox wait --timeout 300", background=true,
-notify_on_complete=true)` — the `[IMPORTANT: Background process ... completed]`
-notification re-enters as a new turn when you are idle (CLI and gateway alike);
-read its output, handle the TASK (or `NO_TASK` → check `aura-call-status`),
-`aura-inbox done <id> "..."`, and re-arm the next background wait.
+**Messenger hosts — run the wait in the BACKGROUND (see Read-first #3):**
+- **Hermes**: `terminal(command="aura-inbox wait --timeout 300",
+  background=true, notify_on_complete=true)`. A foreground tool is killed by
+  the first user message and capped at 600 s. On the completion notification:
+  read the output, handle it, re-arm the next background wait.
+- **OpenClaw**: run the same `aura-inbox wait --timeout 300` — exec
+  auto-backgrounds it after 10 s and notifies on exit; act on the exit event,
+  re-arm. Do not tight-poll.
 
-**OpenClaw:** its exec tool auto-backgrounds any command that runs past
-`yieldMs` (default 10 s) and wakes you with a system event on exit
-(`tools.exec.notifyOnExit`, on by default) — so `aura-inbox wait --timeout 300`
-naturally becomes a background wait: act on the exit notification, then re-arm.
-Incoming user messages do NOT kill the in-flight run (default queue mode
-`steer` injects them at the next model boundary). Do not re-poll in a tight
-loop — OpenClaw's own docs forbid emulating scheduling with sleep/poll loops.
-
-**Can't hold a live loop at all?** — skip the loop and just monitor:
-`aura-call-status --wait`. Dispatches still execute: when no orchestrator is
-draining the inbox, aura spawns each task directly — you only lose the
-live-context edge, nothing breaks. (On Hermes the direct fallback needs
-`AURA_HERMES_WORKER` set at launch — see the per-host table.)
+**Can't hold a live loop at all?** — just monitor: `aura-call-status --wait`.
+Dispatches still execute via the direct fallback (Hermes needs
+`AURA_HERMES_WORKER` set — see the table); you only lose the live-context edge.
 
 ## Step 5 — After the call: summarize, don't paste
 
@@ -151,13 +166,18 @@ The host callback delivers the raw in-call **transcript** — both `[developer]`
 and `[aura]` lines (the model's own transcript events; not speech-to-text),
 already redacted. Its location is per-host (see the table). **Read it and write a
 short summary into the chat** — key points, decisions, follow-ups. **Do not paste
-the raw transcript.** If there is no recap (call never connected, or empty), say so.
+the raw transcript.** Long call and the file is too big for one read? Read it in
+chunks (say 200 lines each), summarize each chunk, then merge the chunk
+summaries into one final recap. If there is no recap (call never connected, or
+empty), say so.
 
 ## Per-host specifics (examples)
 
 The **In-call dispatch** column is the direct-spawn **fallback** — what aura runs
 when no orchestrator is draining the inbox (Step 4). With the Step 4 loop running,
 you handle dispatch yourself (answer live, or delegate to that same executor).
+Relative `.aura/…` paths below resolve under `AURA_STATE_DIR` when pinned, else
+under the call's launch directory.
 
 | Host | `--host` | Context source | In-call dispatch (fallback) | Recap delivered to |
 |---|---|---|---|---|
@@ -208,6 +228,7 @@ and Codex have a per-call model knob; OpenClaw/Hermes ignore it.
 | no `aura-cli` (user side) | `install.sh --client` (Linux needs ALSA dev headers; macOS/Windows none) |
 | no `aura-server` / `aura-call` / `aura-inbox` | `install.sh --server` (needs no audio package; installs all three helpers) |
 | `XAI_API_KEY` not found | the server exits with a clear error → ask the user for their xAI key |
+| loop runs but every task cold-fallbacks; `aura-call-status` says `none`/stale while the call is clearly live | the server and the helpers are looking at DIFFERENT `.aura` dirs (cwd drift — classic on messenger hosts whose exec resets cwd). Compare the server's `in-call dispatch inbox at <dir>` log line with `aura-inbox alive`'s `ALIVE <dir>`; fix by setting `AURA_STATE_DIR` once in the aura `.env` (see Step 4.1). |
 | the model interrupts/answers ITSELF on open speakers (echo loop) | the client cancels echo by default (AEC3). If the user disabled it or runs an old client: relaunch `aura-cli` without `AURA_AEC=off`, or set `AURA_AEC=gate` (mutes the mic while the model speaks — no barge-in), or suggest headphones. |
 | Step 4 loop stalls — `aura-inbox`/edits/dispatch hang, dispatches all cold-fallback | your framework is prompting for tool approval the user can't give mid-call. Set it to **auto-approve** the orchestrator's tool calls (Claude: allow-rules `Bash(aura-inbox:*)`, `Bash(aura-call-status:*)`, `Bash(aura-call:*)` — the loop runs ALL of these helpers, the `:` before `*` is required, and `--permission-mode acceptEdits` covers edits but NOT Bash, so the allow-rules are needed; Hermes: `hermes config set approvals.cron_mode approve`; OpenClaw: `openclaw config set tools.exec.ask off`) — one-time, see onboarding Step 5b. |
 | REMOTE launch fails: `Address already in use` | LOCAL self-heals by hopping to a free port (it never kills anything). On a VPS it can't hop (the firewall is opened for one port); it reclaims the port only from a stale `aura-server` that `lsof` proves is holding it. If it still fails, kill whatever holds the port — find it with `ss -lunp 'sport = :<port>'` (or `lsof -iUDP:<port>`) — then relaunch on the **same** port. Use `pkill -x aura-server`, never `pkill -f <path>` (that also matches your own shell and kills it). |

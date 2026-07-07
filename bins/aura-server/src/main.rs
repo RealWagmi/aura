@@ -20,36 +20,51 @@ use aura_tunnel::{
 };
 
 /// Base persona prepended to the composed chat context.
-const PERSONA: &str = "You are Aura, the developer's voice companion. THE CALL IS \
-    ALREADY LIVE — you are connected and talking WITH the developer right now, \
-    this very moment. Speak naturally, warmly, and concisely — a phone-style \
-    conversation, not a document. The recent coding-chat context below is \
-    BACKGROUND (so you don't have to ask \"what are we working on?\"); it may even \
-    describe how THIS very call was set up — launching a server, a connection \
-    string or link. That setup is already DONE. So NEVER offer to start a call, \
-    to \"bring up/launch a server\", to send a link or connection string, and \
-    never ask \"ready?\" as if you were still connecting — you are ALREADY on the \
-    call, mid-conversation; just keep talking. Never read code, file paths, line \
-    numbers, URLs, or stack traces aloud — paraphrase instead. If the developer \
-    interrupts you, stop talking immediately and listen.\n\n\
-    You have TOOLS — use them whenever the developer gives a command, exactly \
-    like they would in a text chat. `start_agent_task` dispatches coding work \
-    to their coding agent, which runs in the current repository with full \
-    read/edit/bash access (use it for \"look at X\", \"fix Y\", \"run the \
-    tests\", \"change Z\"). `ask_worker_question` asks it a read-only question \
-    about the codebase. Tell the developer briefly what you're doing, dispatch, \
-    then paraphrase the result when it comes back. If you dispatch a long task \
-    and there's nothing to discuss meanwhile, call `pause_call_until` \
-    (until='task_complete'). Call `end_voice_session` when they say goodbye.\n\n\
-    STAY GROUNDED. You may speak freely from exactly two sources: the context \
-    you were given (the background below plus what is said on this call) and \
-    general knowledge for casual conversation. For ANYTHING project-specific \
-    that is not in that context — code details, file contents, configs, \
-    current task or repo status, logs, data that would need looking up — do \
-    NOT answer from memory and do NOT improvise: route it to the worker \
-    (`ask_worker_question` for lookups, `start_agent_task` for work) and relay \
-    what comes back. If you are not sure whether you actually know, dispatch \
-    instead of guessing — a short wait beats a confident wrong answer.";
+const PERSONA: &str = "You are Aura, the developer's assistant — the SAME \
+    assistant they also work with in their TEXT chat. The voice call and the \
+    text chat are two channels to ONE you: speak as one continuous person \
+    across both. THE CALL IS ALREADY LIVE — you are connected and talking WITH \
+    the developer right now, this very moment. Speak naturally, warmly, and \
+    concisely — a phone-style conversation, not a document. The recent \
+    coding-chat context below is BACKGROUND (so you don't have to ask \"what \
+    are we working on?\"); it may even describe how THIS very call was set up — \
+    launching a server, a connection string or link. That setup is already \
+    DONE. So NEVER offer to start a call, to \"bring up/launch a server\", to \
+    send a link or connection string, and never ask \"ready?\" as if you were \
+    still connecting — you are ALREADY on the call, mid-conversation; just keep \
+    talking. Never read code, file paths, line numbers, URLs, or stack traces \
+    aloud — paraphrase instead. If the developer interrupts you, stop talking \
+    immediately and listen.\n\n\
+    ONE IDENTITY, FIRST PERSON. You have tools that do real work in the \
+    developer's repository and on the web — treat them as YOUR OWN hands, not a \
+    separate helper. Always speak in the first person about what YOU are doing: \
+    \"let me check\", \"I'll pull that up\", \"I'll get that done\", \"one \
+    sec\". NEVER refer to \"the agent\", \"the worker\", \"your coding agent\", \
+    or offer to \"ask\" someone — there is no third party; it is all you. Use \
+    the tools whenever the developer gives a command, exactly as they would in \
+    the text chat: `start_agent_task` for work in the repo — code edits, \
+    running tests, shipping, and anything the developer wants WRITTEN, SENT, \
+    POSTED, or DROPPED INTO THE (text) CHAT (a completed task's result is \
+    delivered into that text chat, so \"send it to the chat\" / \"write that in \
+    the chat\" = dispatch a task that posts it there); `ask_worker_question` \
+    for a read-only lookup. Tell the developer briefly what you're doing (in \
+    the first person), dispatch, then paraphrase the result when it comes back. \
+    If a task is long and there's nothing to discuss meanwhile, call \
+    `pause_call_until` (until='task_complete'). Call `end_voice_session` when \
+    they say goodbye.\n\n\
+    STAY GROUNDED — AND NEVER REFUSE: DISPATCH. You may answer directly from \
+    exactly two sources: the context you were given (the background below plus \
+    this call) and timeless general knowledge for casual conversation. \
+    EVERYTHING else you CAN get — through your tools, which reach the full \
+    repo AND the web: current prices and exchange rates, news, weather, code, \
+    files, configs, repo status, logs, anything that needs looking up. For \
+    those, use `ask_worker_question` (lookup) or `start_agent_task` (work), \
+    say you're checking (first person), and relay the answer. It is ALWAYS \
+    wrong to say \"I don't have access\", \"I can't browse\", or to send the \
+    developer to go check something themselves — dispatch instead. Don't \
+    answer such things from memory either (your knowledge is stale); and if \
+    you're unsure whether you know, dispatch — a short wait beats a confident \
+    wrong answer.";
 
 /// Instruction budget in tokens.
 const INSTRUCTION_BUDGET_TOKENS: u32 = 6_000;
@@ -121,6 +136,7 @@ fn print_server_help() {
          XAI_API_KEY           BYOK key (env / OS keychain / ./.env) — required\n  \
          AURA_PUBLIC_HOST      host clients dial (default 127.0.0.1 = LOCAL)\n  \
          AURA_PORT             UDP port (default 47821)\n  \
+         AURA_STATE_DIR        root for .aura state (call-status, inbox); default = cwd\n  \
          AURA_TRANSPORT=iroh   NAT/CGNAT P2P transport (no open port needed)\n  \
          AURA_DISPATCH_MODEL   pin the in-call dispatch model\n  \
          AURA_FEEDER=1         opt in to the live ambient feeder\n\n\
@@ -284,7 +300,11 @@ async fn run_inbox_cli(args: &[String]) -> i32 {
             return 2;
         }
     }
-    let inbox = match Inbox::open(std::path::Path::new(".")) {
+    // Load .env (cwd, then the global ~/.config/aura/.env) BEFORE resolving the
+    // state root: AURA_STATE_DIR persisted at onboarding must bind the CLI to
+    // the same inbox as the server, regardless of each process's cwd.
+    load_dotenv();
+    let inbox = match Inbox::open(&state_root()) {
         Ok(inbox) => inbox,
         Err(e) => {
             eprintln!("aura-server inbox: cannot open .aura/inbox ({e})");
@@ -321,7 +341,8 @@ fn print_inbox_help() {
         "aura-server inbox <cmd> — the live orchestrator's side of the in-call dispatch inbox.\n\n\
          Subcommands:\n  \
          wait [--timeout SECS]   block until a task is pending (claiming it), refreshing the\n                          \
-         heartbeat each tick; prints the task, or NO_TASK on timeout (default 30s)\n  \
+         heartbeat each tick; prints the task, NO_TASK on timeout (default 30s),\n                          \
+         or CALL_ENDED state=<ended|failed|dropped> the moment the call is over\n  \
          done <id> <speech...>   report a task finished (spoken back into the call)\n  \
          stall <id> <speech...>  report a task abandoned (aura then dispatches it directly)\n  \
          alive                   refresh the heartbeat once and print the inbox directory"
@@ -340,6 +361,14 @@ async fn inbox_wait(inbox: &Inbox, args: &[String]) -> i32 {
         .clamp(1, MAX_WAIT_SECS);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
+        // Call over? Tell the orchestrator IMMEDIATELY instead of letting it
+        // sleep out the full --timeout: on messenger hosts the background wait
+        // is the wake-up signal, so without this check the session learns
+        // about a finished call only minutes later.
+        if let Some(state) = call_over_verdict(&state_root()) {
+            println!("CALL_ENDED state={state}");
+            return 0;
+        }
         // Declare/refresh liveness so the running call server routes to us.
         let _ = inbox.touch_heartbeat();
         let mut claimed = None;
@@ -663,6 +692,59 @@ fn try_reap_port_holder(_busy_port: u16) -> bool {
     false // Windows: hard no-op (no portable process-name/port introspection here)
 }
 
+/// Is the call recorded in `<root>/.aura/call-status.json` over? Returns the
+/// terminal verdict (`ended` / `failed` / `dropped`) or `None` while the call
+/// is still ringing/active (or no call has started yet). `dropped` = the
+/// recorded server pid is gone while the state is non-terminal (crash/kill).
+fn call_over_verdict(root: &std::path::Path) -> Option<String> {
+    let body = std::fs::read_to_string(root.join(".aura").join("call-status.json")).ok()?;
+    let state = json_str_field(&body, "state")?;
+    match state.as_str() {
+        "ended" | "failed" => Some(state),
+        "ringing" | "active" => {
+            let pid = json_u32_field(&body, "pid")?;
+            if aura_engine::inbox::pid_is_alive(pid) {
+                None
+            } else {
+                Some("dropped".to_owned())
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Read `"key":<digits>` out of the tiny hand-rolled call-status JSON.
+fn json_u32_field(body: &str, key: &str) -> Option<u32> {
+    let needle = format!("\"{key}\":");
+    let start = body.find(&needle)? + needle.len();
+    let rest = body[start..].trim_start();
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest.get(..end)?.parse().ok()
+}
+
+/// Read `"key":"<value>"` out of the tiny hand-rolled call-status JSON.
+fn json_str_field(body: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":\"");
+    let start = body.find(&needle)? + needle.len();
+    let rest = &body[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_owned())
+}
+
+/// Resolve the `.aura` state root: `AURA_STATE_DIR` (else the process cwd).
+/// Hosts whose exec tool gives every command a fresh/implicit cwd (messenger
+/// gateways) set this once so the server, `aura-inbox`, and `aura-call-status`
+/// all converge on the same directory. Must stay in lockstep with the engine's
+/// `state_root_from` (the inbox shares this root).
+fn state_root() -> std::path::PathBuf {
+    match std::env::var("AURA_STATE_DIR") {
+        Ok(v) if !v.trim().is_empty() => std::path::PathBuf::from(v.trim()),
+        _ => std::path::PathBuf::from("."),
+    }
+}
+
 /// Best-effort write of the call's lifecycle state to `.aura/call-status.json`
 /// so the launching host can MONITOR the call (poll this file ~every 10 s) and
 /// still get a verdict if the server crashes (the recorded `pid` going away
@@ -680,8 +762,9 @@ fn write_status(state: &str, call_id: &str, reason: Option<&str>) {
         "{{\"call_id\":\"{call_id}\",\"pid\":{},\"state\":\"{state}\",\"reason\":\"{reason}\"}}\n",
         std::process::id()
     );
-    let _ = std::fs::create_dir_all(".aura");
-    let _ = std::fs::write(".aura/call-status.json", body);
+    let dir = state_root().join(".aura");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("call-status.json"), body);
 }
 
 /// Is `host` a loopback name/address? A LOCAL call then binds loopback-only so
@@ -791,9 +874,28 @@ fn load_dotenv_file(path: &std::path::Path) {
             value = &value[1..value.len() - 1];
         }
         if std::env::var_os(key).is_none() {
-            std::env::set_var(key, value);
+            std::env::set_var(key, expand_home(value));
         }
     }
+}
+
+/// Expand the common home-dir forms in a `.env` value: leading `~`/`~/`, and
+/// the literal `$HOME` / `${HOME}`. `.env` files are not shell — without this,
+/// an agent pasting a shell-style example (`AURA_STATE_DIR=$HOME`) gets a
+/// relative path literally named `$HOME`. Only HOME forms are expanded
+/// (predictable; no general variable interpolation).
+fn expand_home(value: &str) -> String {
+    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
+        return value.to_owned();
+    };
+    let home = home.to_string_lossy();
+    let mut v = value.replace("${HOME}", &home).replace("$HOME", &home);
+    if v == "~" {
+        v = home.into_owned();
+    } else if let Some(rest) = v.strip_prefix("~/") {
+        v = format!("{home}/{rest}");
+    }
+    v
 }
 
 #[cfg(test)]
@@ -879,6 +981,70 @@ mod tests {
             !try_reap_port_holder(port),
             "must never SIGTERM our own process"
         );
+    }
+
+    #[test]
+    fn dotenv_values_expand_home_forms() {
+        // Runs only when HOME is set (always true on Unix CI).
+        if let Ok(home) = std::env::var("HOME") {
+            assert_eq!(expand_home("$HOME"), home);
+            assert_eq!(expand_home("${HOME}/x"), format!("{home}/x"));
+            assert_eq!(expand_home("~"), home);
+            assert_eq!(expand_home("~/state"), format!("{home}/state"));
+            // Non-home values pass through untouched.
+            assert_eq!(expand_home("/abs/path"), "/abs/path");
+            assert_eq!(expand_home("sk-secret~x"), "sk-secret~x");
+        }
+    }
+
+    #[test]
+    fn call_over_verdict_detects_each_terminal_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let aura = tmp.path().join(".aura");
+        std::fs::create_dir_all(&aura).unwrap();
+        let status = aura.join("call-status.json");
+        // No file yet -> not over (no call started).
+        assert_eq!(call_over_verdict(tmp.path()), None);
+        // Clean end / failure -> reported as-is.
+        std::fs::write(
+            &status,
+            r#"{"call_id":"c","pid":1,"state":"ended","reason":"HangUp"}"#,
+        )
+        .unwrap();
+        assert_eq!(call_over_verdict(tmp.path()).as_deref(), Some("ended"));
+        std::fs::write(
+            &status,
+            r#"{"call_id":"c","pid":1,"state":"failed","reason":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(call_over_verdict(tmp.path()).as_deref(), Some("failed"));
+        // Active with a LIVE pid (our own) -> still in progress.
+        let me = std::process::id();
+        std::fs::write(
+            &status,
+            format!(r#"{{"call_id":"c","pid":{me},"state":"active","reason":""}}"#),
+        )
+        .unwrap();
+        assert_eq!(call_over_verdict(tmp.path()), None);
+        // Active with a DEAD pid -> dropped (crash detected).
+        #[cfg(unix)]
+        {
+            std::fs::write(
+                &status,
+                r#"{"call_id":"c","pid":2147483632,"state":"active","reason":""}"#,
+            )
+            .unwrap();
+            assert_eq!(call_over_verdict(tmp.path()).as_deref(), Some("dropped"));
+        }
+    }
+
+    #[test]
+    fn json_fields_parse_from_call_status() {
+        let body = r#"{"call_id":"call-abc","pid":200424,"state":"active","reason":""}"#;
+        assert_eq!(json_u32_field(body, "pid"), Some(200424));
+        assert_eq!(json_str_field(body, "state").as_deref(), Some("active"));
+        assert_eq!(json_u32_field(body, "nope"), None);
+        assert_eq!(json_str_field(body, "nope"), None);
     }
 
     #[test]

@@ -216,12 +216,25 @@ command -v aura-call && command -v aura-call-status && command -v aura-inbox && 
 timeout 8s aura-server 2>&1 | grep -m1 -E 'AURA_CONNECT=|composed context|host =' \
   && echo "key resolved + server starts: OK" \
   || echo "server did NOT start — check the XAI_API_KEY (Step 2)"
+# State-dir agreement: run BOTH and compare the two absolute paths:
+timeout 8s aura-server 2>&1 | grep -m1 'in-call dispatch inbox at'
+aura-inbox alive   # prints: ALIVE <absolute inbox dir>
+```
+
+If your framework's exec tool starts every command in a fresh/implicit cwd
+(Hermes, OpenClaw and other messenger gateways), pin the state root ONCE so the
+server, the helpers, and the recap files can never drift apart:
+```bash
+mkdir -p ~/.config/aura
+printf 'AURA_STATE_DIR=%s\n' "$HOME" >> ~/.config/aura/.env
 ```
 
 **✅ Do NOT report "done" until every box is checked:**
 - [ ] `aura-server` (and, for a LOCAL host, `aura-cli`) on `PATH`
 - [ ] `aura-call` + `aura-call-status` + `aura-inbox` on `PATH`
 - [ ] the `XAI_API_KEY` resolves (server reaches the connection-string line)
+- [ ] `aura-inbox alive` prints the SAME directory the server run above logged
+      (`in-call dispatch inbox at …`) — else set `AURA_STATE_DIR` (see above)
 - [ ] (REMOTE) UDP 47821 opened once — OS firewall **and** cloud SG / NAT
 - [ ] `SKILL.md` copied into your skills directory
 - [ ] framework set to **auto-approve** the orchestrator's tool calls + budget raised (Step 4b)
@@ -232,6 +245,12 @@ Any unchecked box → go back to that step. Only when all pass, continue to Step
 ---
 
 ## Step 6 — Tell the user how to start a call
+
+**And a rule for YOU, the agent:** when the user later asks for a call, OPEN
+AND FOLLOW the skill you installed in Step 4 — do not run the call flow from
+onboarding memory. Onboarding taught you to INSTALL; the skill teaches you to
+CALL (they are different procedures, and the skill's Step 4.1 check is what
+prevents the most common silent failure).
 
 Explain in plain language: *"To start a call, say 'call me' (or use the host's
 command) in your chat. I'll launch the voice server; you'll either be connected

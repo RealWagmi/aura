@@ -481,7 +481,31 @@ line `XAI_API_KEY=...`, is the env var unset so `./.env` is consulted?). The
 connection string printed during this probe is throwaway (single-use, ~120 s) —
 it is never used and expires harmlessly.
 
-**6c. (REMOTE) Reachability reminder.** You cannot fully verify external UDP
+**6c. State-dir agreement.** Compare the directory the server posts in-call
+tasks to with the one the helpers resolve — run BOTH commands and compare:
+
+```bash
+timeout 8s aura-server 2>&1 | grep -m1 'in-call dispatch inbox at'
+aura-inbox alive   # prints: ALIVE <absolute inbox dir>
+```
+
+The two directories MUST match, or every in-call dispatch silently
+cold-fallbacks and `aura-call-status` reads a stale file. They match
+automatically when both run from the same cwd; if your framework's exec tool
+starts every command in a fresh/implicit cwd (Hermes, OpenClaw and other
+messenger gateways), pin the root ONCE in the GLOBAL aura env file (the same
+place Step 3 recommends for the key — a cwd-relative `./.env` would be lost
+the moment the cwd changes):
+
+```bash
+mkdir -p ~/.config/aura
+printf 'AURA_STATE_DIR=%s\n' "$HOME" >> ~/.config/aura/.env
+```
+
+The server, `aura-inbox`, and `aura-call-status` all read that file; the
+post-call recap files land under the same root.
+
+**6d. (REMOTE) Reachability reminder.** You cannot fully verify external UDP
 reachability from inside the VM. Remind the user that step 4 must be complete on
 **both** the OS firewall and the cloud security group / NAT.
 
@@ -490,6 +514,7 @@ reachability from inside the VM. Remind the user that step 4 must be complete on
 - [ ] `aura-server` is on `PATH` (6a) — and `aura-cli` too if this is a LOCAL host
 - [ ] `aura-call`, `aura-call-status`, and `aura-inbox` are on `PATH` (Step 2)
 - [ ] the `XAI_API_KEY` resolves — the server reaches the connection-string line (6b)
+- [ ] `aura-inbox alive` prints the SAME directory the 6b probe logged (6c) — else set `AURA_STATE_DIR`
 - [ ] (REMOTE) UDP 47821 was opened once — OS firewall **and** cloud SG / NAT (Step 4)
 - [ ] `skills/SKILL.md` was copied into your skills directory (Step 5)
 - [ ] your framework is set to **auto-approve** the orchestrator's tool calls and has a high enough turn/timeout budget for a full call (Step 5b)
@@ -501,6 +526,12 @@ checked do you continue to Step 7 and tell the user how to start a call.
 ---
 
 ## Step 7 — Tell the user how to start a call
+
+**And a rule for YOU, the agent:** when the user later asks for a call, OPEN
+AND FOLLOW the skill you installed in Step 5 — do not run the call flow from
+onboarding memory. Onboarding taught you to INSTALL; the skill teaches you to
+CALL (they are different procedures, and the skill's Step 4.1 check is what
+prevents the most common silent failure).
 
 Onboarding is done. Explain to the user, in plain language, what happens next.
 The host skill (step 5) launches `aura-server` for them on each call; they do

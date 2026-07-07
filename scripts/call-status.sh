@@ -11,8 +11,12 @@
 #                              exit. This is the "monitor the call" step a host
 #                              runs after relaying the connection string.
 #
-# Env: AURA_STATUS_FILE (default .aura/call-status.json),
-#      AURA_RECAP_FILE  (default .aura/hooks/aura-last-claude-result.json),
+# Env: AURA_STATE_DIR   (root for .aura state; default = cwd). Resolved like
+#                        the Rust binaries: process env, then ./.env, then the
+#                        global aura .env — so the onboarding .env pin works
+#                        here too,
+#      AURA_STATUS_FILE (default $AURA_STATE_DIR/.aura/call-status.json),
+#      AURA_RECAP_FILE  (default $AURA_STATE_DIR/.aura/hooks/aura-last-claude-result.json),
 #      AURA_POLL_SECS   (default 10).
 #
 # Terminal states: ended (clean hang-up — caller Ctrl-C or the model's
@@ -22,8 +26,36 @@
 
 set -uo pipefail
 
-STATUS_FILE="${AURA_STATUS_FILE:-.aura/call-status.json}"
-RECAP_FILE="${AURA_RECAP_FILE:-.aura/hooks/aura-last-claude-result.json}"
+# Resolve the state root EXACTLY like the Rust binaries (aura-server /
+# aura-inbox): process env first, then ./.env, then the global aura .env
+# (AURA_HOME, else XDG_CONFIG_HOME, else ~/.config/aura). Home forms in the
+# value ("~", "$HOME") are expanded, mirroring the Rust loader.
+env_file_state_dir() {
+    [ -f "$1" ] || return 1
+    local v
+    v=$(sed -n 's/^[[:space:]]*AURA_STATE_DIR[[:space:]]*=[[:space:]]*//p' "$1" | head -n 1)
+    v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+    [ -n "$v" ] || return 1
+    printf '%s' "$v"
+}
+resolve_state_dir() {
+    if [ -n "${AURA_STATE_DIR:-}" ]; then printf '%s' "$AURA_STATE_DIR"; return; fi
+    local f v
+    for f in ./.env "${AURA_HOME:-}/.env" "${XDG_CONFIG_HOME:-$HOME/.config}/aura/.env"; do
+        [ "$f" = "/.env" ] && continue
+        if v=$(env_file_state_dir "$f"); then printf '%s' "$v"; return; fi
+    done
+    printf '.'
+}
+STATE_DIR="$(resolve_state_dir)"
+case "$STATE_DIR" in
+    "~") STATE_DIR="$HOME" ;;
+    "~/"*) STATE_DIR="$HOME/${STATE_DIR#\~/}" ;;
+esac
+STATE_DIR="${STATE_DIR//\$\{HOME\}/$HOME}"
+STATE_DIR="${STATE_DIR//\$HOME/$HOME}"
+STATUS_FILE="${AURA_STATUS_FILE:-$STATE_DIR/.aura/call-status.json}"
+RECAP_FILE="${AURA_RECAP_FILE:-$STATE_DIR/.aura/hooks/aura-last-claude-result.json}"
 POLL_SECS="${AURA_POLL_SECS:-10}"
 
 TERMINAL=0

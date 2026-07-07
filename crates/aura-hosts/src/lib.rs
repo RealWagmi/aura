@@ -26,9 +26,38 @@ use aura_core::tools::{AgentRuntime, TaskEnvelope, TaskHandoffState, TaskResult}
 use aura_core::{redact_secrets, CallbackMode};
 
 /// Cap on the post-call transcript posted into the chat (chars). Generous: it
-/// carries BOTH sides of the conversation and the host summarizes it; delivered
-/// once, not spoken. Truncation keeps the start — long calls should raise this.
-pub(crate) const CALL_SUMMARY_MAX_CHARS: usize = 8_000;
+/// carries BOTH sides of the conversation and the host summarizes it (in
+/// chunks when large — the skill's Step 5); delivered once, not spoken.
+pub(crate) const CALL_SUMMARY_MAX_CHARS: usize = 24_000;
+
+/// Cap an over-long recap by keeping the START and the END with an elision
+/// marker between them — never head-only truncation: on a long call the tail
+/// carries the decisions/follow-ups, which are exactly what the summary needs.
+/// The head keeps roughly a third of the budget, the tail the rest.
+pub(crate) fn cap_recap(recap: &str) -> String {
+    let total = recap.chars().count();
+    if total <= CALL_SUMMARY_MAX_CHARS {
+        return recap.to_owned();
+    }
+    let head_budget = CALL_SUMMARY_MAX_CHARS / 3;
+    let tail_budget = CALL_SUMMARY_MAX_CHARS - head_budget;
+    let head: String = recap.chars().take(head_budget).collect();
+    let tail: String = recap.chars().skip(total - tail_budget).collect();
+    let elided = total - head_budget - tail_budget;
+    format!("{head}\n[... {elided} characters of the middle elided ...]\n{tail}")
+}
+
+/// The `.aura` state root for host-side artifacts (recap files, hooks):
+/// `AURA_STATE_DIR` when set (the server loads `.env` into the process env at
+/// startup, so a pinned value is visible here), else the adapter's own `cwd`.
+/// Keeps recap locations in lockstep with the engine inbox and
+/// `call-status.json`, which resolve the same variable.
+pub(crate) fn state_root_or(cwd: &std::path::Path) -> std::path::PathBuf {
+    match std::env::var("AURA_STATE_DIR") {
+        Ok(v) if !v.trim().is_empty() => std::path::PathBuf::from(v.trim()),
+        _ => cwd.to_path_buf(),
+    }
+}
 
 pub mod claude;
 pub mod codex;
@@ -127,7 +156,7 @@ pub trait HostAdapter: AgentRuntime {
                 detail: "empty call; nothing to recap".to_owned(),
             });
         }
-        let capped: String = recap.chars().take(CALL_SUMMARY_MAX_CHARS).collect();
+        let capped = cap_recap(recap);
         let result = TaskResult {
             task_id: "voice-call-summary".to_owned(),
             handoff_state: TaskHandoffState::Accepted,
@@ -149,6 +178,26 @@ pub trait HostAdapter: AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cap_recap_keeps_head_and_tail_of_long_calls() {
+        // Short recap: untouched.
+        assert_eq!(cap_recap("short call"), "short call");
+        // Long recap: both the opening AND the ending survive, with an elision
+        // marker between — head-only truncation would lose the decisions at
+        // the end of a long call.
+        let long: String = (0..CALL_SUMMARY_MAX_CHARS + 10_000)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let capped = cap_recap(&long);
+        assert!(capped.chars().count() < long.chars().count());
+        assert!(capped.starts_with(&long[..100]), "head preserved");
+        assert!(
+            capped.ends_with(&long[long.len() - 100..]),
+            "tail preserved"
+        );
+        assert!(capped.contains("elided"), "elision marker present");
+    }
 
     #[test]
     fn trigger_source_variants_construct() {

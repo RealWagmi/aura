@@ -308,7 +308,9 @@ impl ClaudeAdapter {
         // recap. `.aura/` is gitignored. A loaded config can still override it.
         let config = ClaudeConfig {
             execute_tasks: true,
-            hooks_dir: Some(cwd.join(".aura").join("hooks")),
+            // Hooks (incl. the call recap) follow AURA_STATE_DIR when set, so
+            // they stay next to the inbox/call-status under cwd drift.
+            hooks_dir: Some(crate::state_root_or(&cwd).join(".aura").join("hooks")),
             dispatch_model,
             ..ClaudeConfig::default()
         };
@@ -549,7 +551,7 @@ impl HostAdapter for ClaudeAdapter {
                 detail: "empty call; nothing to recap".to_owned(),
             });
         }
-        let capped: String = recap.chars().take(crate::CALL_SUMMARY_MAX_CHARS).collect();
+        let capped = crate::cap_recap(recap);
         tokio::fs::create_dir_all(dir)
             .await
             .map_err(|e| HostError::Callback(e.to_string()))?;

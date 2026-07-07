@@ -901,8 +901,10 @@ impl HostAdapter for OpenClawAdapter {
                 detail: "empty call; nothing to recap".to_owned(),
             });
         }
-        let capped: String = recap.chars().take(crate::CALL_SUMMARY_MAX_CHARS).collect();
-        let dir = self.cwd.join(".aura");
+        let capped = crate::cap_recap(recap);
+        // Root at AURA_STATE_DIR when set — keep the recap where the
+        // inbox/call-status live (cwd drift otherwise loses it).
+        let dir = crate::state_root_or(&self.cwd).join(".aura");
         tokio::fs::create_dir_all(&dir)
             .await
             .map_err(|e| HostError::Callback(e.to_string()))?;

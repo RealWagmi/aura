@@ -272,14 +272,18 @@ impl CallSession {
         // heartbeat stat per dispatch — when no orchestrator loop is live, so it
         // is always safe to apply.
         //
-        // The inbox roots at the process cwd, which MUST match the directory the
-        // host's `aura-inbox` watch-loop runs in (the skill's convention) — a
-        // mismatch silently degrades every dispatch to the direct fallback. Log
-        // the ABSOLUTE inbox dir once so an operator can diagnose a cwd mismatch
-        // instead of guessing. `open_for_call` resets the inbox for this fresh
-        // call (see its docs), so a prior call's orphaned task can't resurface.
+        // The inbox roots at `AURA_STATE_DIR` (else the process cwd), which MUST
+        // match what the host's `aura-inbox` watch-loop resolves — a mismatch
+        // silently degrades every dispatch to the direct fallback. The env
+        // override exists exactly for hosts whose exec tool gives every command
+        // a fresh/implicit cwd (messenger gateways): set it once and both sides
+        // converge regardless of where each process starts. Log the ABSOLUTE
+        // inbox dir once so an operator can diagnose a mismatch instead of
+        // guessing. `open_for_call` resets the inbox for this fresh call (see
+        // its docs), so a prior call's orphaned task can't resurface.
         let raw_agent: Arc<dyn AgentRuntime> = host.clone();
-        let agent: Arc<dyn AgentRuntime> = match Inbox::open_for_call(std::path::Path::new(".")) {
+        let state_root = state_root_from(std::env::var("AURA_STATE_DIR").ok().as_deref());
+        let agent: Arc<dyn AgentRuntime> = match Inbox::open_for_call(&state_root) {
             Ok(inbox) => {
                 // Best-effort absolute path so the log is diagnostic regardless of
                 // the process cwd; fall back to the relative path if canonicalize
@@ -641,6 +645,17 @@ fn build_callback_result(meta: CallbackMeta, speech: &str) -> TaskResult {
         handoff_state: TaskHandoffState::Accepted,
         speech_update: speech.to_owned(),
         envelope,
+    }
+}
+
+/// Resolve the `.aura` state root from an `AURA_STATE_DIR`-style value: a
+/// non-empty trimmed value wins, else the process cwd. Must stay in lockstep
+/// with `aura-server`'s own resolution (`state_root()` in its `main.rs`) — the
+/// server's `call-status.json` and this engine's inbox share the same root.
+fn state_root_from(raw: Option<&str>) -> std::path::PathBuf {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => std::path::PathBuf::from("."),
     }
 }
 
@@ -1506,6 +1521,16 @@ mod tests {
         // task_id is opaque, stable per intent, and never empty.
         assert!(result.task_id.starts_with("voice-task-"));
         assert!(result.accepted());
+    }
+
+    #[test]
+    fn state_root_resolution_env_wins_else_cwd() {
+        assert_eq!(
+            state_root_from(Some("/home/u/.aura-state")),
+            std::path::PathBuf::from("/home/u/.aura-state")
+        );
+        assert_eq!(state_root_from(Some("  ")), std::path::PathBuf::from("."));
+        assert_eq!(state_root_from(None), std::path::PathBuf::from("."));
     }
 
     #[test]

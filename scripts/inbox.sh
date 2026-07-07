@@ -4,7 +4,10 @@
 # orchestrator: it loops on `aura-inbox wait`, and for each spoken task it either
 # answers directly or delegates to a sub-agent, then reports the result with
 # `aura-inbox done`. The running call server (aura-server) posts tasks to and
-# reads results from the SAME `.aura/inbox/` in this directory.
+# reads results from the SAME `.aura/inbox/` — rooted at AURA_STATE_DIR when
+# set (persist it in the aura .env so both sides converge regardless of cwd;
+# essential on hosts whose exec tool starts every command in a fresh cwd),
+# else the current directory.
 #
 # This is a thin wrapper over `aura-server inbox …`; `install.sh` installs it on
 # PATH as `aura-inbox` (together with the server). The host skill calls it.
