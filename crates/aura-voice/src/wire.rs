@@ -270,6 +270,7 @@ fn turn_detection_from_latency(latency_target_ms: u64, silence_override_ms: Opti
     let target = latency_target_ms.clamp(400, 1_600);
     let prefix_padding_ms = ((target / 2) + 50).clamp(250, 650);
     let silence_duration_ms = match silence_override_ms {
+        Some(0) => 0,
         Some(ms) => ms.clamp(300, 3_000),
         None => (target + 300).clamp(700, 1_900),
     };
@@ -448,6 +449,14 @@ mod tests {
         assert_eq!(v["session"]["audio"]["input"]["format"]["rate"], 24000);
         assert_eq!(v["session"]["audio"]["output"]["format"]["rate"], 24000);
         assert_eq!(v["session"]["temperature"], 0.5);
+    }
+
+    #[test]
+    fn zero_silence_override_is_preserved_for_push_to_talk() {
+        let mut cfg = cfg();
+        cfg.end_of_turn_timeout_ms = Some(0);
+        let v = xai_session_update_event(&cfg);
+        assert_eq!(v["session"]["turn_detection"]["silence_duration_ms"], 0);
     }
 
     #[test]

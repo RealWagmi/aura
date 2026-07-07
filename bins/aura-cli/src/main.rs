@@ -9,6 +9,56 @@ use aura_audio::{AudioSettings, CpalTransport};
 use aura_tunnel::{
     ConnectionString, IrohEndpoint, IrohPreset, TransportKind, TunnelConfig, TunnelEndpoint,
 };
+use std::sync::Arc;
+
+#[cfg(windows)]
+mod hotkey;
+
+#[derive(Debug, Clone)]
+enum InputMode {
+    Voice,
+    TogglePushToTalk(PushToTalkGate),
+}
+
+#[derive(Debug, Clone)]
+struct PushToTalkGate {
+    state: Arc<std::sync::atomic::AtomicU64>,
+    label: String,
+}
+
+impl InputMode {
+    fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+        let mode = std::env::var("AURA_INPUT_MODE").unwrap_or_else(|_| "voice".to_owned());
+        match mode.trim().to_ascii_lowercase().as_str() {
+            "" | "voice" | "vad" => Ok(Self::Voice),
+            "push_to_talk" | "push-to-talk" | "ptt" => start_push_to_talk(),
+            other => {
+                Err(format!("AURA_INPUT_MODE must be voice or push_to_talk, got {other:?}").into())
+            }
+        }
+    }
+}
+
+impl PushToTalkGate {
+    fn press_count(&self) -> u64 {
+        self.state.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[cfg(windows)]
+fn start_push_to_talk() -> Result<InputMode, Box<dyn std::error::Error>> {
+    let raw = std::env::var("AURA_PUSH_TO_TALK_HOTKEY").unwrap_or_else(|_| "ctrl+space".to_owned());
+    let watcher = hotkey::start_push_to_talk_watcher(&raw)?;
+    Ok(InputMode::TogglePushToTalk(PushToTalkGate {
+        state: watcher.presses,
+        label: watcher.label,
+    }))
+}
+
+#[cfg(not(windows))]
+fn start_push_to_talk() -> Result<InputMode, Box<dyn std::error::Error>> {
+    Err("AURA_INPUT_MODE=push_to_talk currently supports Windows global hotkeys only".into())
+}
 
 #[tokio::main]
 async fn main() {
@@ -46,7 +96,10 @@ fn handle_cli_flags() -> Option<i32> {
                  iroh:   aura://<node-id>#k=...&c=...&t=iroh (server behind NAT)\n  \
                  AURA_AEC        echo handling on the mic: on (default, AEC3 echo\n                  \
                  cancellation — speakers + barge-in work), gate (mute mic while\n                  \
-                 the model speaks; no barge-in), off (raw mic; headsets only)",
+                 the model speaks; no barge-in), off (raw mic; headsets only)\n  \
+                 AURA_INPUT_MODE voice (default) or push_to_talk\n  \
+                 AURA_PUSH_TO_TALK_HOTKEY Windows global toggle hotkey\n                  \
+                 for push_to_talk mode (default ctrl+space)",
                 env!("CARGO_PKG_VERSION")
             );
             Some(0)
@@ -144,11 +197,56 @@ impl VoiceTunnel for IrohEndpoint {
 async fn pump<T: VoiceTunnel>(mut tunnel: T) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("aura: tunnel up. Acquiring microphone and speaker…");
     let mut audio = CpalTransport::start(AudioSettings::default())?;
+    let input_mode = InputMode::from_env()?;
+    let mut ptt_recording = false;
+    let mut ptt_seen_presses = match &input_mode {
+        InputMode::Voice => 0,
+        InputMode::TogglePushToTalk(gate) => gate.press_count(),
+    };
+    let mut ptt_buffer: Vec<Vec<i16>> = Vec::new();
+    const MAX_PUSH_TO_TALK_BUFFER_FRAMES: usize = 1_500;
+    if let InputMode::TogglePushToTalk(gate) = &input_mode {
+        eprintln!(
+            "aura: push-to-talk is enabled. Press {} to start talking, then press {} again to send.",
+            gate.label, gate.label
+        );
+    }
     eprintln!("aura: on the call — speak when you hear Aura. Ctrl-C to hang up.");
     loop {
         tokio::select! {
             mic = audio.recv_pcm24() => match mic {
-                Some(frame) => tunnel.send_pcm24(&frame),
+                Some(frame) => match &input_mode {
+                    InputMode::Voice => tunnel.send_pcm24(&frame),
+                    InputMode::TogglePushToTalk(gate) => {
+                        let presses = gate.press_count();
+                        if presses != ptt_seen_presses {
+                            let toggles = presses.saturating_sub(ptt_seen_presses);
+                            ptt_seen_presses = presses;
+                            for _ in 0..toggles {
+                                if ptt_recording {
+                                    ptt_recording = false;
+                                    for buffered in ptt_buffer.drain(..) {
+                                        tunnel.send_pcm24(&buffered);
+                                    }
+                                    eprintln!("aura: sent push-to-talk message.");
+                                } else {
+                                    ptt_buffer.clear();
+                                    ptt_recording = true;
+                                    audio.clear_playout();
+                                    eprintln!("aura: recording push-to-talk message.");
+                                }
+                            }
+                        }
+
+                        if ptt_recording {
+                            if ptt_buffer.len() >= MAX_PUSH_TO_TALK_BUFFER_FRAMES {
+                                ptt_buffer.remove(0);
+                            }
+                            ptt_buffer.push(frame.clone());
+                        }
+                        tunnel.send_pcm24(&vec![0; frame.len()]);
+                    }
+                },
                 None => break, // mic/device closed
             },
             net = tunnel.recv_pcm24() => match net {

@@ -696,14 +696,50 @@ mod tests {
         panic!("stub subagent spawn kept hitting ETXTBSY after retries");
     }
 
+    fn stub_subagent_config(stub_path: std::path::PathBuf) -> digest::SubagentConfig {
+        #[cfg(windows)]
+        {
+            digest::SubagentConfig {
+                claude_binary: std::path::PathBuf::from("powershell.exe"),
+                extra_args: vec![
+                    "-NoProfile".to_owned(),
+                    "-ExecutionPolicy".to_owned(),
+                    "Bypass".to_owned(),
+                    "-File".to_owned(),
+                    stub_path.display().to_string(),
+                ],
+                ..Default::default()
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            digest::SubagentConfig {
+                claude_binary: stub_path,
+                ..Default::default()
+            }
+        }
+    }
+
     /// Build a stub-claude bash script that emits one valid digest per
     /// stdin line. Used by the cycle tests to keep them self-contained
     /// (no real `claude` install required).
     async fn stub_subagent() -> ClaudeSubagent {
         let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let path = dir.path().join("fake_claude.ps1");
+        #[cfg(not(windows))]
         let path = dir.path().join("fake_claude.sh");
         // Loop forever — one user line in, one digest out. Exits when
         // stdin closes (i.e. when the subagent is dropped).
+        #[cfg(windows)]
+        let script = r#"
+while (($line = [Console]::In.ReadLine()) -ne $null) {
+  Write-Output '{"type":"system","subtype":"init"}'
+  Write-Output '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"{\"recent_facts\":[\"test fact\"],\"active_topic\":\"test topic\",\"suggested_directions\":[]}"}]}}'
+  Write-Output '{"type":"result","subtype":"success","is_error":false,"result":""}'
+}
+"#;
+        #[cfg(not(windows))]
         let script = r#"#!/usr/bin/env bash
 while read -r _line; do
   echo '{"type":"system","subtype":"init"}'
@@ -723,10 +759,7 @@ done
         // on process exit). Otherwise the script vanishes when this fn
         // returns and the spawned subprocess can't re-read it.
         std::mem::forget(dir);
-        let cfg = digest::SubagentConfig {
-            claude_binary: path,
-            ..Default::default()
-        };
+        let cfg = stub_subagent_config(path);
         spawn_stub_retrying(&cfg).await
     }
 
@@ -829,7 +862,17 @@ done
         // simulate a stalled subprocess. Pre-fix, abort had to wait
         // for this sleep; post-fix, drop(subagent) ends it via SIGKILL.
         let stub_dir = tempdir().unwrap();
+        #[cfg(windows)]
+        let stub_path = stub_dir.path().join("fake_claude_slow.ps1");
+        #[cfg(not(windows))]
         let stub_path = stub_dir.path().join("fake_claude_slow.sh");
+        #[cfg(windows)]
+        let script = r#"
+$null = [Console]::In.ReadLine()
+Write-Output '{"type":"system","subtype":"init"}'
+Start-Sleep -Seconds 30
+"#;
+        #[cfg(not(windows))]
         let script = r#"#!/usr/bin/env bash
 read -r _line
 echo '{"type":"system","subtype":"init"}'
@@ -844,14 +887,11 @@ sleep 30
             perms.set_mode(0o755);
             tokio::fs::set_permissions(&stub_path, perms).await.unwrap();
         }
-        let subagent = spawn_stub_retrying(&digest::SubagentConfig {
-            claude_binary: stub_path,
-            // Long enough that the subagent would wait on its own,
-            // forcing the test to rely on the cancel path.
-            read_timeout: Duration::from_secs(30),
-            ..Default::default()
-        })
-        .await;
+        let mut cfg = stub_subagent_config(stub_path);
+        // Long enough that the subagent would wait on its own, forcing
+        // the test to rely on the cancel path.
+        cfg.read_timeout = Duration::from_secs(30);
+        let subagent = spawn_stub_retrying(&cfg).await;
 
         let (events_tx, events_rx) = mpsc::channel::<HistoryEvent>(4);
         let (digests_tx, _digests_rx) = mpsc::channel::<Digest>(4);

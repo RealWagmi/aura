@@ -1017,6 +1017,30 @@ mod tests {
         panic!("stub subagent spawn kept hitting ETXTBSY after retries");
     }
 
+    fn stub_subagent_config(stub_path: std::path::PathBuf) -> SubagentConfig {
+        #[cfg(windows)]
+        {
+            SubagentConfig {
+                claude_binary: std::path::PathBuf::from("powershell.exe"),
+                extra_args: vec![
+                    "-NoProfile".to_owned(),
+                    "-ExecutionPolicy".to_owned(),
+                    "Bypass".to_owned(),
+                    "-File".to_owned(),
+                    stub_path.display().to_string(),
+                ],
+                ..Default::default()
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            SubagentConfig {
+                claude_binary: stub_path,
+                ..Default::default()
+            }
+        }
+    }
+
     fn ev(kind: &str, speech: &str, ts: u128) -> HistoryEvent {
         HistoryEvent {
             timestamp_ms: ts,
@@ -1634,7 +1658,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn talks_to_stub_subagent_end_to_end() {
         let stub_dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let stub_path = stub_dir.path().join("fake_claude.ps1");
+        #[cfg(not(windows))]
         let stub_path = stub_dir.path().join("fake_claude.sh");
+        #[cfg(windows)]
+        let script = r#"
+$null = [Console]::In.ReadLine()
+Write-Output '{"type":"system","subtype":"init"}'
+Write-Output '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"{\"recent_facts\":[\"user is on AirPods\"],\"active_topic\":\"audio device check\",\"suggested_directions\":[]}"}]}}'
+Write-Output '{"type":"result","subtype":"success","is_error":false,"result":""}'
+"#;
+        #[cfg(not(windows))]
         let script = r#"#!/usr/bin/env bash
 # Stub claude — read one user message line from stdin, emit a
 # stream-json response, then exit.
@@ -1644,18 +1679,15 @@ echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text
 echo '{"type":"result","subtype":"success","is_error":false,"result":""}'
 "#;
         tokio::fs::write(&stub_path, script).await.unwrap();
-        let mut perms = tokio::fs::metadata(&stub_path).await.unwrap().permissions();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let mut perms = tokio::fs::metadata(&stub_path).await.unwrap().permissions();
             perms.set_mode(0o755);
+            tokio::fs::set_permissions(&stub_path, perms).await.unwrap();
         }
-        tokio::fs::set_permissions(&stub_path, perms).await.unwrap();
 
-        let cfg = SubagentConfig {
-            claude_binary: stub_path,
-            ..Default::default()
-        };
+        let cfg = stub_subagent_config(stub_path);
 
         let mut subagent = spawn_stub_retrying(&cfg).await;
         let events = vec![ev("user", "switching to AirPods", 1)];
@@ -1671,7 +1703,17 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":""}'
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn surfaces_subagent_error_results() {
         let stub_dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let stub_path = stub_dir.path().join("fake_claude_err.ps1");
+        #[cfg(not(windows))]
         let stub_path = stub_dir.path().join("fake_claude_err.sh");
+        #[cfg(windows)]
+        let script = r#"
+$null = [Console]::In.ReadLine()
+Write-Output '{"type":"system","subtype":"init"}'
+Write-Output '{"type":"result","subtype":"success","is_error":true,"result":"Prompt is too long"}'
+"#;
+        #[cfg(not(windows))]
         let script = r#"#!/usr/bin/env bash
 read -r _line
 echo '{"type":"system","subtype":"init"}'
@@ -1686,10 +1728,7 @@ echo '{"type":"result","subtype":"success","is_error":true,"result":"Prompt is t
             tokio::fs::set_permissions(&stub_path, perms).await.unwrap();
         }
 
-        let cfg = SubagentConfig {
-            claude_binary: stub_path,
-            ..Default::default()
-        };
+        let cfg = stub_subagent_config(stub_path);
 
         let mut subagent = spawn_stub_retrying(&cfg).await;
         let events = vec![ev("user", "x", 1)];
@@ -1707,9 +1746,19 @@ echo '{"type":"result","subtype":"success","is_error":true,"result":"Prompt is t
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn timeout_when_subagent_goes_silent_mid_response() {
         let stub_dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let stub_path = stub_dir.path().join("fake_claude_hang.ps1");
+        #[cfg(not(windows))]
         let stub_path = stub_dir.path().join("fake_claude_hang.sh");
         // Reads the user envelope, emits init, then sleeps forever.
         // Without the fix, next_digest would hang here too.
+        #[cfg(windows)]
+        let script = r#"
+$null = [Console]::In.ReadLine()
+Write-Output '{"type":"system","subtype":"init"}'
+Start-Sleep -Seconds 60
+"#;
+        #[cfg(not(windows))]
         let script = r#"#!/usr/bin/env bash
 read -r _line
 echo '{"type":"system","subtype":"init"}'
@@ -1724,11 +1773,8 @@ sleep 60
             tokio::fs::set_permissions(&stub_path, perms).await.unwrap();
         }
 
-        let cfg = SubagentConfig {
-            claude_binary: stub_path,
-            read_timeout: Duration::from_millis(150),
-            ..Default::default()
-        };
+        let mut cfg = stub_subagent_config(stub_path);
+        cfg.read_timeout = Duration::from_millis(150);
 
         let started = std::time::Instant::now();
         let mut subagent = spawn_stub_retrying(&cfg).await;
@@ -1760,9 +1806,19 @@ sleep 60
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stdout_eof_poisons_subagent() {
         let stub_dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let stub_path = stub_dir.path().join("fake_claude_eof.ps1");
+        #[cfg(not(windows))]
         let stub_path = stub_dir.path().join("fake_claude_eof.sh");
         // Reads the envelope, emits init, then exits — stdout hits EOF
         // before any `result` line, so next_digest returns StdoutEof.
+        #[cfg(windows)]
+        let script = r#"
+$null = [Console]::In.ReadLine()
+Write-Output '{"type":"system","subtype":"init"}'
+exit 0
+"#;
+        #[cfg(not(windows))]
         let script = r#"#!/usr/bin/env bash
 read -r _line
 echo '{"type":"system","subtype":"init"}'
@@ -1782,11 +1838,8 @@ exit 0
         // saturated test runner can't turn this into a spurious Timeout
         // before EOF is delivered (the deadline resets each line, so the
         // real EOF always wins the race).
-        let cfg = SubagentConfig {
-            claude_binary: stub_path,
-            read_timeout: Duration::from_secs(5),
-            ..Default::default()
-        };
+        let mut cfg = stub_subagent_config(stub_path);
+        cfg.read_timeout = Duration::from_secs(5);
         let mut subagent = spawn_stub_retrying(&cfg).await;
         let events = vec![ev("user", "x", 1)];
         let err = subagent.next_digest(&events).await.unwrap_err();
@@ -1814,12 +1867,33 @@ exit 0
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn poisoned_subagent_respawns_clean_on_next_digest() {
         let stub_dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let stub_path = stub_dir.path().join("fake_claude_respawn.ps1");
+        #[cfg(not(windows))]
         let stub_path = stub_dir.path().join("fake_claude_respawn.sh");
         let marker = stub_dir.path().join("spawned.marker");
         // First run (no marker): drop a partial fragment with NO newline,
         // create the marker, then hang so read_line times out with the
         // fragment buffered. Later runs (marker present): emit a full,
         // valid digest and finish.
+        #[cfg(windows)]
+        let script = format!(
+            r#"
+$marker = '{marker}'
+if (!(Test-Path -LiteralPath $marker)) {{
+  New-Item -ItemType File -LiteralPath $marker -Force | Out-Null
+  $null = [Console]::In.ReadLine()
+  [Console]::Out.Write('{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"STALE_')
+  Start-Sleep -Seconds 60
+}} else {{
+  $null = [Console]::In.ReadLine()
+  Write-Output '{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"{{\"recent_facts\":[\"fresh fact\"],\"active_topic\":\"after respawn\",\"suggested_directions\":[]}}"}}]}}}}'
+  Write-Output '{{"type":"result","subtype":"success","is_error":false,"result":""}}'
+}}
+"#,
+            marker = marker.display()
+        );
+        #[cfg(not(windows))]
         let script = format!(
             r#"#!/usr/bin/env bash
 MARKER="{marker}"
@@ -1850,11 +1924,8 @@ fi
         // a clean digest within the same deadline, and 5s is ample even
         // under a saturated test runner. A shorter deadline risks the
         // respawned process spuriously timing out under load.
-        let cfg = SubagentConfig {
-            claude_binary: stub_path,
-            read_timeout: Duration::from_secs(5),
-            ..Default::default()
-        };
+        let mut cfg = stub_subagent_config(stub_path);
+        cfg.read_timeout = Duration::from_secs(5);
         let mut subagent = spawn_stub_retrying(&cfg).await;
         let events = vec![ev("user", "x", 1)];
 
@@ -1866,6 +1937,8 @@ fi
             "first tick should time out, got {first:?}"
         );
         assert!(subagent.is_poisoned(), "first timeout must poison");
+        #[cfg(windows)]
+        tokio::fs::write(&marker, b"spawned").await.unwrap();
 
         // Second tick: must respawn a fresh process and parse cleanly,
         // proving the corrupt reader (holding "...STALE_") was discarded.

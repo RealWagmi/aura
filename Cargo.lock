@@ -181,6 +181,7 @@ dependencies = [
  "aura-audio",
  "aura-tunnel",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -141,6 +141,7 @@ fn print_server_help() {
          AURA_STATE_DIR        root for .aura state (call-status, inbox); default = cwd\n  \
          AURA_TRANSPORT=iroh   NAT/CGNAT P2P transport (no open port needed)\n  \
          AURA_DISPATCH_MODEL   pin the in-call dispatch model\n  \
+         AURA_END_OF_TURN_TIMEOUT_MS  silence before Aura replies (300..3000 ms)\n  \
          AURA_FEEDER=1         opt in to the live ambient feeder\n\n\
          Connection string printed for the caller (single-use, ~120 s):\n  \
          direct:  aura://HOST:PORT#k=<secret>&c=<call>\n  \
@@ -165,13 +166,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("aura-server: composed context from {msg_count} recent message(s).");
 
     let provider = XaiRealtimeProvider::new();
+    let end_of_turn_timeout_ms = resolve_end_of_turn_timeout_ms(
+        std::env::var("AURA_INPUT_MODE").ok().as_deref(),
+        std::env::var("AURA_END_OF_TURN_TIMEOUT_MS").ok().as_deref(),
+    )?;
+    if let Some(ms) = end_of_turn_timeout_ms {
+        eprintln!("aura-server: end-of-turn silence timeout requested: {ms} ms.");
+    }
     let cfg = VoiceSessionConfig {
         instructions: instructions_from_brief(PERSONA, &brief, INSTRUCTION_BUDGET_TOKENS),
         voice: provider.default_voice().to_owned(),
         tools: aura_core::local_function_schemas(),
         latency_target_ms: 800,
         temperature: Some(0.5),
-        end_of_turn_timeout_ms: None,
+        end_of_turn_timeout_ms,
         output_speed: None,
         cold_start_kick: true,
     };
@@ -735,6 +743,38 @@ fn json_str_field(body: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_owned())
 }
 
+fn parse_end_of_turn_timeout_ms(raw: Option<&str>) -> Result<Option<u64>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let ms = trimmed.parse::<u64>().map_err(|_| {
+        format!("AURA_END_OF_TURN_TIMEOUT_MS must be a non-negative number of milliseconds, got {raw:?}")
+    })?;
+    Ok(Some(ms))
+}
+
+fn resolve_end_of_turn_timeout_ms(
+    input_mode: Option<&str>,
+    raw_timeout: Option<&str>,
+) -> Result<Option<u64>, String> {
+    if input_mode
+        .map(|mode| {
+            matches!(
+                mode.trim().to_ascii_lowercase().as_str(),
+                "push_to_talk" | "push-to-talk" | "ptt"
+            )
+        })
+        .unwrap_or(false)
+    {
+        return Ok(Some(0));
+    }
+    parse_end_of_turn_timeout_ms(raw_timeout)
+}
+
 /// Resolve the `.aura` state root: `AURA_STATE_DIR` (else the process cwd).
 /// Hosts whose exec tool gives every command a fresh/implicit cwd (messenger
 /// gateways) set this once so the server, `aura-inbox`, and `aura-call-status`
@@ -764,9 +804,45 @@ fn write_status(state: &str, call_id: &str, reason: Option<&str>) {
         "{{\"call_id\":\"{call_id}\",\"pid\":{},\"state\":\"{state}\",\"reason\":\"{reason}\"}}\n",
         std::process::id()
     );
-    let dir = state_root().join(".aura");
+    let root = state_root();
+    let _ = ensure_aura_gitignore(&root);
+    let dir = root.join(".aura");
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join("call-status.json"), body);
+}
+
+fn ensure_aura_gitignore(root: &std::path::Path) -> std::io::Result<()> {
+    if !is_inside_git_worktree(root) {
+        return Ok(());
+    }
+
+    let gitignore = root.join(".gitignore");
+    let existing = match std::fs::read_to_string(&gitignore) {
+        Ok(body) => body,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err),
+    };
+    if existing.lines().map(str::trim).any(|line| line == ".aura") {
+        return Ok(());
+    }
+
+    let mut next = existing;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str(".aura\n");
+    std::fs::write(gitignore, next)
+}
+
+fn is_inside_git_worktree(root: &std::path::Path) -> bool {
+    let mut cursor = Some(root);
+    while let Some(path) = cursor {
+        if path.join(".git").exists() {
+            return true;
+        }
+        cursor = path.parent();
+    }
+    false
 }
 
 /// Is `host` a loopback name/address? A LOCAL call then binds loopback-only so
@@ -997,6 +1073,72 @@ mod tests {
             assert_eq!(expand_home("/abs/path"), "/abs/path");
             assert_eq!(expand_home("sk-secret~x"), "sk-secret~x");
         }
+    }
+
+    #[test]
+    fn end_of_turn_timeout_env_parses_optional_ms() {
+        assert_eq!(parse_end_of_turn_timeout_ms(None), Ok(None));
+        assert_eq!(parse_end_of_turn_timeout_ms(Some("")), Ok(None));
+        assert_eq!(parse_end_of_turn_timeout_ms(Some("0")), Ok(Some(0)));
+        assert_eq!(parse_end_of_turn_timeout_ms(Some(" 2000 ")), Ok(Some(2000)));
+        assert_eq!(parse_end_of_turn_timeout_ms(Some("3000")), Ok(Some(3000)));
+    }
+
+    #[test]
+    fn end_of_turn_timeout_env_rejects_invalid_values() {
+        assert!(parse_end_of_turn_timeout_ms(Some("abc")).is_err());
+    }
+
+    #[test]
+    fn push_to_talk_forces_zero_end_of_turn_timeout() {
+        assert_eq!(
+            resolve_end_of_turn_timeout_ms(Some("push_to_talk"), Some("2500")),
+            Ok(Some(0))
+        );
+        assert_eq!(
+            resolve_end_of_turn_timeout_ms(Some("ptt"), Some("abc")),
+            Ok(Some(0))
+        );
+    }
+
+    #[test]
+    fn voice_mode_uses_configured_end_of_turn_timeout() {
+        assert_eq!(
+            resolve_end_of_turn_timeout_ms(Some("voice"), Some("2500")),
+            Ok(Some(2500))
+        );
+    }
+
+    #[test]
+    fn aura_gitignore_entry_is_added_inside_git_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+
+        ensure_aura_gitignore(tmp.path()).unwrap();
+
+        let gitignore = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert_eq!(gitignore, ".aura\n");
+    }
+
+    #[test]
+    fn aura_gitignore_entry_is_not_duplicated() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "target/\n.aura\n").unwrap();
+
+        ensure_aura_gitignore(tmp.path()).unwrap();
+
+        let gitignore = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert_eq!(gitignore, "target/\n.aura\n");
+    }
+
+    #[test]
+    fn aura_gitignore_entry_skips_non_git_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        ensure_aura_gitignore(tmp.path()).unwrap();
+
+        assert!(!tmp.path().join(".gitignore").exists());
     }
 
     #[test]
