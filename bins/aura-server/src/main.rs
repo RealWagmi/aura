@@ -1,7 +1,8 @@
 //! `aura-server` — the unified call server.
 //!
 //! The host launches it (on `127.0.0.1` for LOCAL, on a VPS for REMOTE). It
-//! holds the `XAI_API_KEY` + the engine + the host `Brief` + the in-call tools,
+//! holds the BYOK key (`XAI_API_KEY` or `OPENAI_API_KEY` — the provider is
+//! picked per key) + the engine + the host `Brief` + the in-call tools,
 //! mints a per-call session secret, prints a **connection string**, and on the
 //! client's Noise handshake bridges the tunnel audio into the SAME
 //! `aura_engine::CallSession::run` (the engine never knew about transports).
@@ -12,7 +13,7 @@ use aura_engine::inbox::{Inbox, InboxTask};
 use aura_engine::{AmbientFeeder, CallSession};
 use aura_hosts::{resolve_host, HostAdapter};
 use aura_voice::compose::instructions_from_brief;
-use aura_voice::{VoiceProvider, VoiceSessionConfig, XaiRealtimeProvider};
+use aura_voice::{OpenAiRealtimeProvider, VoiceProvider, VoiceSessionConfig, XaiRealtimeProvider};
 
 use aura_tunnel::{
     ConnectionString, IrohPreset, IrohServer, IrohTransport, SessionSecret, TunnelConfig,
@@ -135,7 +136,11 @@ fn print_server_help() {
          -V, --version   print the version and exit\n  \
          -h, --help      show this help and exit\n\n\
          Key environment variables:\n  \
-         XAI_API_KEY           BYOK key (env / OS keychain / ./.env) — required\n  \
+         XAI_API_KEY           BYOK key for xAI Grok voice (env / OS keychain / ./.env)\n  \
+         OPENAI_API_KEY        BYOK key for OpenAI gpt-realtime-2.1 (same sources)\n  \
+         AURA_VOICE_PROVIDER   xai | openai (default: auto by which key is present; xai wins)\n  \
+         AURA_VOICE_MODEL      realtime model override (e.g. gpt-realtime-2.1-mini, ~3x cheaper)\n  \
+         AURA_TRANSCRIBE_LANG  ISO-639-1 hint for OpenAI input transcription (e.g. ru)\n  \
          AURA_PUBLIC_HOST      host clients dial (default 127.0.0.1 = LOCAL)\n  \
          AURA_PORT             UDP port (default 47821)\n  \
          AURA_STATE_DIR        root for .aura state (call-status, inbox); default = cwd\n  \
@@ -150,10 +155,84 @@ fn print_server_help() {
     );
 }
 
+/// Explicit voice-provider pin: `xai` | `openai`. Unset = auto by key.
+const VOICE_PROVIDER_ENV: &str = "AURA_VOICE_PROVIDER";
+/// Optional realtime-model override for the chosen provider.
+const VOICE_MODEL_ENV: &str = "AURA_VOICE_MODEL";
+
+/// Which realtime voice provider this server dials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderChoice {
+    Xai,
+    OpenAi,
+}
+
+impl ProviderChoice {
+    fn as_str(self) -> &'static str {
+        match self {
+            ProviderChoice::Xai => "xai",
+            ProviderChoice::OpenAi => "openai",
+        }
+    }
+}
+
+/// Resolve the provider choice. Explicit `AURA_VOICE_PROVIDER=xai|openai`
+/// wins (a typo is an error, never a silent fallback); otherwise auto-detect
+/// by which BYOK key resolves — xAI first for back-compat when both are
+/// present. No key at all is a fail-fast error naming both options.
+fn choose_provider(
+    explicit: Option<&str>,
+    have_xai: bool,
+    have_openai: bool,
+) -> Result<ProviderChoice, String> {
+    let explicit = explicit.map(|s| s.trim().to_ascii_lowercase());
+    match explicit.as_deref() {
+        Some("xai") => Ok(ProviderChoice::Xai),
+        Some("openai") => Ok(ProviderChoice::OpenAi),
+        Some(other) if !other.is_empty() => Err(format!(
+            "{VOICE_PROVIDER_ENV} must be \"xai\" or \"openai\", got {other:?}"
+        )),
+        // Unset / empty → auto-detect by key.
+        _ => {
+            if have_xai {
+                Ok(ProviderChoice::Xai)
+            } else if have_openai {
+                Ok(ProviderChoice::OpenAi)
+            } else {
+                Err(format!(
+                    "no BYOK key found: set XAI_API_KEY (xAI Grok voice) or OPENAI_API_KEY \
+                     (OpenAI gpt-realtime-2.1 / gpt-realtime-2.1-mini) in the environment, the \
+                     OS keychain, or a .env file; optionally pin the provider with \
+                     {VOICE_PROVIDER_ENV}=xai|openai"
+                ))
+            }
+        }
+    }
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     load_dotenv();
-    // Fail fast if the BYOK key is absent (before binding / minting).
-    aura_voice::xai::resolve_xai_key()?;
+    // Pick the voice provider and fail fast if its BYOK key is absent (before
+    // binding / minting). Explicit AURA_VOICE_PROVIDER wins; otherwise
+    // auto-detect by which key resolves (env or OS keychain), xAI first.
+    let explicit = std::env::var(VOICE_PROVIDER_ENV).ok();
+    let have_xai = aura_voice::xai::resolve_xai_key().is_ok();
+    let have_openai = aura_voice::openai::resolve_openai_key().is_ok();
+    let choice = choose_provider(explicit.as_deref(), have_xai, have_openai)?;
+    match choice {
+        ProviderChoice::Xai => {
+            aura_voice::xai::resolve_xai_key()?;
+        }
+        ProviderChoice::OpenAi => {
+            aura_voice::openai::resolve_openai_key()?;
+        }
+    }
+    if explicit.as_deref().map(str::trim).unwrap_or("").is_empty() && have_xai && have_openai {
+        eprintln!(
+            "aura-server: both XAI_API_KEY and OPENAI_API_KEY found; defaulting to xai — set \
+             {VOICE_PROVIDER_ENV}=openai to switch."
+        );
+    }
 
     let cwd = std::env::current_dir()?;
     // Resolve the host this server was launched for: the launching
@@ -165,7 +244,33 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let msg_count = brief.context.recent_messages_verbatim.len();
     eprintln!("aura-server: composed context from {msg_count} recent message(s).");
 
-    let provider = XaiRealtimeProvider::new();
+    // Optional model override (e.g. gpt-realtime-2.1-mini, the ~3x cheaper
+    // OpenAI model). Empty/whitespace = unset.
+    let model_override = std::env::var(VOICE_MODEL_ENV)
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty());
+    let provider: Box<dyn VoiceProvider> = match choice {
+        ProviderChoice::Xai => match &model_override {
+            Some(m) => Box::new(XaiRealtimeProvider::with_model_and_voice(
+                m.clone(),
+                aura_voice::xai::DEFAULT_VOICE,
+            )),
+            None => Box::new(XaiRealtimeProvider::new()),
+        },
+        ProviderChoice::OpenAi => match &model_override {
+            Some(m) => Box::new(OpenAiRealtimeProvider::with_model_and_voice(
+                m.clone(),
+                aura_voice::openai::DEFAULT_VOICE,
+            )),
+            None => Box::new(OpenAiRealtimeProvider::new()),
+        },
+    };
+    eprintln!(
+        "aura-server: voice provider = {} (model {}).",
+        choice.as_str(),
+        provider.model_id()
+    );
     let end_of_turn_timeout_ms = resolve_end_of_turn_timeout_ms(
         std::env::var("AURA_INPUT_MODE").ok().as_deref(),
         std::env::var("AURA_END_OF_TURN_TIMEOUT_MS").ok().as_deref(),
@@ -182,6 +287,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         end_of_turn_timeout_ms,
         output_speed: None,
         cold_start_kick: true,
+        // ISO-639-1 hint for OpenAI's input transcription (e.g. "ru");
+        // auto-detect when unset. Ignored by xAI.
+        transcription_language: std::env::var("AURA_TRANSCRIBE_LANG")
+            .ok()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty()),
     };
 
     let call_id = mint_call_id();
@@ -259,7 +370,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The caller completed the handshake — the call is live.
     write_status("active", &call_id, None);
 
-    let provider: Arc<dyn VoiceProvider> = Arc::new(provider);
+    let provider: Arc<dyn VoiceProvider> = Arc::from(provider);
     // Live ambient context — opt-in via `AURA_FEEDER`.
     let feeder = maybe_start_feeder(&cwd).await;
 
@@ -951,6 +1062,14 @@ fn load_dotenv_file(path: &std::path::Path) {
         {
             value = &value[1..value.len() - 1];
         }
+        // A dangling `KEY=` (empty value) is treated as ABSENT, not as "set to
+        // empty": an interrupted key-paste can leave such a line, and setting
+        // the var to "" would permanently shadow a correct `KEY=value` line
+        // appended later in the same file (this loader never overrides a set
+        // var, and every consumer rejects empty values anyway).
+        if value.is_empty() {
+            continue;
+        }
         if std::env::var_os(key).is_none() {
             std::env::set_var(key, expand_home(value));
         }
@@ -1073,6 +1192,22 @@ mod tests {
             assert_eq!(expand_home("/abs/path"), "/abs/path");
             assert_eq!(expand_home("sk-secret~x"), "sk-secret~x");
         }
+    }
+
+    /// A dangling `KEY=` line (interrupted key paste) must be skipped, so a
+    /// correct `KEY=value` appended LATER in the same file still loads —
+    /// setting "" would permanently shadow it (the loader never overrides).
+    #[test]
+    fn dotenv_empty_value_does_not_shadow_later_line() {
+        const VAR: &str = "AURA_TEST_DOTENV_EMPTY";
+        // SAFETY: this is the only test that touches this dedicated var.
+        unsafe { std::env::remove_var(VAR) };
+        let tmp = tempfile::tempdir().unwrap();
+        let env_file = tmp.path().join(".env");
+        std::fs::write(&env_file, format!("{VAR}=\n{VAR}=real-value\n")).unwrap();
+        load_dotenv_file(&env_file);
+        assert_eq!(std::env::var(VAR).as_deref(), Ok("real-value"));
+        unsafe { std::env::remove_var(VAR) };
     }
 
     #[test]
@@ -1200,5 +1335,52 @@ mod tests {
         assert!(!pid_is_aura_server(std::process::id()));
         // A pid that cannot exist is likewise never verified.
         assert!(!pid_is_aura_server(u32::MAX));
+    }
+
+    #[test]
+    fn choose_provider_explicit_wins_and_rejects_typos() {
+        // Explicit pin wins regardless of which keys are present.
+        assert_eq!(
+            choose_provider(Some("openai"), true, false).unwrap(),
+            ProviderChoice::OpenAi
+        );
+        assert_eq!(
+            choose_provider(Some(" XAI "), false, true).unwrap(),
+            ProviderChoice::Xai
+        );
+        // A typo is an error, never a silent fallback.
+        let err = choose_provider(Some("opnai"), true, true).unwrap_err();
+        assert!(err.contains("AURA_VOICE_PROVIDER"));
+        assert!(err.contains("opnai"));
+    }
+
+    #[test]
+    fn choose_provider_auto_detects_by_key_xai_first() {
+        assert_eq!(
+            choose_provider(None, true, false).unwrap(),
+            ProviderChoice::Xai
+        );
+        assert_eq!(
+            choose_provider(None, false, true).unwrap(),
+            ProviderChoice::OpenAi
+        );
+        // Both present → xai for back-compat (the caller prints a note).
+        assert_eq!(
+            choose_provider(None, true, true).unwrap(),
+            ProviderChoice::Xai
+        );
+        // Empty/whitespace explicit value behaves like unset.
+        assert_eq!(
+            choose_provider(Some("  "), false, true).unwrap(),
+            ProviderChoice::OpenAi
+        );
+    }
+
+    #[test]
+    fn choose_provider_no_key_is_fail_fast_naming_both() {
+        let err = choose_provider(None, false, false).unwrap_err();
+        assert!(err.contains("XAI_API_KEY"));
+        assert!(err.contains("OPENAI_API_KEY"));
+        assert!(err.contains("AURA_VOICE_PROVIDER"));
     }
 }

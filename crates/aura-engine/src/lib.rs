@@ -208,6 +208,14 @@ struct CallState {
     /// The model called `pause_call_until`; enter the paused phase once its
     /// "pausing" turn finishes (next `ResponseDone`).
     pending_pause: Option<PauseCondition>,
+    /// Conversation-item id of the response audio currently playing (when the
+    /// provider reports one) — the barge-in truncate target.
+    current_item: Option<String>,
+    /// PCM samples delivered to the transport for `current_item`. Divided by
+    /// 24 this is the item's delivered milliseconds; minus the transport's
+    /// still-queued milliseconds it approximates what the user actually HEARD
+    /// — the `audio_end_ms` for `VoiceSink::truncate_item`.
+    item_delivered_samples: u64,
 }
 
 impl CallState {
@@ -217,6 +225,8 @@ impl CallState {
         self.suppress = false;
         self.assistant_active = false;
         self.user_speaking = false;
+        self.current_item = None;
+        self.item_delivered_samples = 0;
     }
 }
 
@@ -325,7 +335,7 @@ impl CallSession {
                     mic = transport.recv_pcm24() => match mic {
                         Some(pcm) => {
                             if sink.send_audio(&pcm).await.is_err() {
-                                match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript)).await {
+                                match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "mic-audio send failed").await {
                                     Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
                                     None => break Transition::Ended(EndReason::ReconnectExhausted),
                                 }
@@ -334,7 +344,7 @@ impl CallSession {
                         None => break Transition::Ended(EndReason::HangUp),
                     },
                     ev = stream.next_event() => match ev {
-                        None => match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript)).await {
+                        None => match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "the provider closed the event stream").await {
                             Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
                             None => break Transition::Ended(EndReason::ReconnectExhausted),
                         },
@@ -342,7 +352,7 @@ impl CallSession {
                             if e.is_terminal() {
                                 break Transition::Ended(EndReason::ProviderFatal);
                             }
-                            match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript)).await {
+                            match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), &format!("event-stream error: {e}")).await {
                                 Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
                                 None => break Transition::Ended(EndReason::ReconnectExhausted),
                             }
@@ -385,7 +395,7 @@ impl CallSession {
                                     let cond = state.pending_pause.take().unwrap_or(PauseCondition::TaskComplete);
                                     break Transition::Pause(cond);
                                 }
-                                Flow::Reconnect => match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript)).await {
+                                Flow::Reconnect => match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "recovering from an in-call error (see the line above)").await {
                                     Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
                                     None => break Transition::Ended(EndReason::ReconnectExhausted),
                                 },
@@ -426,7 +436,7 @@ impl CallSession {
                     // --- RESUME: bring the realtime leg back with the pre-pause
                     // dialogue digest + the latched result, then speak it. ---
                     let resume_cfg = build_resume_cfg(&cfg, &transcript, &latched);
-                    match reconnect(&provider, &resume_cfg).await {
+                    match reconnect(&provider, &resume_cfg, "pause condition met").await {
                         Some((s, st)) => {
                             sink = s;
                             stream = st;
@@ -491,12 +501,19 @@ async fn handle_event(
 ) -> Flow {
     match event {
         VoiceEvent::SessionReady => Flow::Continue,
-        VoiceEvent::OutputAudio(pcm) => {
+        VoiceEvent::OutputAudio { pcm, item_id } => {
             // Drop the cancelled response's late audio while suppressing.
             if state.suppress {
                 return Flow::Continue;
             }
             state.assistant_active = true;
+            // Track the playing item for barge-in truncate: a new item id
+            // starts a fresh delivered-samples count.
+            if item_id != state.current_item {
+                state.current_item = item_id;
+                state.item_delivered_samples = 0;
+            }
+            state.item_delivered_samples += pcm.len() as u64;
             match transport.send_pcm24(&pcm).await {
                 Ok(()) => Flow::Continue,
                 // A closed transport ends the call; a transient IO error drops
@@ -508,18 +525,52 @@ async fn handle_event(
         }
         VoiceEvent::OutputTextDelta(_) | VoiceEvent::InputTranscriptDelta { .. } => Flow::Continue,
         VoiceEvent::UserSpeechStarted => {
+            // Heard-audio estimate for truncate, taken BEFORE clear_playout
+            // wipes the queue: delivered minus still-queued = what actually
+            // reached the user's ears (the tunnel pacer sends at real-time
+            // rate, so "left the queue" ≈ "was played").
+            let heard_ms =
+                (state.item_delivered_samples / 24).saturating_sub(transport.queued_ms());
             let decision =
                 speech_started_decision(transport.queued_ms(), state.assistant_active, echo_risk);
             if decision.clear_local_playback {
                 transport.clear_playout();
             }
             if decision.cancel_active_response {
-                // cancel + suppress move together: a cancel without the guard
-                // lets late deltas overlap the user's speech.
-                if sink.cancel_response().await.is_err() {
-                    return Flow::Reconnect;
+                // Only cancel a LIVE response. The provider bursts a whole turn
+                // far faster than realtime, so `response.done` arrives while the
+                // audio is still DRAINING from the transport queue; a barge-in
+                // during that drain has no in-flight response to cancel, and
+                // sending `response.cancel` then only draws a benign
+                // `invalid_request_error`. `suppress` guards a live response's
+                // late deltas, so it is set exactly when we actually cancel —
+                // never lingering to eat the NEXT response's audio/tool calls
+                // (that stale-suppress bug refused to hang up on a spoken "end
+                // the call").
+                if state.assistant_active {
+                    if let Err(e) = sink.cancel_response().await {
+                        eprintln!("aura-engine: barge-in cancel send failed: {e}");
+                        return Flow::Reconnect;
+                    }
+                    state.suppress = true;
                 }
-                state.suppress = true;
+                // Context sync for BOTH live and post-done barge-ins: truncate
+                // the item at what the user actually heard so the model's
+                // context drops the unheard tail and does not repeat it on the
+                // next turn. `current_item` deliberately survives
+                // `response.done` for exactly this (it is reset only when a new
+                // item's audio starts). No-op for providers without truncate;
+                // only sent when audio was in fact cut off (`heard < delivered`,
+                // so `audio_end_ms` can never exceed the generated length).
+                if let Some(item_id) = state.current_item.take() {
+                    let delivered_ms = state.item_delivered_samples / 24;
+                    if heard_ms < delivered_ms
+                        && sink.truncate_item(&item_id, heard_ms).await.is_err()
+                    {
+                        return Flow::Reconnect;
+                    }
+                    state.item_delivered_samples = 0;
+                }
             }
             if decision.mark_user_speaking {
                 state.user_speaking = true;
@@ -539,6 +590,13 @@ async fn handle_event(
             let _ = transport.flush_output().await;
             state.assistant_active = false;
             state.suppress = false;
+            // Do NOT clear `current_item`/`item_delivered_samples` here: the
+            // response is done GENERATING but its audio is still draining from
+            // the transport queue, and a barge-in during that drain must be
+            // able to truncate this item at the heard position. They are reset
+            // when the next item's audio starts (the `OutputAudio` arm) or on
+            // reconnect; a barge-in after the queue fully drains is harmless
+            // because `heard == delivered` then, so no truncate is sent.
             // If the model asked to hang up, end once its farewell turn is done.
             if state.ending {
                 return Flow::End(EndReason::HangUp);
@@ -551,10 +609,22 @@ async fn handle_event(
             Flow::Continue
         }
         VoiceEvent::Error(e) => {
+            // The code/kind is the whole diagnosis (e.g. a provider that answers
+            // a client event with an error). Non-terminal used to reconnect
+            // SILENTLY, which hid a reconnect-per-barge-in pattern for months.
+            eprintln!("aura-engine: provider error event: {e}");
             if e.is_terminal() {
                 Flow::End(EndReason::ProviderFatal)
             } else {
-                Flow::Reconnect
+                // An in-band error EVENT on a live stream is informational —
+                // the session itself is fine. Live-diagnosed example: a
+                // barge-in `response.cancel` racing a response that already
+                // finished server-side makes xAI answer `invalid_request_error`;
+                // reconnecting on that dropped the whole session (fresh
+                // context, language resets) on EVERY late barge-in. Genuine
+                // session death still reconnects via the transport paths
+                // (stream close / read error / send failure).
+                Flow::Continue
             }
         }
     }
@@ -976,7 +1046,13 @@ fn cap_buf_tail(buf: &mut String) {
 async fn reconnect(
     provider: &Arc<dyn VoiceProvider>,
     cfg: &VoiceSessionConfig,
+    why: &str,
 ) -> Option<(Box<dyn VoiceSink>, Box<dyn VoiceStream>)> {
+    // One diagnostic line per reconnect episode. `why` distinguishes a genuine
+    // mid-call drop from the planned pause-resume: a healthy, pause-free call
+    // never logs a drop, so a reconnect-per-barge-in pattern (a provider
+    // rejecting an event we sent, e.g. an experimental truncate) is visible.
+    eprintln!("aura-engine: {why}; reconnecting the realtime session.");
     const BACKOFF_MS: [u64; 3] = [250, 1_000, 3_000];
     for delay_ms in BACKOFF_MS {
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -1015,6 +1091,7 @@ mod tests {
     struct SinkLog {
         audio: Vec<Vec<i16>>,
         cancels: usize,
+        truncates: Vec<(String, u64)>,
         injects: Vec<String>,
         tool_results: usize,
         requests: usize,
@@ -1033,6 +1110,18 @@ mod tests {
         }
         async fn cancel_response(&mut self) -> Result<(), VoiceError> {
             self.log.lock().unwrap().cancels += 1;
+            Ok(())
+        }
+        async fn truncate_item(
+            &mut self,
+            item_id: &str,
+            audio_end_ms: u64,
+        ) -> Result<(), VoiceError> {
+            self.log
+                .lock()
+                .unwrap()
+                .truncates
+                .push((item_id.to_owned(), audio_end_ms));
             Ok(())
         }
         async fn send_tool_result(
@@ -1171,6 +1260,7 @@ mod tests {
             end_of_turn_timeout_ms: None,
             output_speed: None,
             cold_start_kick: false,
+            transcription_language: None,
         }
     }
 
@@ -1220,8 +1310,14 @@ mod tests {
             vec![Script::Ok {
                 events: vec![
                     VoiceEvent::SessionReady,
-                    VoiceEvent::OutputAudio(vec![1, 2, 3]),
-                    VoiceEvent::OutputAudio(vec![4, 5]),
+                    VoiceEvent::OutputAudio {
+                        pcm: vec![1, 2, 3],
+                        item_id: None,
+                    },
+                    VoiceEvent::OutputAudio {
+                        pcm: vec![4, 5],
+                        item_id: None,
+                    },
                     VoiceEvent::Error(VoiceError::BalanceZero),
                 ],
                 end: End::Pending,
@@ -1264,11 +1360,20 @@ mod tests {
             vec![Script::Ok {
                 events: vec![
                     VoiceEvent::SessionReady,
-                    VoiceEvent::OutputAudio(vec![1]),
+                    VoiceEvent::OutputAudio {
+                        pcm: vec![1],
+                        item_id: None,
+                    },
                     VoiceEvent::UserSpeechStarted,
-                    VoiceEvent::OutputAudio(vec![2]), // late delta of cancelled response — dropped
+                    VoiceEvent::OutputAudio {
+                        pcm: vec![2],
+                        item_id: None,
+                    }, // late delta of cancelled response — dropped
                     VoiceEvent::ResponseDone { input_tokens: None },
-                    VoiceEvent::OutputAudio(vec![3]), // suppress cleared — played
+                    VoiceEvent::OutputAudio {
+                        pcm: vec![3],
+                        item_id: None,
+                    }, // suppress cleared — played
                     VoiceEvent::Error(VoiceError::BalanceZero),
                 ],
                 end: End::Pending,
@@ -1284,6 +1389,74 @@ mod tests {
         assert_eq!(*h.played.lock().unwrap(), vec![vec![1], vec![3]]);
         assert_eq!(h.sink_log.lock().unwrap().cancels, 1);
         assert_eq!(h.cleared.load(Ordering::SeqCst), 1);
+        // No item_id was reported → nothing to truncate.
+        assert!(h.sink_log.lock().unwrap().truncates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn barge_in_truncates_cancelled_item_at_heard_position() {
+        // 960 samples @24k = 40 ms delivered for item "it_1"; the fake
+        // transport reports 20 ms still queued at the barge-in, so the user
+        // heard 40 - 20 = 20 ms. The engine must cancel AND truncate the item
+        // at 20 ms (dropping the unheard tail from the model's context).
+        let h = harness(
+            vec![Script::Ok {
+                events: vec![
+                    VoiceEvent::SessionReady,
+                    VoiceEvent::OutputAudio {
+                        pcm: vec![0; 960],
+                        item_id: Some("it_1".into()),
+                    },
+                    VoiceEvent::UserSpeechStarted,
+                    VoiceEvent::Error(VoiceError::BalanceZero),
+                ],
+                end: End::Pending,
+            }],
+            vec![],
+            false,
+        );
+        let outcome = CallSession::run(h.transport, h.provider, host(), None, cfg())
+            .await
+            .unwrap();
+        assert_eq!(outcome.reason, EndReason::ProviderFatal);
+        let log = h.sink_log.lock().unwrap();
+        assert_eq!(log.cancels, 1);
+        assert_eq!(log.truncates, vec![("it_1".to_owned(), 20)]);
+    }
+
+    #[tokio::test]
+    async fn post_done_barge_in_truncates_still_playing_item() {
+        // The REAL fix for "the model repeats a line after I interrupt": the
+        // provider bursts a long answer, `response.done` arrives while the
+        // audio is still draining, and a barge-in during that drain must
+        // truncate the item at the heard position (so the model's context drops
+        // the unheard tail). 960 samples = 40 ms delivered; the fake reports
+        // 20 ms still queued at barge-in → heard = 20 ms. Post-done there is no
+        // live response, so no `response.cancel` is sent.
+        let h = harness(
+            vec![Script::Ok {
+                events: vec![
+                    VoiceEvent::SessionReady,
+                    VoiceEvent::OutputAudio {
+                        pcm: vec![0; 960],
+                        item_id: Some("it_1".into()),
+                    },
+                    VoiceEvent::ResponseDone { input_tokens: None }, // done generating; audio still queued
+                    VoiceEvent::UserSpeechStarted,                   // barge-in during drain
+                    VoiceEvent::Error(VoiceError::BalanceZero),
+                ],
+                end: End::Pending,
+            }],
+            vec![],
+            false,
+        );
+        let outcome = CallSession::run(h.transport, h.provider, host(), None, cfg())
+            .await
+            .unwrap();
+        assert_eq!(outcome.reason, EndReason::ProviderFatal);
+        let log = h.sink_log.lock().unwrap();
+        assert_eq!(log.truncates, vec![("it_1".to_owned(), 20)]);
+        assert_eq!(log.cancels, 0, "post-done barge-in must not cancel");
     }
 
     #[tokio::test]
@@ -1298,8 +1471,11 @@ mod tests {
             vec![Script::Ok {
                 events: vec![
                     VoiceEvent::SessionReady,
-                    VoiceEvent::OutputAudio(vec![1]), // assistant speaking -> barge-in cancels
-                    VoiceEvent::UserSpeechStarted,    // barge-in: sets suppress
+                    VoiceEvent::OutputAudio {
+                        pcm: vec![1],
+                        item_id: None,
+                    }, // assistant speaking -> barge-in cancels
+                    VoiceEvent::UserSpeechStarted, // barge-in: sets suppress
                     VoiceEvent::ToolCall(VoiceToolCall {
                         call_id: Some("e1".into()),
                         name: "end_voice_session".into(),
@@ -1403,6 +1579,77 @@ mod tests {
         // The pause ack + the resume kick both asked for a response.
         assert!(log.requests >= 2, "requests = {}", log.requests);
         assert!(log.closed, "the collapsed session's sink was closed");
+    }
+
+    #[tokio::test]
+    async fn post_done_barge_in_does_not_suppress_the_next_response() {
+        // Live-diagnosed "the call refuses to hang up": the developer speaks
+        // over the still-playing TAIL of a response whose `response.done` was
+        // already processed. Post-done there is no live response, so we neither
+        // cancel nor set suppress — the model's NEXT response (here: obeying the
+        // spoken "end the call" with an `end_voice_session` tool call) must be
+        // honored, so the call ends with HangUp, not the fallback fatal error.
+        let h = harness(
+            vec![Script::Ok {
+                events: vec![
+                    VoiceEvent::SessionReady,
+                    VoiceEvent::OutputAudio {
+                        pcm: vec![1],
+                        item_id: None,
+                    }, // queues 20 ms in the fake transport
+                    VoiceEvent::ResponseDone { input_tokens: None }, // response over; tail still queued
+                    VoiceEvent::UserSpeechStarted, // "end the call" spoken over the tail
+                    VoiceEvent::ToolCall(VoiceToolCall {
+                        call_id: Some("e1".into()),
+                        name: "end_voice_session".into(),
+                        args: serde_json::json!({}),
+                    }), // the NEW response obeying the request -> must EXECUTE
+                    VoiceEvent::ResponseDone { input_tokens: None }, // farewell turn done -> hang up
+                    VoiceEvent::Error(VoiceError::BalanceZero),      // only reached on regression
+                ],
+                end: End::Pending,
+            }],
+            vec![],
+            false,
+        );
+        let outcome = CallSession::run(h.transport, h.provider, host(), None, cfg())
+            .await
+            .unwrap();
+        assert_eq!(outcome.reason, EndReason::HangUp);
+        // No live response to cancel post-done → no `response.cancel` (which
+        // would only draw a benign invalid_request_error from the provider).
+        assert_eq!(h.sink_log.lock().unwrap().cancels, 0);
+    }
+
+    #[tokio::test]
+    async fn nonterminal_error_event_does_not_reconnect() {
+        // Live-diagnosed regression guard: a barge-in `response.cancel` racing
+        // an already-finished response makes the provider answer an in-band
+        // `invalid_request_error` event. That must NOT drop the session — the
+        // call continues on the SAME connection (connects stays 1) and audio
+        // after the error still plays.
+        let h = harness(
+            vec![Script::Ok {
+                events: vec![
+                    VoiceEvent::SessionReady,
+                    VoiceEvent::Error(VoiceError::Protocol("invalid_request_error".into())),
+                    VoiceEvent::OutputAudio {
+                        pcm: vec![7],
+                        item_id: None,
+                    },
+                    VoiceEvent::Error(VoiceError::BalanceZero), // deterministic end
+                ],
+                end: End::Pending,
+            }],
+            vec![],
+            false,
+        );
+        let outcome = CallSession::run(h.transport, h.provider, host(), None, cfg())
+            .await
+            .unwrap();
+        assert_eq!(outcome.reason, EndReason::ProviderFatal);
+        assert_eq!(h.connects.load(Ordering::SeqCst), 1, "no reconnect");
+        assert_eq!(*h.played.lock().unwrap(), vec![vec![7]]);
     }
 
     #[tokio::test]

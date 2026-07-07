@@ -8,7 +8,8 @@
 #                   connection string from $AURA_CONNECT (or one line on
 #                   stdin)  - never from argv.
 #   * aura-server  - the server the host/AI launches (127.0.0.1 for a LOCAL
-#                   call, a VPS for a REMOTE call). Holds XAI_API_KEY + the
+#                   call, a VPS for a REMOTE call). Holds the API key (xAI or
+#                   OpenAI) + the
 #                   engine + the chat context + the tools. Needs no audio
 #                   package on any OS.
 #
@@ -530,7 +531,7 @@ ${C_BOLD}NEXT — do not stop here.${C_RESET} The binaries + call helpers are in
       * drop the host skill (skills/SKILL.md) in place   — onboarding step 5
   The aura-call / aura-call-status / aura-inbox helpers are already on your PATH
   (the skill uses them). The host/AI launches aura-server per call; it needs
-  XAI_API_KEY in its environment (or the OS keychain, or a ./.env in its working dir).
+  XAI_API_KEY or OPENAI_API_KEY in its environment (or the OS keychain, or a ./.env).
       ${ONBOARDING_URL}
 EOF
     echo

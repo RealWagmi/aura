@@ -44,9 +44,11 @@ pub const ALPN: &[u8] = b"aura/voice/0";
 const FRAME_SAMPLES: usize = 480;
 const FRAME_MS: u64 = 20;
 /// Outbound queue cap — a MEMORY backstop only (matches the direct transport).
-/// xAI bursts a full turn faster than realtime, so the queue must hold a whole
-/// turn or drop-oldest truncates the response. 30 s @ 50 frames/s = 1500 frames.
-const MAX_OUTBOUND_FRAMES: usize = 1500;
+/// The model bursts a full answer faster than realtime, so the queue must hold
+/// a whole LONG answer or drop-oldest audibly eats words (live-diagnosed on the
+/// direct transport at the old 30 s cap; see `endpoint.rs`). 5 min @ 50
+/// frames/s = 15 000 frames ≈ 14 MB; overflow is logged loudly.
+const MAX_OUTBOUND_FRAMES: usize = 15_000;
 
 /// Which iroh preset (relay + discovery) to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +171,8 @@ async fn read_framed<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<Vec<u8>, Iroh
 struct Outbound {
     queue: VecDeque<Vec<i16>>,
     reframer: Reframer,
+    /// Total frames dropped on overflow (diagnostic; see `MAX_OUTBOUND_FRAMES`).
+    dropped_frames: u64,
 }
 
 /// Aborts the spawned task when the endpoint is dropped.
@@ -332,6 +336,7 @@ impl IrohEndpoint {
         let outbound = Arc::new(Mutex::new(Outbound {
             queue: VecDeque::new(),
             reframer: Reframer::new(FRAME_SAMPLES),
+            dropped_frames: 0,
         }));
         let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<i16>>(cfg.inbound_capacity.max(1));
 
@@ -427,6 +432,17 @@ impl IrohEndpoint {
             out.queue.push_back(f);
             while out.queue.len() > MAX_OUTBOUND_FRAMES {
                 out.queue.pop_front();
+                out.dropped_frames += 1;
+                // Loud, rate-limited (first drop, then ~1/s of loss): overflow
+                // eats the audio the listener is ABOUT TO HEAR.
+                if out.dropped_frames == 1 || out.dropped_frames.is_multiple_of(50) {
+                    eprintln!(
+                        "aura-tunnel: outbound pacer queue FULL ({} min cap) — {} ms of audio \
+                         dropped; words are being skipped",
+                        MAX_OUTBOUND_FRAMES as u64 / 50 / 60,
+                        out.dropped_frames * FRAME_MS
+                    );
+                }
             }
         }
     }

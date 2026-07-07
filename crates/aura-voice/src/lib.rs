@@ -3,9 +3,11 @@
 //!
 //! This crate exports the provider-neutral contract the engine talks to —
 //! [`VoiceProvider`], the split [`VoiceSink`] / [`VoiceStream`] pair, and
-//! the [`VoiceEvent`] stream — plus the single v1
-//! implementation `XaiRealtimeProvider` (DIRECT `wss://api.x.ai/v1/realtime`,
-//! BYOK, host-pinned).
+//! the [`VoiceEvent`] stream — plus two DIRECT implementations:
+//! `XaiRealtimeProvider` (`wss://api.x.ai/v1/realtime`) and
+//! `OpenAiRealtimeProvider` (`wss://api.openai.com/v1/realtime`, GA protocol).
+//! Both are BYOK with a per-provider host-pin; they share one WS/event
+//! plumbing (`realtime_ws`) because both speak GA-style event names.
 //!
 //! ## The sink/stream split
 //!
@@ -28,10 +30,14 @@
 
 use async_trait::async_trait;
 
+mod byok;
 pub mod compose;
+pub mod openai;
+mod realtime_ws;
 pub mod wire;
 pub mod xai;
 
+pub use openai::OpenAiRealtimeProvider;
 pub use xai::XaiRealtimeProvider;
 
 /// Capabilities a provider advertises so the engine can drive it without
@@ -70,10 +76,19 @@ pub enum VoiceEvent {
     /// Session negotiated; safe to start pumping audio.
     SessionReady,
     /// Decoded model audio, already base64-decoded to PCM16 @ 24k.
-    OutputAudio(Vec<i16>),
+    /// `item_id` is the provider's conversation-item id for this response's
+    /// audio (when reported) — the engine tracks it so a barge-in can
+    /// [`VoiceSink::truncate_item`] the cancelled item at the position the
+    /// user actually heard.
+    OutputAudio {
+        pcm: Vec<i16>,
+        item_id: Option<String>,
+    },
     /// Incremental assistant text (for transcript/UI; not the audio path).
     OutputTextDelta(String),
-    /// User transcript, inline from the realtime WS (NOT a separate STT).
+    /// User transcript, arriving inline over the same realtime WS (xAI: the
+    /// model's own events; OpenAI: its built-in transcription sidecar). Feeds
+    /// the transcript/recap TEXT only — never the audio path.
     InputTranscriptDelta { delta: String, final_: bool },
     /// Provider server-VAD detected the user started speaking (barge-in
     /// trigger).
@@ -109,11 +124,15 @@ pub struct VoiceSessionConfig {
     /// When `true`, `connect` includes a cold-start user item + response
     /// so the model greets first (batched into the handshake flush).
     pub cold_start_kick: bool,
+    /// Optional ISO-639-1 language hint (e.g. `"ru"`) for OpenAI's input
+    /// transcription sidecar; `None` = auto-detect. Ignored by xAI (its inline
+    /// transcription takes no config).
+    pub transcription_language: Option<String>,
 }
 
-/// The swappable provider seam. xAI is the only v1 implementation; the
-/// OpenAI session builder is kept dormant as a witness that the seam is
-/// real.
+/// The swappable provider seam. Two DIRECT implementations: xAI Grok voice
+/// and OpenAI `gpt-realtime-2.1`; the server picks one per call (by which
+/// BYOK key the operator provided).
 #[async_trait]
 pub trait VoiceProvider: Send + Sync {
     /// Realtime model id, e.g. `"grok-voice-think-fast-1.0"`.
@@ -139,6 +158,18 @@ pub trait VoiceSink: Send {
     async fn send_audio(&mut self, pcm16: &[i16]) -> Result<(), VoiceError>;
     /// Barge-in: ask the model to cancel the in-flight response.
     async fn cancel_response(&mut self) -> Result<(), VoiceError>;
+    /// Barge-in context sync: truncate the cancelled assistant item at the
+    /// audio position the user actually heard, so the model's conversation
+    /// state doesn't retain the unheard tail (on a WS transport the server
+    /// can't observe client playback). Providers without
+    /// `conversation.item.truncate` support keep this default no-op.
+    async fn truncate_item(
+        &mut self,
+        _item_id: &str,
+        _audio_end_ms: u64,
+    ) -> Result<(), VoiceError> {
+        Ok(())
+    }
     /// Return a tool result to the model.
     async fn send_tool_result(
         &mut self,
@@ -169,7 +200,8 @@ pub enum VoiceError {
     /// Refused to send the key to a non-pinned host (anti-exfiltration).
     #[error("endpoint host not allowed (host-pin): {0}")]
     HostNotAllowed(String),
-    /// No usable `XAI_API_KEY` from env or keychain.
+    /// No usable BYOK key (`XAI_API_KEY` / `OPENAI_API_KEY`) from env or
+    /// keychain.
     #[error("no API key available: {0}")]
     MissingKey(String),
     /// Handshake / upgrade failed.

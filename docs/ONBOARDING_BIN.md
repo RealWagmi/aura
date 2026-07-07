@@ -5,10 +5,11 @@
 there is **no Rust toolchain, no clone, and no compile**. (Windows, or an
 unlisted CPU arch, uses the source guide instead: `docs/ONBOARDING.md`.) Read
 this file in full, then execute the steps in order. You proceed autonomously and
-report results; the one thing you always need from the user is the `XAI_API_KEY`.
+report results; the one thing you always need from the user is the API key
+(`XAI_API_KEY` or `OPENAI_API_KEY`).
 
 `aura` gives an AI chat a real voice call: the user types "call me", the host
-launches `aura-server` (it holds the xAI key, the engine, the chat context, and
+launches `aura-server` (it holds the API key, the engine, the chat context, and
 the tools), the server mints a single-use session secret and prints a
 **connection string**, and the user's thin client `aura-cli` (mic/speaker) dials
 in over one Noise-encrypted UDP tunnel. **No broker, no relay** — the AI server
@@ -18,7 +19,7 @@ is itself the call endpoint.
 
 1. **Detect OS + arch + decide LOCAL vs REMOTE** — from the environment → Step 0
 2. **Install the binaries** (`install_bin.sh --server`) — downloads + verifies + puts on PATH → Step 1
-3. **Get the `XAI_API_KEY`** — the ONE time you stop and ask the user → Step 2
+3. **Choose the voice provider + get the API key** — the ONE time you stop and ask the user → Step 2
 4. **(REMOTE only) NAT check first**, then open the UDP port once (`aura-open-port`) — or, behind NAT, set `AURA_TRANSPORT=iroh` and open nothing; LOCAL → skip → Step 3
 5. **Drop the host skill** into your framework's skills dir → Step 4
 6. **Set your framework to auto-approve** the orchestrator's tool calls + raise the budget → Step 4b
@@ -29,7 +30,7 @@ is itself the call endpoint.
 
 - ❌ **Re-asking the user for things you can detect or decide** (OS, arch, mode when clear, the skills dir, defaults). Ask only for the items in "When to ask the user".
 - ❌ **Stopping after the install.** Installed binaries ≠ a working call — you are done only after the Step 5 self-check passes.
-- ❌ **Echoing, printing, or logging the `XAI_API_KEY` or the session secret**, or putting either on a command line (`argv` is visible in `ps`).
+- ❌ **Echoing, printing, or logging the API key or the session secret**, or putting either on a command line (`argv` is visible in `ps`).
 - ❌ **Opening the firewall per call.** The UDP port is opened ONCE at Step 3.
 - ❌ **Ignoring a checksum failure.** If `install_bin.sh` reports a SHA-256 mismatch, STOP — do not work around it.
 - ❌ **Continuing past a failed step.** On any failure: stop, tell the user what failed and the fix, do not proceed.
@@ -37,7 +38,7 @@ is itself the call endpoint.
 ## When to ask the user (the ONLY interactive points)
 
 - **Proceed autonomously:** OS/arch detection, the mode decision (when clear), the install, dropping the skill, opening the port when you have root, and every verification.
-- **Ask the user — only these:** (1) the **`XAI_API_KEY`** (Step 2); (2) **LOCAL or REMOTE** (Step 0) *only* if you cannot tell from the environment; (3) to run the **`sudo` firewall command** (Step 3) *only* when you lack root.
+- **Ask the user — only these:** (1) the **API key** — which provider and the key itself (Step 2); (2) **LOCAL or REMOTE** (Step 0) *only* if you cannot tell from the environment; (3) to run the **`sudo` firewall command** (Step 3) *only* when you lack root.
 - **Never** sign in, paste the key, or change anything outside this machine on the user's behalf.
 
 ---
@@ -80,12 +81,23 @@ arch), it prints the source-install command — follow `docs/ONBOARDING.md` inst
 
 ---
 
-## Step 2 — Obtain the `XAI_API_KEY` (get it from the user)
+## Step 2 — Choose the voice provider and obtain the API key (get it from the user)
 
-`aura` is **BYOK**. The server resolves the key in order: env `XAI_API_KEY` → a
-`.env` file (`./.env`, then a user-global `$AURA_HOME/.env`, else
-`${XDG_CONFIG_HOME:-~/.config}/aura/.env`) → the OS keychain. The key is sent
-**only** to `api.x.ai` (host-pinned).
+`aura` is **BYOK** and supports two realtime voice providers. **Ask the user
+which API key they can provide** — offer exactly these options:
+
+| Choice | Key to provide | Voice model | Cost ballpark |
+|---|---|---|---|
+| **xAI Grok** | `XAI_API_KEY` | `grok-voice-think-fast-1.0` | flat **$0.05/min** — predictable |
+| **OpenAI** | `OPENAI_API_KEY` | `gpt-realtime-2.1` | token-billed, ≈$0.05–0.10/min — smartest, 128k context |
+| **OpenAI mini** | `OPENAI_API_KEY` | `gpt-realtime-2.1-mini` | token-billed, ≈$0.02–0.04/min — cheapest |
+
+The server resolves the key in order: env (`XAI_API_KEY` / `OPENAI_API_KEY`) →
+a `.env` file (`./.env`, then a user-global `$AURA_HOME/.env`, else
+`${XDG_CONFIG_HOME:-~/.config}/aura/.env`) → the OS keychain. It auto-picks the
+provider by which key it finds (xAI wins when both are present). Each key is
+host-pinned: `XAI_API_KEY` goes **only** to `api.x.ai`, `OPENAI_API_KEY`
+**only** to `api.openai.com`.
 
 **Recommended — a user-global `~/.config/aura/.env`** (found no matter which
 directory the host launches the server from). Create it owner-only *first*, then
@@ -94,14 +106,32 @@ have the user paste the key so it never appears in your transcript:
 ```bash
 umask 077
 mkdir -p ~/.config/aura
+# Write OPENAI_API_KEY= instead if the user chose OpenAI:
 printf 'XAI_API_KEY=' > ~/.config/aura/.env && chmod 600 ~/.config/aura/.env
 ( read -rs k; printf '%s\n' "$k" >> ~/.config/aura/.env; unset k )
 echo "key written to ~/.config/aura/.env"   # confirmation only; the key is never printed
 ```
 
+That snippet is for a terminal the USER types into (they paste; the key never
+appears in your transcript). If the user instead sends the key to you in chat,
+append the `KEY=<key>` line to the same file with your FILE-WRITE/edit tool
+(never a shell echo/printf — command lines are visible in `ps`), then
+`chmod 600` the file.
+
+If the user chose **OpenAI**, also append the provider pin (plus the model line
+only for mini, and an optional ISO-639-1 transcription hint for non-English
+users — it improves the user-side transcript in call recaps):
+
+```bash
+printf 'AURA_VOICE_PROVIDER=openai\n' >> ~/.config/aura/.env
+printf 'AURA_VOICE_MODEL=gpt-realtime-2.1-mini\n' >> ~/.config/aura/.env   # mini only
+printf 'AURA_TRANSCRIBE_LANG=ru\n' >> ~/.config/aura/.env                  # optional, e.g. Russian
+```
+
 **Never** run `echo "$XAI_API_KEY"`, never put the key on a command line, and
 never write it anywhere but a `0600` `.env` (or the keychain). On macOS/Windows
-you may instead store it in the OS keychain (service `aura`, entry `XAI_API_KEY`).
+you may instead store it in the OS keychain (service `aura`, entry named like
+the env var).
 
 ---
 
@@ -215,7 +245,7 @@ command -v aura-call && command -v aura-call-status && command -v aura-inbox && 
 # Key resolves? The server reaches the connection-string line, then we stop it.
 timeout 8s aura-server 2>&1 | grep -m1 -E 'AURA_CONNECT=|composed context|host =' \
   && echo "key resolved + server starts: OK" \
-  || echo "server did NOT start — check the XAI_API_KEY (Step 2)"
+  || echo "server did NOT start — check the API key (Step 2)"
 # State-dir agreement: run BOTH and compare the two absolute paths:
 timeout 8s aura-server 2>&1 | grep -m1 'in-call dispatch inbox at'
 aura-inbox alive   # prints: ALIVE <absolute inbox dir>
@@ -232,7 +262,7 @@ printf 'AURA_STATE_DIR=%s\n' "$HOME" >> ~/.config/aura/.env
 **✅ Do NOT report "done" until every box is checked:**
 - [ ] `aura-server` (and, for a LOCAL host, `aura-cli`) on `PATH`
 - [ ] `aura-call` + `aura-call-status` + `aura-inbox` on `PATH`
-- [ ] the `XAI_API_KEY` resolves (server reaches the connection-string line)
+- [ ] the API key resolves (server reaches the connection-string line)
 - [ ] `aura-inbox alive` prints the SAME directory the server run above logged
       (`in-call dispatch inbox at …`) — else set `AURA_STATE_DIR` (see above)
 - [ ] (REMOTE) UDP 47821 opened once — OS firewall **and** cloud SG / NAT
@@ -271,6 +301,6 @@ curl -fsSL https://raw.githubusercontent.com/RealWagmi/aura/main/install_bin.sh 
 
 - **"no prebuilt binary for this platform".** Your OS/arch isn't published (Windows, or an unusual arch). Build from source: `docs/ONBOARDING.md` (or the command the installer printed).
 - **SHA-256 mismatch.** The installer aborts on purpose — do not work around it. Re-run (a partial download), and if it persists, report it; do not install an unverified binary.
-- **`aura-server` exits immediately with `no BYOK xAI key found`.** The key didn't resolve — re-do Step 2 (is `~/.config/aura/.env` present with a `XAI_API_KEY=...` line and `0600`?). Never print the key to debug it.
+- **`aura-server` exits immediately with `no BYOK key found` (or `no BYOK xAI/OpenAI key found`).** The key didn't resolve — re-do Step 2 (is `~/.config/aura/.env` present with a `XAI_API_KEY=...` / `OPENAI_API_KEY=...` line and `0600`?). Never print the key to debug it.
 - **Client can't reach a REMOTE server.** The UDP port is almost always blocked **outside** the VM by the cloud security group / NAT — add an inbound UDP 47821 rule there. Confirm `AURA_PUBLIC_HOST` is the reachable public IP/DNS. If the server sits behind NAT/CGNAT (Step 3a says BEHIND NAT), switch to `AURA_TRANSPORT=iroh` instead of fighting the firewall.
 - **`aura-server` / `aura-cli` not found after install.** `~/.local/bin` is not on `PATH` yet — restart the shell or `source` your rc, or use the full path.

@@ -4,10 +4,10 @@
 file in full, then execute the numbered steps **in order**. Do **not** improvise,
 reorder, or skip steps. You proceed **autonomously** and report results to the
 user in plain language; the one thing you always need from them is the
-`XAI_API_KEY` (step 3). See **When to ask the user** below for the few exceptions.
+API key (`XAI_API_KEY` or `OPENAI_API_KEY`, step 3). See **When to ask the user** below for the few exceptions.
 
 `aura` gives an AI chat a real voice call: the user types "call me", the host
-launches `aura-server` (it holds the xAI key, the engine, the chat context, and
+launches `aura-server` (it holds the API key, the engine, the chat context, and
 the tools), the server mints a single-use session secret and prints a
 **connection string**, and the user's thin client `aura-cli` (mic/speaker, via
 cpal) connects over one Noise-encrypted UDP tunnel. There is **no broker and no relay** — in a remote setup the AI server is
@@ -20,7 +20,7 @@ You are the AI setting up the server. Read this whole file first, then execute:
 1. **Detect OS + decide LOCAL vs REMOTE** — from the environment, not by asking → Step 0
 2. **Clone the repo** into a stable working dir (`~/aura`) → Step 1
 3. **Build + install the server** (`./install.sh --server`) — this also puts `aura-call` / `aura-call-status` on PATH → Step 2
-4. **Get the `XAI_API_KEY`** — the ONE time you stop and ask the user → Step 3
+4. **Choose the voice provider + get the API key** — the ONE time you stop and ask the user → Step 3
 5. **(REMOTE only) NAT check first**, then open the UDP port once (`scripts/aura-open-port.sh`) — or, behind NAT, set `AURA_TRANSPORT=iroh` and open nothing; LOCAL → skip → Step 4
 6. **Copy the skill** `skills/SKILL.md` into your framework's skills dir (`mkdir -p` first) → Step 5
 7. **Set your framework to auto-approve** the orchestrator's tool calls + raise the turn/timeout budget → Step 5b
@@ -33,7 +33,7 @@ You are the AI setting up the server. Read this whole file first, then execute:
 - ❌ **Starting before reading the whole guide**, or reordering / skipping steps.
 - ❌ **Stopping after the build.** Built binaries ≠ a working call — you are done only after the Step 6 self-check passes.
 - ❌ **Killing the build because it seems slow.** A first `cargo build --release` (it also fetches the pinned toolchain + crates) can take several minutes — give it a generous timeout and let it finish; do not kill or retry it.
-- ❌ **Echoing, printing, or logging the `XAI_API_KEY` or the session secret**, or putting either on a command line (`argv` is visible in `ps`).
+- ❌ **Echoing, printing, or logging the API key or the session secret**, or putting either on a command line (`argv` is visible in `ps`).
 - ❌ **Opening the firewall per call.** The UDP port is opened ONCE at Step 4 and never touched again.
 - ❌ **Asking the user where the skill goes.** You know your own skills directory — copy `SKILL.md` there yourself (`mkdir -p` the directory first).
 - ❌ **Pasting the connection string anywhere public.** For REMOTE it goes only to the one user over the existing chat; it is single-use and ~120 s.
@@ -43,7 +43,7 @@ You are the AI setting up the server. Read this whole file first, then execute:
 
 - **Proceed autonomously** — OS detection, the mode decision (when it is clear), cloning, building, installing, copying the skill, opening the port when you have root, and every verification. Report what you did in plain language; do not ask permission for these.
 - **Ask the user — only these:**
-  1. **The `XAI_API_KEY`** (Step 3) — BYOK; you cannot proceed without it.
+  1. **The API key** — which provider and the key itself (Step 3); BYOK, you cannot proceed without it.
   2. **LOCAL or REMOTE** (Step 0) — *only* if you genuinely cannot tell from the environment.
   3. **Run the `sudo` firewall commands** (Step 4) — only when you lack root; you print the exact commands and the user runs them.
 - **Never** sign in, paste the key, or change anything outside this machine on the user's behalf.
@@ -51,7 +51,7 @@ You are the AI setting up the server. Read this whole file first, then execute:
 ## What you are building toward
 
 - **`aura-server`** — runs where the host/AI runs (on `127.0.0.1` for a LOCAL
-  call, on a VPS for a REMOTE call). Holds `XAI_API_KEY` + engine + context +
+  call, on a VPS for a REMOTE call). Holds the BYOK key + engine + context +
   tools. Does **not** use the microphone, so it needs **no audio library**.
 - **`aura-cli`** — the thin client on the **user's own machine** (it has the mic
   and speakers). Holds no key, no engine, no context. On Linux it needs the ALSA
@@ -64,7 +64,7 @@ installs `aura-cli` too.
 
 ## Hard rules (never violate)
 
-- **Never echo, print, or log the `XAI_API_KEY` or the session secret.** Never
+- **Never echo, print, or log the API key or the session secret.** Never
   place either on a command line (`argv`) — anything on a command line is
   visible in `ps`. The key lives only in the environment, the OS keychain, or a
   `chmod 600` `./.env` file. The session secret travels only inside the
@@ -179,24 +179,38 @@ re-run `./install.sh --server`.
 
 ---
 
-## Step 3 — Obtain the `XAI_API_KEY` (get it from the user)
+## Step 3 — Choose the voice provider and obtain the API key (get it from the user)
 
-`aura` is **BYOK** (bring your own key). The server resolves the key in this
-order (first non-empty value wins):
+`aura` is **BYOK** (bring your own key) and supports two realtime voice
+providers. **Ask the user which API key they can provide** — this is where you
+stop for input. Offer exactly these options:
 
-1. the environment variable `XAI_API_KEY`;
+| Choice | Key to provide | Voice model | Cost ballpark |
+|---|---|---|---|
+| **xAI Grok** | `XAI_API_KEY` | `grok-voice-think-fast-1.0` | flat **$0.05/min** — predictable |
+| **OpenAI** | `OPENAI_API_KEY` | `gpt-realtime-2.1` | token-billed, ≈$0.05–0.10/min — smartest, 128k context |
+| **OpenAI mini** | `OPENAI_API_KEY` | `gpt-realtime-2.1-mini` | token-billed, ≈$0.02–0.04/min — cheapest |
+
+The server auto-picks the provider by which key it finds (xAI wins when both
+are present). To pin it explicitly, add `AURA_VOICE_PROVIDER=xai|openai` to the
+same `.env`; for the mini model also add
+`AURA_VOICE_MODEL=gpt-realtime-2.1-mini`.
+
+The server resolves the key in this order (first non-empty value wins):
+
+1. the environment variable (`XAI_API_KEY` / `OPENAI_API_KEY`);
 2. a `.env` file (`KEY=VALUE` lines), loaded into the environment without
    overriding an already-set variable — first `./.env` in the directory the
    server starts in, then a fixed user-global `$AURA_HOME/.env` (else
    `${XDG_CONFIG_HOME:-~/.config}/aura/.env`);
-3. the OS keychain (service `aura`, entry `XAI_API_KEY`).
+3. the OS keychain (service `aura`, entry named like the env var).
 
-The key is sent **only** to `api.x.ai` (host-pinned); the server refuses to send
-it anywhere else.
+Each key is host-pinned: `XAI_API_KEY` is sent **only** to `api.x.ai`,
+`OPENAI_API_KEY` **only** to `api.openai.com`; the server refuses to send
+either anywhere else.
 
-**Ask the user for their xAI API key now** — this is where you stop for input.
-Store it **without ever echoing or logging it**, and choose the location by how
-the server runs.
+Store the key **without ever echoing or logging it**, and choose the location
+by how the server runs.
 
 **Recommended — a user-global `~/.config/aura/.env`.** The host (e.g. Claude
 Code) launches the server from whatever directory it is in, so a key tied to one
@@ -207,10 +221,27 @@ have the user paste the key so it never appears in your transcript or shell hist
 ```bash
 umask 077
 mkdir -p ~/.config/aura
+# Write OPENAI_API_KEY= instead if the user chose OpenAI:
 printf 'XAI_API_KEY=' > ~/.config/aura/.env && chmod 600 ~/.config/aura/.env
 # The user pastes the key — read from stdin, never argv, never printed:
 ( read -rs k; printf '%s\n' "$k" >> ~/.config/aura/.env; unset k )
 echo "key written to ~/.config/aura/.env"   # confirmation only; the key is never printed
+```
+
+That snippet is for a terminal the USER types into (they paste; the key never
+appears in your transcript). If the user instead sends the key to you in chat,
+append the `KEY=<key>` line to the same file with your FILE-WRITE/edit tool
+(never a shell echo/printf — command lines are visible in `ps`), then
+`chmod 600` the file.
+
+If the user chose **OpenAI**, also append the provider pin (plus the model line
+only for mini, and an optional ISO-639-1 transcription hint for non-English
+users — it improves the user-side transcript in call recaps):
+
+```bash
+printf 'AURA_VOICE_PROVIDER=openai\n' >> ~/.config/aura/.env
+printf 'AURA_VOICE_MODEL=gpt-realtime-2.1-mini\n' >> ~/.config/aura/.env   # mini only
+printf 'AURA_TRANSCRIBE_LANG=ru\n' >> ~/.config/aura/.env                  # optional, e.g. Russian
 ```
 
 Verify it exists and is owner-only, **without printing its contents**:
@@ -226,7 +257,7 @@ test -f "$f" && [ "$(stat -c '%a' "$f" 2>/dev/null || stat -f '%Lp' "$f")" = "60
 **Alternatives.** For a dedicated server you always start from one fixed directory,
 a `chmod 600 ./.env` in that directory works the same way (same commands, `.env`
 instead of `~/.config/aura/.env`). Or store the secret in the **OS keychain**
-(service `aura`, entry `XAI_API_KEY`) on macOS (`security`) or Windows (Credential
+(service `aura`, entry named like the env var) on macOS (`security`) or Windows (Credential
 Manager) — directory-independent, nothing on disk. On Linux the keychain backend
 is the kernel keyring (keyutils), which does not reliably persist for a
 long-running server, so prefer `.env` there.
@@ -472,12 +503,12 @@ non-zero immediately with a clear message.
 # line on stderr. Reaching that line proves the key resolved. We stop it there.
 timeout 8s aura-server 2>&1 | grep -m1 -E 'AURA_CONNECT=|composed context|host =' \
   && echo "key resolved + server starts: OK" \
-  || echo "server did NOT start — check the XAI_API_KEY (step 3)"
+  || echo "server did NOT start — check the API key (step 3)"
 ```
 
-If instead you see `no BYOK xAI key found` (or `aura-server: ... key ...`), the
+If instead you see `no BYOK key found` (or `no BYOK xAI/OpenAI key found`), the
 key is not resolving — revisit step 3 (is `./.env` in *this* directory, is the
-line `XAI_API_KEY=...`, is the env var unset so `./.env` is consulted?). The
+line `XAI_API_KEY=...` / `OPENAI_API_KEY=...`, is the env var unset so `./.env` is consulted?). The
 connection string printed during this probe is throwaway (single-use, ~120 s) —
 it is never used and expires harmlessly.
 
@@ -513,7 +544,7 @@ reachability from inside the VM. Remind the user that step 4 must be complete on
 
 - [ ] `aura-server` is on `PATH` (6a) — and `aura-cli` too if this is a LOCAL host
 - [ ] `aura-call`, `aura-call-status`, and `aura-inbox` are on `PATH` (Step 2)
-- [ ] the `XAI_API_KEY` resolves — the server reaches the connection-string line (6b)
+- [ ] the API key resolves — the server reaches the connection-string line (6b)
 - [ ] `aura-inbox alive` prints the SAME directory the 6b probe logged (6c) — else set `AURA_STATE_DIR`
 - [ ] (REMOTE) UDP 47821 was opened once — OS firewall **and** cloud SG / NAT (Step 4)
 - [ ] `skills/SKILL.md` was copied into your skills directory (Step 5)
@@ -607,9 +638,9 @@ The server is env-driven (no config file is loaded); the skill launches it and
   address. If the server is behind NAT/CGNAT (Step 4a says BEHIND NAT), stop
   fighting the firewall and switch to `AURA_TRANSPORT=iroh`.
 - **`aura-server` exits immediately with a key error
-  (`no BYOK xAI key found`).** The `XAI_API_KEY` did not resolve. Check, in
+  (`no BYOK key found`).** The API key did not resolve. Check, in
   order: is the env var exported in *this* shell? is there a `./.env` with a
-  `XAI_API_KEY=...` line in the server's working directory? is the env var unset
+  `XAI_API_KEY=...` / `OPENAI_API_KEY=...` line in the server's working directory? is the env var unset
   so `./.env` is even consulted (a set-but-empty env var does not fall through to
   `./.env`)? Re-do step 3. Never print the key to debug it.
 - **Build error mentioning `alsa` / `libasound` / `asound`.** That dependency is

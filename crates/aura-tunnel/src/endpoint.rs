@@ -64,15 +64,16 @@ impl Default for TunnelConfig {
 }
 
 /// Cap on the outbound queue — a MEMORY backstop for a dead/stalled pacer, NOT
-/// an audio limiter. The xAI realtime API streams a full turn's PCM in ~3-5 s of
-/// wall time, far faster than the 20 ms realtime pacer drains it, so a
-/// multi-second response legitimately backs up here and the pacer plays it out
-/// at realtime. The queue MUST hold a whole turn or drop-oldest eats the
-/// response — the SAME bug the client playback buffer hit at 5 s (it uses 30 s
-/// now; see aura-audio). 30 s @ 50 frames/s = 1500 frames ≈ 1.44 MB. Barge-in
-/// (`clear_outbound`) drains the whole queue instantly regardless of size, so a
-/// large cap costs zero interruption latency.
-const MAX_OUTBOUND_FRAMES: usize = 1500;
+/// an audio limiter. The realtime API streams a full answer's PCM far faster
+/// than the 20 ms realtime pacer drains it, so a LONG answer legitimately backs
+/// up MINUTES here. Live-diagnosed 2026-07-07: a ~90 s fable overflowed the old
+/// 30 s cap about 40 s into playback and the silent drop-oldest audibly ate
+/// words ("stumbles ~40 s into long speech"). The cap must exceed any single
+/// answer: 5 min @ 50 frames/s = 15 000 frames ≈ 14 MB — still a trivial
+/// backstop. Barge-in (`clear_outbound`) drains the whole queue instantly
+/// regardless of size, so a large cap costs zero interruption latency; hitting
+/// the cap is logged loudly (never silent again).
+const MAX_OUTBOUND_FRAMES: usize = 15_000;
 
 /// Outbound state behind one lock: the queue the pacer drains, plus the
 /// reframer that chops engine audio into exact 20 ms frames. Co-locating them
@@ -81,6 +82,8 @@ const MAX_OUTBOUND_FRAMES: usize = 1500;
 struct Outbound {
     queue: VecDeque<Vec<i16>>,
     reframer: Reframer,
+    /// Total frames dropped on overflow (diagnostic; see `MAX_OUTBOUND_FRAMES`).
+    dropped_frames: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -254,6 +257,7 @@ impl TunnelEndpoint {
         let outbound = Arc::new(Mutex::new(Outbound {
             queue: VecDeque::new(),
             reframer: Reframer::new(FRAME_SAMPLES),
+            dropped_frames: 0,
         }));
         let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<i16>>(cfg.inbound_capacity.max(1));
 
@@ -368,6 +372,17 @@ impl TunnelEndpoint {
             out.queue.push_back(f);
             while out.queue.len() > MAX_OUTBOUND_FRAMES {
                 out.queue.pop_front();
+                out.dropped_frames += 1;
+                // Loud, rate-limited (first drop, then ~1/s of loss): overflow
+                // eats the audio the listener is ABOUT TO HEAR.
+                if out.dropped_frames == 1 || out.dropped_frames.is_multiple_of(50) {
+                    eprintln!(
+                        "aura-tunnel: outbound pacer queue FULL ({} min cap) — {} ms of audio \
+                         dropped; words are being skipped",
+                        MAX_OUTBOUND_FRAMES as u64 / 50 / 60,
+                        out.dropped_frames * FRAME_MS
+                    );
+                }
             }
         }
     }

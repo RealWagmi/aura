@@ -16,7 +16,7 @@ pub use transport::CpalTransport;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_queue::ArrayQueue;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -301,6 +301,9 @@ pub struct PlaybackHandle {
     max_live_frames: Arc<AtomicUsize>,
     /// AEC far-end reference: mirrors every sample the output callback pops.
     farend: Arc<FarEndTap>,
+    /// Total un-played samples dropped on overflow (the 30 s cap's
+    /// drop-oldest) — diagnostic for "long answers skip words".
+    dropped: Arc<AtomicU64>,
 }
 
 impl PlaybackHandle {
@@ -311,6 +314,7 @@ impl PlaybackHandle {
             output_sample_rate: Arc::new(AtomicU32::new(output_sample_rate)),
             max_live_frames: Arc::new(AtomicUsize::new(max_live_frames)),
             farend: Arc::new(FarEndTap::new(output_sample_rate)),
+            dropped: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -324,15 +328,34 @@ impl PlaybackHandle {
         let mut converted = Vec::with_capacity(samples.len());
         resample_nearest(samples, 24_000, output_sample_rate, &mut converted);
         let max_live_frames = self.max_live_frames.load(Ordering::Acquire);
+        let mut dropped_now = 0u64;
         for frame in converted {
             while self.queue.len() >= max_live_frames {
                 let _ = self.queue.pop();
+                dropped_now += 1;
             }
             // ArrayQueue rejects on full; preserve the prior "drop oldest"
             // behaviour so live audio stays responsive instead of stalling.
             if self.queue.push(frame).is_err() {
                 let _ = self.queue.pop();
                 let _ = self.queue.push(frame);
+                dropped_now += 1;
+            }
+        }
+        if dropped_now > 0 {
+            // Diagnostic: overflow eats the OLDEST un-played samples — the very
+            // audio the listener is about to hear — so long answers audibly
+            // skip words. Log the first drop, then once per ~second of loss
+            // (this runs on the pusher thread, never the RT audio callback).
+            let rate = u64::from(output_sample_rate.max(1));
+            let total = self.dropped.fetch_add(dropped_now, Ordering::Relaxed) + dropped_now;
+            let prev = total - dropped_now;
+            if prev == 0 || total / rate > prev / rate {
+                eprintln!(
+                    "[aura-audio] playback queue FULL (~30 s cap): {} ms of model speech dropped \
+                     so far — words are being skipped",
+                    total * 1_000 / rate
+                );
             }
         }
     }

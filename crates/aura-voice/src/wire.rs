@@ -2,16 +2,16 @@
 //! PCM/base64 helpers, the `session.update` builders, and the host-pin
 //! validator.
 //!
-//! The v1 product is xAI
-//! DIRECT only, so the Cloudflare-proxy endpoints, the STT sidecar
-//! (`SttServerEvent`/`parse_stt_event`/`stt_url`), the `AURA_TOKEN` managed
-//! path, and the OpenAI OAuth resolution are all left out. The
-//! OpenAI `session.update` builder is kept **dormant** (compiled, unit-tested,
-//! never dialed) as a witness that the provider seam is real.
+//! Two DIRECT providers speak through this module: xAI Grok voice and OpenAI
+//! `gpt-realtime-2.1`. Both use GA-style event names, so ONE
+//! [`parse_server_event`] serves both; the per-provider differences are the
+//! `session.update` builders and the endpoint/host-pin constants below. The
+//! Cloudflare-proxy endpoints, the STT sidecar, and the `AURA_TOKEN` managed
+//! path are deliberately left out (BYOK DIRECT only).
 //!
 //! The runtime above [`crate::VoiceStream`] never sees these JSON shapes —
 //! [`parse_server_event`] + the `ServerEvent` → `VoiceEvent` mapping in
-//! `xai.rs` is the only place the wire format is touched.
+//! `realtime_ws.rs` is the only place the wire format is touched.
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -34,11 +34,13 @@ pub const UNSAFE_URL_OPT_IN_ENV: &str = "AURA_XAI_DIRECT_ALLOW_UNSAFE_URL";
 /// Optional realtime URL override (staging/tests); still host-pinned.
 pub const REALTIME_URL_OVERRIDE_ENV: &str = "AURA_REALTIME_URL";
 
-/// Dormant OpenAI seam — compiled, never dialed in v1.
+/// OpenAI GA realtime endpoint — the second first-class provider.
 pub const OPENAI_REALTIME_ENDPOINT: &str = "wss://api.openai.com/v1/realtime";
-/// Dormant OpenAI default model. Keep current.
-pub const OPENAI_DEFAULT_MODEL: &str = "gpt-realtime-2";
-/// Allowed host for the dormant OpenAI seam.
+/// Default OpenAI realtime model. Keep current; never write a stale id.
+pub const OPENAI_DEFAULT_MODEL: &str = "gpt-realtime-2.1";
+/// The cheaper OpenAI realtime model (~3x cheaper audio tokens).
+pub const OPENAI_MINI_MODEL: &str = "gpt-realtime-2.1-mini";
+/// The only host the OpenAI BYOK key may be sent to.
 pub const DIRECT_OPENAI_ALLOWED_HOST: &str = "api.openai.com";
 
 #[derive(Debug, thiserror::Error)]
@@ -71,7 +73,10 @@ pub enum ServerEvent {
     #[serde(rename = "session.created")]
     SessionCreated { session: Option<Value> },
     #[serde(rename = "response.output_audio.delta")]
-    OutputAudioDelta { delta: String },
+    OutputAudioDelta {
+        delta: String,
+        item_id: Option<String>,
+    },
     #[serde(rename = "conversation.item.input_audio_transcription.completed")]
     InputAudioTranscriptionCompleted {
         transcript: Option<String>,
@@ -81,6 +86,14 @@ pub enum ServerEvent {
     InputAudioTranscriptionDelta {
         delta: String,
         item_id: Option<String>,
+    },
+    /// The provider's confirmation of our `conversation.item.truncate` — the
+    /// heard-position sync worked (the unheard tail left the model's context).
+    /// Carried for observability only; the engine takes no action on it.
+    #[serde(rename = "conversation.item.truncated")]
+    ItemTruncated {
+        item_id: Option<String>,
+        audio_end_ms: Option<u64>,
     },
     /// Unified transcript delta. See type-level docs.
     #[serde(rename = "response.text.delta")]
@@ -206,6 +219,19 @@ pub fn response_cancel_event() -> Value {
     json!({"type": "response.cancel"})
 }
 
+/// Barge-in context sync: truncate a cancelled assistant item's audio at the
+/// position the user actually heard; the server drops the unheard tail (and
+/// its transcript) from the model's conversation state. Required on the WS
+/// transport, where the server cannot observe client playback.
+pub fn conversation_item_truncate_event(item_id: &str, audio_end_ms: u64) -> Value {
+    json!({
+        "type": "conversation.item.truncate",
+        "item_id": item_id,
+        "content_index": 0,
+        "audio_end_ms": audio_end_ms
+    })
+}
+
 pub fn input_audio_buffer_append_event(audio_base64: &str) -> Value {
     json!({"type": "input_audio_buffer.append", "audio": audio_base64})
 }
@@ -306,28 +332,50 @@ pub fn xai_session_update_event(cfg: &VoiceSessionConfig) -> Value {
     json!({"type": "session.update", "session": session})
 }
 
-/// Dormant OpenAI `session.update` builder. OpenAI nests voice /
+/// The OpenAI GA `session.update` builder. OpenAI nests voice /
 /// turn_detection / transcription under `session.audio.*`, requires
-/// `session.type: "realtime"`, and rejects top-level `temperature`. Compiled
-/// and unit-tested but never dialed in v1 — it witnesses the provider seam.
-pub fn openai_session_update_event(cfg: &VoiceSessionConfig) -> Value {
+/// `session.type: "realtime"`, and rejects top-level `temperature` (removed
+/// from the GA API — the knob simply doesn't exist there).
+///
+/// Input transcription is ALWAYS on: it is not an optional nicety — it feeds
+/// the `[developer]` lines of the in-call transcript, the reconnect/pause
+/// digests, and the post-call recap. `whisper-1` is the stable choice; the
+/// optional ISO-639-1 hint improves non-English accuracy. The audio path
+/// itself stays direct speech-to-speech — this sidecar only affects the
+/// transcript TEXT.
+///
+/// `reasoning.effort`: `low` is the documented production-voice
+/// recommendation for `gpt-realtime-2.1`; the mini model is raised to
+/// `medium` to compensate for the smaller model.
+pub fn openai_session_update_event(cfg: &VoiceSessionConfig, model: &str) -> Value {
     let turn_detection =
         turn_detection_from_latency(cfg.latency_target_ms, cfg.end_of_turn_timeout_ms);
+    let mut transcription = json!({"model": "whisper-1"});
+    if let Some(lang) = &cfg.transcription_language {
+        transcription["language"] = json!(lang);
+    }
+    let effort = if model.contains("mini") {
+        "medium"
+    } else {
+        "low"
+    };
     let mut session = json!({
         "type": "realtime",
+        "output_modalities": ["audio"],
         "instructions": cfg.instructions,
         "audio": {
             "input": {
                 "format": {"type": "audio/pcm", "rate": 24000},
                 "turn_detection": turn_detection,
-                "transcription": {"model": "whisper-1"}
+                "transcription": transcription
             },
             "output": {
                 "format": {"type": "audio/pcm", "rate": 24000},
                 "voice": cfg.voice
             }
         },
-        "tools": cfg.tools
+        "tools": cfg.tools,
+        "reasoning": {"effort": effort}
     });
     if let Some(speed) = cfg.output_speed {
         session["audio"]["output"]["speed"] = json!(speed);
@@ -337,41 +385,60 @@ pub fn openai_session_update_event(cfg: &VoiceSessionConfig) -> Value {
 
 // --- URL + host-pin ----------------------------------------------------------
 
-/// Build the realtime URL: `AURA_REALTIME_URL` override if set, else the xAI
-/// DIRECT endpoint, with `?model=` appended.
-pub fn xai_realtime_url(model: &str) -> String {
-    let endpoint = std::env::var(REALTIME_URL_OVERRIDE_ENV)
-        .unwrap_or_else(|_| DIRECT_REALTIME_ENDPOINT.to_owned());
-    let mut url = Url::parse(&endpoint).unwrap_or_else(|_| {
-        Url::parse(DIRECT_REALTIME_ENDPOINT).expect("built-in endpoint parses")
-    });
+/// Build a realtime URL: `AURA_REALTIME_URL` override if set, else the given
+/// provider endpoint, with `?model=` appended.
+fn realtime_url_with_default(default_endpoint: &str, model: &str) -> String {
+    let endpoint =
+        std::env::var(REALTIME_URL_OVERRIDE_ENV).unwrap_or_else(|_| default_endpoint.to_owned());
+    let mut url = Url::parse(&endpoint)
+        .unwrap_or_else(|_| Url::parse(default_endpoint).expect("built-in endpoint parses"));
     url.query_pairs_mut().append_pair("model", model);
     url.to_string()
 }
 
-/// Host-pin: refuse to send the BYOK key to any host other than `api.x.ai`.
-/// The escape hatch (`AURA_XAI_DIRECT_ALLOW_UNSAFE_URL=1`) is loudly logged and
-/// for isolated local testing only. This is the single anti-exfiltration guard
-/// for the DIRECT path.
+/// The xAI realtime URL (override-aware, still host-pinned).
+pub fn xai_realtime_url(model: &str) -> String {
+    realtime_url_with_default(DIRECT_REALTIME_ENDPOINT, model)
+}
+
+/// The OpenAI realtime URL (override-aware, still host-pinned).
+pub fn openai_realtime_url(model: &str) -> String {
+    realtime_url_with_default(OPENAI_REALTIME_ENDPOINT, model)
+}
+
+/// Host-pin against the xAI host. See [`validate_realtime_url_for`].
 pub fn validate_realtime_url(realtime_url: &str) -> Result<(), WireError> {
+    validate_realtime_url_for(realtime_url, DIRECT_XAI_ALLOWED_HOST)
+}
+
+/// Host-pin: refuse to send a BYOK key to any host other than the provider's
+/// pinned API host (`api.x.ai` / `api.openai.com`). The escape hatch
+/// (`AURA_XAI_DIRECT_ALLOW_UNSAFE_URL=1`) is loudly logged and for isolated
+/// local testing only. This is the single anti-exfiltration guard for the
+/// DIRECT path.
+pub fn validate_realtime_url_for(
+    realtime_url: &str,
+    allowed_host: &'static str,
+) -> Result<(), WireError> {
     let host = Url::parse(realtime_url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_owned))
         .unwrap_or_else(|| "<invalid-url>".to_owned());
-    if host == DIRECT_XAI_ALLOWED_HOST {
+    if host == allowed_host {
         return Ok(());
     }
     if std::env::var(UNSAFE_URL_OPT_IN_ENV).as_deref() == Ok("1") {
         eprintln!(
-            "AURA SECURITY WARNING: {UNSAFE_URL_OPT_IN_ENV}=1 allows XAI_API_KEY to be sent to \
-             realtime endpoint {realtime_url} (host {host}). Use only for isolated local testing."
+            "AURA SECURITY WARNING: {UNSAFE_URL_OPT_IN_ENV}=1 allows the BYOK API key to be sent \
+             to realtime endpoint {realtime_url} (host {host}). Use only for isolated local \
+             testing."
         );
         return Ok(());
     }
     Err(WireError::UnsafeEndpoint {
         endpoint: realtime_url.to_owned(),
         host,
-        allowed: DIRECT_XAI_ALLOWED_HOST,
+        allowed: allowed_host,
         opt_in: UNSAFE_URL_OPT_IN_ENV,
     })
 }
@@ -390,18 +457,40 @@ mod tests {
             end_of_turn_timeout_ms: None,
             output_speed: None,
             cold_start_kick: true,
+            transcription_language: None,
         }
     }
 
     #[test]
     fn parses_audio_delta_and_folds_text_tags() {
+        // item_id absent → None (xAI may omit it).
         let e =
             parse_server_event(r#"{"type":"response.output_audio.delta","delta":"AAA="}"#).unwrap();
-        assert!(matches!(e, ServerEvent::OutputAudioDelta { .. }));
+        assert!(matches!(
+            e,
+            ServerEvent::OutputAudioDelta { item_id: None, .. }
+        ));
+        // item_id present → captured (drives barge-in truncate).
+        let e = parse_server_event(
+            r#"{"type":"response.output_audio.delta","delta":"AAA=","item_id":"it_1"}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(e, ServerEvent::OutputAudioDelta { item_id: Some(id), .. } if id == "it_1")
+        );
         // output_text.delta folds onto TextDelta.
         let e =
             parse_server_event(r#"{"type":"response.output_text.delta","delta":"hi"}"#).unwrap();
         assert!(matches!(e, ServerEvent::TextDelta { delta } if delta == "hi"));
+    }
+
+    #[test]
+    fn truncate_event_shape() {
+        let v = conversation_item_truncate_event("it_9", 1234);
+        assert_eq!(v["type"], "conversation.item.truncate");
+        assert_eq!(v["item_id"], "it_9");
+        assert_eq!(v["content_index"], 0);
+        assert_eq!(v["audio_end_ms"], 1234);
     }
 
     #[test]
@@ -461,11 +550,40 @@ mod tests {
 
     #[test]
     fn openai_builder_nests_voice_under_audio_output() {
-        // Dormant seam: shape differs from xAI (witness it compiles + differs).
-        let v = openai_session_update_event(&cfg());
+        let v = openai_session_update_event(&cfg(), OPENAI_DEFAULT_MODEL);
         assert_eq!(v["session"]["type"], "realtime");
+        assert_eq!(v["session"]["output_modalities"], json!(["audio"]));
         assert_eq!(v["session"]["audio"]["output"]["voice"], "eve");
+        assert_eq!(v["session"]["audio"]["input"]["format"]["rate"], 24000);
+        assert_eq!(v["session"]["audio"]["output"]["format"]["rate"], 24000);
+        // GA removed the temperature knob — it must never be sent.
         assert!(v["session"]["voice"].is_null());
+        assert!(v["session"]["temperature"].is_null());
+    }
+
+    #[test]
+    fn openai_builder_transcription_always_on_with_optional_language() {
+        // No hint → whisper-1 with auto language detection.
+        let v = openai_session_update_event(&cfg(), OPENAI_DEFAULT_MODEL);
+        let t = &v["session"]["audio"]["input"]["transcription"];
+        assert_eq!(t["model"], "whisper-1");
+        assert!(t["language"].is_null());
+        // Hint set → forwarded as ISO-639-1.
+        let mut c = cfg();
+        c.transcription_language = Some("ru".into());
+        let v = openai_session_update_event(&c, OPENAI_DEFAULT_MODEL);
+        assert_eq!(
+            v["session"]["audio"]["input"]["transcription"]["language"],
+            "ru"
+        );
+    }
+
+    #[test]
+    fn openai_builder_reasoning_effort_low_full_medium_mini() {
+        let full = openai_session_update_event(&cfg(), OPENAI_DEFAULT_MODEL);
+        assert_eq!(full["session"]["reasoning"]["effort"], "low");
+        let mini = openai_session_update_event(&cfg(), OPENAI_MINI_MODEL);
+        assert_eq!(mini["session"]["reasoning"]["effort"], "medium");
     }
 
     #[test]
@@ -483,5 +601,21 @@ mod tests {
         assert!(validate_realtime_url("wss://api.x.ai/v1/realtime?model=x").is_ok());
         let err = validate_realtime_url("wss://evil.example/v1/realtime").unwrap_err();
         assert!(matches!(err, WireError::UnsafeEndpoint { .. }));
+    }
+
+    #[test]
+    fn host_pin_is_per_provider() {
+        std::env::remove_var(UNSAFE_URL_OPT_IN_ENV);
+        let openai = openai_realtime_url(OPENAI_DEFAULT_MODEL);
+        assert!(openai.starts_with("wss://api.openai.com/v1/realtime?model="));
+        assert!(openai.contains(OPENAI_DEFAULT_MODEL));
+        assert!(validate_realtime_url_for(&openai, DIRECT_OPENAI_ALLOWED_HOST).is_ok());
+        // The pin is not interchangeable: each key only travels to ITS host.
+        assert!(validate_realtime_url_for(&openai, DIRECT_XAI_ALLOWED_HOST).is_err());
+        assert!(validate_realtime_url_for(
+            "wss://api.x.ai/v1/realtime?model=x",
+            DIRECT_OPENAI_ALLOWED_HOST
+        )
+        .is_err());
     }
 }
