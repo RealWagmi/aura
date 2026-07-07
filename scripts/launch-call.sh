@@ -11,8 +11,9 @@
 #     STDOUT and returns immediately, while the server keeps running detached.
 #   - The session secret is printed exactly once (inside the AURA_CONNECT=...
 #     line) for the caller to relay or run. It is NEVER written to disk and NEVER
-#     placed on argv. aura-server reads XAI_API_KEY from its own environment (else
-#     the OS keychain, else a ./.env file); this script never reads or echoes it.
+#     placed on argv. aura-server reads its BYOK key (XAI_API_KEY or
+#     OPENAI_API_KEY) from its own environment (else the OS keychain, else a
+#     ./.env file); this script never reads or echoes it.
 #
 # Usage:
 #   aura-call local                          LOCAL loopback call (binds 127.0.0.1)
@@ -29,6 +30,14 @@
 #   AURA_TRANSPORT    'iroh' = NAT/CGNAT-friendly QUIC transport (hole-punch +
 #                     blind relay fallback); the connection string then carries
 #                     the server's node id instead of host:port
+#   AURA_CALL_LOG     append the server's MID-CALL stderr (reconnects, dispatch
+#                     inbox path, truncate markers, call end) to this file
+#                     instead of discarding it — for diagnostics/experiments.
+#                     The connection line is consumed before the log starts, so
+#                     the session secret never reaches the file.
+#   (Voice selection - AURA_VOICE_PROVIDER / AURA_VOICE_MODEL / the BYOK keys -
+#   is read by aura-server itself from the environment / .env; prefix this
+#   helper to switch per call.)
 #
 # Portable to Linux and macOS (bash 3.2, BSD tools; no setsid, no GNU timeout).
 
@@ -166,12 +175,34 @@ done <&3
 
 if [ "$emitted" -ne 1 ]; then
   # The FIFO reached EOF without a connection line: the server exited early.
-  die "aura-server exited before printing a connection string (check XAI_API_KEY, the host config, and that UDP ${AURA_PORT:-47821} is free)"
+  die "aura-server exited before printing a connection string (check the API key (XAI_API_KEY / OPENAI_API_KEY), the host config, and that UDP ${AURA_PORT:-47821} is free)"
 fi
 
 # Hand fd 3 to a detached drainer so the live server never sees a closed stderr
-# pipe. `cat` reads to EOF (server exit) then exits; we discard the drained text.
-nohup cat <&3 >/dev/null 2>&1 &
+# pipe. `cat` reads to EOF (server exit) then exits. The drained text is
+# discarded unless AURA_CALL_LOG names a file to append it to (the connection
+# line was already consumed above, so no secret can reach the log).
+#
+# The drainer must NEVER die while the server lives — a dead drainer closes the
+# last read end and the server's next eprintln! EPIPE-panics, killing the call.
+# So: (1) probe-open the log target and fall back to /dev/null if it cannot be
+# opened (a typo'd path must not become a call-killer); (2) if the logging cat
+# still fails MID-call (disk full, file removed), a second cat keeps draining
+# to /dev/null for the rest of the call.
+drain_log="${AURA_CALL_LOG:-/dev/null}"
+# (2>/dev/null comes FIRST: redirections apply left to right, and the probe's
+# own failure message must be suppressed, not printed.)
+if ! : 2>/dev/null >>"$drain_log"; then
+  printf '%s: warning: AURA_CALL_LOG=%s is not writable; discarding the server log\n' \
+    "$prog" "$drain_log" >&2
+  drain_log=/dev/null
+fi
+# The wrapper's OWN stdout/stderr must be redirected AT SPAWN: it inherits this
+# helper's stdout otherwise, and a caller using `conn="$(aura-call ...)"` would
+# block forever on the command substitution (the pipe's write end stays open
+# for the server's whole life). The inner cat re-redirects to the log itself.
+nohup sh -c 'cat >>"$1" 2>/dev/null; exec cat >/dev/null 2>&1' drain "$drain_log" \
+  <&3 >/dev/null 2>&1 &
 disown 2>/dev/null || true
 
 exit 0

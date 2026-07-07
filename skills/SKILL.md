@@ -77,9 +77,47 @@ AURA_CONNECT='aura://HOST:PORT#k=<secret>&c=<call_id>' aura-cli          # direc
 AURA_CONNECT='aura://<node-id>#k=<secret>&c=<call_id>&t=iroh' aura-cli   # iroh
 ```
 
-The server needs `XAI_API_KEY` (env / OS keychain / `./.env`); if it is missing,
-`aura-call` exits non-zero — ask the user for their xAI key (BYOK). REMOTE assumes
+The server needs a BYOK key — `XAI_API_KEY` (xAI Grok) or `OPENAI_API_KEY`
+(OpenAI gpt-realtime-2.1) — from env / OS keychain / `./.env`; if it is missing,
+`aura-call` exits non-zero — ask the user for their key. REMOTE assumes
 the UDP port was opened once at onboarding — never open it per call.
+
+### Switching the voice provider / model (only when the user asks)
+
+The default comes from the aura `.env` (`AURA_VOICE_PROVIDER`; else whichever
+key is present — xAI wins when both exist). To switch for ONE call, prefix the
+launch — env beats `.env`:
+
+```bash
+AURA_VOICE_PROVIDER=openai aura-call local --host <kind>     # OpenAI gpt-realtime-2.1
+AURA_VOICE_PROVIDER=openai AURA_VOICE_MODEL=gpt-realtime-2.1-mini \
+  aura-call local --host <kind>                              # OpenAI mini (~3x cheaper)
+AURA_VOICE_PROVIDER=xai aura-call local --host <kind>        # xAI Grok
+```
+
+Always pair `AURA_VOICE_MODEL=…mini` with `AURA_VOICE_PROVIDER=openai` — the
+model id is only valid on its own provider. To make the switch permanent, put
+the same `KEY=value` lines in `~/.config/aura/.env` — unless a project-local
+`./.env` in the launch directory also sets these vars: that file loads first
+and wins, so update it instead.
+
+The target provider needs ITS OWN key (xai ↔ `XAI_API_KEY`, openai ↔
+`OPENAI_API_KEY`). If the launch fails with `no BYOK … key found`, get the key
+from the user, store it, relaunch. Never echo the key and never put it in a
+shell command (`ps` exposes command lines). Two ways to store it:
+
+- **The user has a terminal on the server machine** → send them this snippet to
+  run THEMSELVES (it reads the key from THEIR keyboard; do NOT run it yourself —
+  your shell has no keyboard, `read` would store an empty key):
+  ```bash
+  umask 077; mkdir -p ~/.config/aura; touch ~/.config/aura/.env; chmod 600 ~/.config/aura/.env
+  ( printf '\nOPENAI_API_KEY='; read -rs k; printf '%s\n' "$k"; unset k ) >> ~/.config/aura/.env
+  ```
+  (For xAI: `XAI_API_KEY=`. Interrupted midway? Just run it again — a dangling
+  empty `KEY=` line is ignored by the server.)
+- **The user sent the key to you in chat** → append the single line
+  `OPENAI_API_KEY=<key>` to `~/.config/aura/.env` with your FILE-WRITE/edit
+  tool (NOT a shell echo/printf), then `chmod 600 ~/.config/aura/.env`.
 
 ## Step 3 — Connect
 
@@ -214,7 +252,7 @@ and Codex have a per-call model knob; OpenClaw/Hermes ignore it.
 
 ## Rules — never break
 
-- 🔒 The session secret and `XAI_API_KEY` travel **only** via the `AURA_CONNECT`
+- 🔒 The session secret and the API key travel **only** via the `AURA_CONNECT`
   env var or stdin — **never argv** (`ps` exposes argv). Never echo/print/log the key.
 - 🔒 The REMOTE connection string goes to **one** user over the existing chat,
   never anywhere public. Single-use, ~120 s.
@@ -227,7 +265,7 @@ and Codex have a per-call model knob; OpenClaw/Hermes ignore it.
 |---|---|
 | no `aura-cli` (user side) | `install.sh --client` (Linux needs ALSA dev headers; macOS/Windows none) |
 | no `aura-server` / `aura-call` / `aura-inbox` | `install.sh --server` (needs no audio package; installs all three helpers) |
-| `XAI_API_KEY` not found | the server exits with a clear error → ask the user for their xAI key |
+| API key not found (`no BYOK … key found`, wording varies by provider) | the server exits with a clear error → ask the user for their xAI or OpenAI key (store it per Step 2's switching section) |
 | loop runs but every task cold-fallbacks; `aura-call-status` says `none`/stale while the call is clearly live | the server and the helpers are looking at DIFFERENT `.aura` dirs (cwd drift — classic on messenger hosts whose exec resets cwd). Compare the server's `in-call dispatch inbox at <dir>` log line with `aura-inbox alive`'s `ALIVE <dir>`; fix by setting `AURA_STATE_DIR` once in the aura `.env` (see Step 4.1). |
 | the model interrupts/answers ITSELF on open speakers (echo loop) | the client cancels echo by default (AEC3). If the user disabled it or runs an old client: relaunch `aura-cli` without `AURA_AEC=off`, or set `AURA_AEC=gate` (mutes the mic while the model speaks — no barge-in), or suggest headphones. |
 | Step 4 loop stalls — `aura-inbox`/edits/dispatch hang, dispatches all cold-fallback | your framework is prompting for tool approval the user can't give mid-call. Set it to **auto-approve** the orchestrator's tool calls (Claude: allow-rules `Bash(aura-inbox:*)`, `Bash(aura-call-status:*)`, `Bash(aura-call:*)` — the loop runs ALL of these helpers, the `:` before `*` is required, and `--permission-mode acceptEdits` covers edits but NOT Bash, so the allow-rules are needed; Hermes: `hermes config set approvals.cron_mode approve`; OpenClaw: `openclaw config set tools.exec.ask off`) — one-time, see onboarding Step 5b. |

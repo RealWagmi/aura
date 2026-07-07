@@ -5,7 +5,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.2.4"
+version = "0.2.5"
 authors = ["aura"]
 description = "Voice calls for AI chats — all-Rust, no broker (xAI Grok voice realtime)."
 publish = false

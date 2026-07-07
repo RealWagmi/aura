@@ -10,7 +10,7 @@
       aura-cli    — the THIN CLIENT. Runs on the user's machine (it owns the
                     mic/speaker via WASAPI). Holds NO key, NO engine, NO host.
       aura-server — the SERVER the host/AI launches (127.0.0.1 for a LOCAL call,
-                    a VPS for a REMOTE one). Holds XAI_API_KEY + the engine + the
+                    a VPS for a REMOTE one). Holds the API key (xAI or OpenAI) + the engine + the
                     chat context + the tools, mints a per-call session secret,
                     prints a connection string.
 
@@ -101,7 +101,7 @@ Options:
 
 What gets installed:
     aura-cli.exe     The CLIENT (mic/speaker via WASAPI). No key, no engine.
-    aura-server.exe  The SERVER the host/AI launches. Holds XAI_API_KEY + engine.
+    aura-server.exe  The SERVER the host/AI launches. Holds the API key + engine.
 
 Windows audio is WASAPI: no extra audio package is required on either side.
 The Rust toolchain is pinned by rust-toolchain.toml (1.92.0); rustup selects it.
@@ -413,7 +413,7 @@ if ($BuildServer) {
     Write-Note '    * drop the host skill (skills/SKILL.md)     - onboarding step 5'
     Write-Note 'The aura-call / aura-call-status / aura-inbox helpers are on your PATH'
     Write-Note '(POSIX shell; run the host under git-bash/WSL on Windows). The host launches'
-    Write-Note 'aura-server per call; it needs XAI_API_KEY in its'
+    Write-Note 'aura-server per call; it needs XAI_API_KEY or OPENAI_API_KEY in its'
     Write-Note 'environment (BYOK; never on the command line). It prints the'
     Write-Note '`AURA_CONNECT=... aura-cli` line to STDERR for the caller to use.'
     Write-Note '    https://raw.githubusercontent.com/RealWagmi/aura/main/docs/ONBOARDING.md'
