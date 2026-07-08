@@ -6,9 +6,10 @@
 //! model, the chat context, the tools, and the key all live on the server.
 
 use aura_audio::{AudioSettings, CpalTransport};
+#[cfg(windows)]
+use aura_tunnel::TunnelControl;
 use aura_tunnel::{
-    ConnectionString, IrohEndpoint, IrohPreset, TransportKind, TunnelConfig, TunnelControl,
-    TunnelEndpoint,
+    ConnectionString, IrohEndpoint, IrohPreset, TransportKind, TunnelConfig, TunnelEndpoint,
 };
 #[cfg(windows)]
 use std::sync::Arc;
@@ -178,6 +179,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 #[allow(async_fn_in_trait)]
 trait VoiceTunnel {
     fn send_pcm24(&self, pcm: &[i16]);
+    #[cfg(windows)]
     fn send_control(&self, control: TunnelControl);
     async fn recv_pcm24(&mut self) -> Option<Vec<i16>>;
 }
@@ -186,6 +188,7 @@ impl VoiceTunnel for TunnelEndpoint {
     fn send_pcm24(&self, pcm: &[i16]) {
         TunnelEndpoint::send_pcm24(self, pcm);
     }
+    #[cfg(windows)]
     fn send_control(&self, control: TunnelControl) {
         TunnelEndpoint::send_control(self, control);
     }
@@ -198,6 +201,7 @@ impl VoiceTunnel for IrohEndpoint {
     fn send_pcm24(&self, pcm: &[i16]) {
         IrohEndpoint::send_pcm24(self, pcm);
     }
+    #[cfg(windows)]
     fn send_control(&self, control: TunnelControl) {
         IrohEndpoint::send_control(self, control);
     }
