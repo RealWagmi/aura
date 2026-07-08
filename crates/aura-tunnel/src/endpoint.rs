@@ -27,7 +27,10 @@ use crate::jitter::JitterBuffer;
 use crate::noise::{self, Transport, MAX_HANDSHAKE_MSG};
 use crate::reframe::Reframer;
 use crate::session::SessionSecret;
-use crate::wire::{decode_transport, encode_transport, TAG_HANDSHAKE, TAG_TRANSPORT};
+use crate::wire::{
+    decode_transport, decode_tunnel_control, encode_transport, encode_tunnel_control,
+    TunnelControl, TunnelInput, TAG_HANDSHAKE, TAG_TRANSPORT,
+};
 
 /// 20 ms @ 24 kHz mono.
 const FRAME_SAMPLES: usize = 480;
@@ -80,7 +83,7 @@ const MAX_OUTBOUND_FRAMES: usize = 15_000;
 /// lets `clear_outbound` (barge-in) also reset the reframer carry so a stale
 /// `<20 ms` partial frame can't prepend onto the next response.
 struct Outbound {
-    queue: VecDeque<Vec<i16>>,
+    queue: VecDeque<Vec<u8>>,
     reframer: Reframer,
     /// Total frames dropped on overflow (diagnostic; see `MAX_OUTBOUND_FRAMES`).
     dropped_frames: u64,
@@ -196,7 +199,7 @@ impl TunnelServer {
 /// A live tunnel endpoint: PCM16@24k in/out over the encrypted UDP session.
 pub struct TunnelEndpoint {
     outbound: Arc<Mutex<Outbound>>,
-    inbound_rx: mpsc::Receiver<Vec<i16>>,
+    inbound_rx: mpsc::Receiver<TunnelInput>,
     _send_task: AbortOnDrop,
     _io_task: AbortOnDrop,
 }
@@ -259,7 +262,7 @@ impl TunnelEndpoint {
             reframer: Reframer::new(FRAME_SAMPLES),
             dropped_frames: 0,
         }));
-        let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<i16>>(cfg.inbound_capacity.max(1));
+        let (inbound_tx, inbound_rx) = mpsc::channel::<TunnelInput>(cfg.inbound_capacity.max(1));
 
         // Outbound pacer: every 20 ms send one queued frame, OR — when the queue
         // is idle — an encrypted empty "keepalive" frame. The steady keepalive
@@ -282,7 +285,6 @@ impl TunnelEndpoint {
                         .expect("outbound lock")
                         .queue
                         .pop_front()
-                        .map(|pcm| pcm_to_bytes(&pcm))
                         .unwrap_or_default();
                     match transport.encrypt(nonce, &bytes) {
                         Ok(ct) => {
@@ -320,7 +322,13 @@ impl TunnelEndpoint {
                                         // Any authenticated frame proves liveness;
                                         // empty == keepalive (not pushed to audio).
                                         last_recv = tokio::time::Instant::now();
-                                        if !pt.is_empty() {
+                                        if let Some(control) = decode_tunnel_control(&pt) {
+                                            if inbound_tx.try_send(TunnelInput::Control(control)).is_err()
+                                                && inbound_tx.is_closed()
+                                            {
+                                                break;
+                                            }
+                                        } else if !pt.is_empty() {
                                             jitter.push(nonce as u16, pt);
                                         }
                                     }
@@ -343,7 +351,7 @@ impl TunnelEndpoint {
                             if let Some(bytes) = jitter.pop() {
                                 // Drop this frame if the consumer is far behind
                                 // (channel full); a closed channel ends the task.
-                                if inbound_tx.try_send(bytes_to_pcm(&bytes)).is_err()
+                                if inbound_tx.try_send(TunnelInput::Audio(bytes_to_pcm(&bytes))).is_err()
                                     && inbound_tx.is_closed()
                                 {
                                     break;
@@ -369,7 +377,7 @@ impl TunnelEndpoint {
         let mut out = self.outbound.lock().expect("outbound lock");
         let frames = out.reframer.push(pcm);
         for f in frames {
-            out.queue.push_back(f);
+            out.queue.push_back(pcm_to_bytes(&f));
             while out.queue.len() > MAX_OUTBOUND_FRAMES {
                 out.queue.pop_front();
                 out.dropped_frames += 1;
@@ -393,13 +401,32 @@ impl TunnelEndpoint {
         let mut out = self.outbound.lock().expect("outbound lock");
         if let Some(mut tail) = out.reframer.flush() {
             tail.resize(FRAME_SAMPLES, 0);
-            out.queue.push_back(tail);
+            out.queue.push_back(pcm_to_bytes(&tail));
         }
+    }
+
+    /// Queue an authenticated control event for the peer.
+    pub fn send_control(&self, control: TunnelControl) {
+        self.outbound
+            .lock()
+            .expect("outbound lock")
+            .queue
+            .push_back(encode_tunnel_control(control));
+    }
+
+    /// The next inbound audio/control event, or `None` when the tunnel closes.
+    pub async fn recv_input(&mut self) -> Option<TunnelInput> {
+        self.inbound_rx.recv().await
     }
 
     /// The next inbound 20 ms frame, or `None` when the tunnel closes.
     pub async fn recv_pcm24(&mut self) -> Option<Vec<i16>> {
-        self.inbound_rx.recv().await
+        loop {
+            match self.recv_input().await? {
+                TunnelInput::Audio(pcm) => return Some(pcm),
+                TunnelInput::Control(_) => continue,
+            }
+        }
     }
 
     /// Drop everything queued for sending AND reset the reframer carry (barge-in

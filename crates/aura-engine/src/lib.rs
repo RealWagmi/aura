@@ -123,6 +123,12 @@ pub trait AudioTransport: Send {
     /// The next ~20 ms frame of audio (mic) as PCM16 mono LE @ 24k. `None`
     /// means the transport closed (hang-up / peer left).
     async fn recv_pcm24(&mut self) -> Option<Vec<i16>>;
+    /// The next transport input. Normal transports can return only audio by
+    /// relying on this default; remote PTT transports may also surface control
+    /// events such as "commit this user turn now".
+    async fn recv_input(&mut self) -> Option<TransportInput> {
+        self.recv_pcm24().await.map(TransportInput::Audio)
+    }
     /// Play a model frame (PCM16 mono LE @ 24k) to the speaker.
     async fn send_pcm24(&mut self, pcm: &[i16]) -> Result<(), TransportError>;
     /// Drop everything queued for playout (barge-in).
@@ -138,6 +144,18 @@ pub trait AudioTransport: Send {
     async fn flush_output(&mut self) -> Result<(), TransportError> {
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportControl {
+    PttOpen,
+    PttClose,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportInput {
+    Audio(Vec<i16>),
+    Control(TransportControl),
 }
 
 /// Errors a transport can surface on send. Receive failures are modeled as
@@ -332,10 +350,21 @@ impl CallSession {
             // --- ACTIVE phase: the realtime session is live. ---
             let transition = loop {
                 tokio::select! {
-                    mic = transport.recv_pcm24() => match mic {
-                        Some(pcm) => {
+                    mic = transport.recv_input() => match mic {
+                        Some(TransportInput::Audio(pcm)) => {
                             if sink.send_audio(&pcm).await.is_err() {
                                 match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "mic-audio send failed").await {
+                                    Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
+                                    None => break Transition::Ended(EndReason::ReconnectExhausted),
+                                }
+                            }
+                        }
+                        Some(TransportInput::Control(TransportControl::PttOpen)) => {
+                            transport.clear_playout();
+                        }
+                        Some(TransportInput::Control(TransportControl::PttClose)) => {
+                            if sink.commit_user_turn().await.is_err() {
+                                match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk commit failed").await {
                                     Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
                                     None => break Transition::Ended(EndReason::ReconnectExhausted),
                                 }
@@ -1095,6 +1124,7 @@ mod tests {
         injects: Vec<String>,
         tool_results: usize,
         requests: usize,
+        commits: usize,
         closed: bool,
     }
 
@@ -1138,6 +1168,12 @@ mod tests {
         }
         async fn request_response(&mut self) -> Result<(), VoiceError> {
             self.log.lock().unwrap().requests += 1;
+            Ok(())
+        }
+        async fn commit_user_turn(&mut self) -> Result<(), VoiceError> {
+            let mut log = self.log.lock().unwrap();
+            log.commits += 1;
+            log.requests += 1;
             Ok(())
         }
         async fn close(&mut self) -> Result<(), VoiceError> {
@@ -1218,7 +1254,7 @@ mod tests {
     }
 
     struct FakeTransport {
-        mic: Mutex<VecDeque<Vec<i16>>>,
+        input: Mutex<VecDeque<TransportInput>>,
         hangup_when_empty: bool,
         played: Arc<Mutex<Vec<Vec<i16>>>>,
         cleared: Arc<AtomicUsize>,
@@ -1228,8 +1264,16 @@ mod tests {
     #[async_trait]
     impl AudioTransport for FakeTransport {
         async fn recv_pcm24(&mut self) -> Option<Vec<i16>> {
-            if let Some(frame) = self.mic.lock().unwrap().pop_front() {
-                return Some(frame);
+            loop {
+                match self.recv_input().await? {
+                    TransportInput::Audio(pcm) => return Some(pcm),
+                    TransportInput::Control(_) => continue,
+                }
+            }
+        }
+        async fn recv_input(&mut self) -> Option<TransportInput> {
+            if let Some(input) = self.input.lock().unwrap().pop_front() {
+                return Some(input);
             }
             if self.hangup_when_empty {
                 return None;
@@ -1258,6 +1302,7 @@ mod tests {
             latency_target_ms: 800,
             temperature: None,
             end_of_turn_timeout_ms: None,
+            manual_turn_detection: false,
             output_speed: None,
             cold_start_kick: false,
             transcription_language: None,
@@ -1278,6 +1323,18 @@ mod tests {
     }
 
     fn harness(scripts: Vec<Script>, mic: Vec<Vec<i16>>, hangup_when_empty: bool) -> Harness {
+        harness_input(
+            scripts,
+            mic.into_iter().map(TransportInput::Audio).collect(),
+            hangup_when_empty,
+        )
+    }
+
+    fn harness_input(
+        scripts: Vec<Script>,
+        input: Vec<TransportInput>,
+        hangup_when_empty: bool,
+    ) -> Harness {
         let sink_log = Arc::new(Mutex::new(SinkLog::default()));
         let played = Arc::new(Mutex::new(Vec::new()));
         let cleared = Arc::new(AtomicUsize::new(0));
@@ -1288,7 +1345,7 @@ mod tests {
             connects: connects.clone(),
         });
         let transport = Box::new(FakeTransport {
-            mic: Mutex::new(mic.into()),
+            input: Mutex::new(input.into()),
             hangup_when_empty,
             played: played.clone(),
             cleared: cleared.clone(),
@@ -1302,6 +1359,30 @@ mod tests {
             cleared,
             connects,
         }
+    }
+
+    #[tokio::test]
+    async fn push_to_talk_close_commits_user_turn() {
+        let h = harness_input(
+            vec![Script::Ok {
+                events: vec![VoiceEvent::SessionReady],
+                end: End::Pending,
+            }],
+            vec![
+                TransportInput::Audio(vec![1, 2, 3]),
+                TransportInput::Control(TransportControl::PttClose),
+            ],
+            true,
+        );
+
+        let _ = CallSession::run(h.transport, h.provider, host(), None, cfg())
+            .await
+            .unwrap();
+
+        let log = h.sink_log.lock().unwrap();
+        assert_eq!(log.audio, vec![vec![1, 2, 3]]);
+        assert_eq!(log.commits, 1);
+        assert_eq!(log.requests, 1);
     }
 
     #[tokio::test]

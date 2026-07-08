@@ -119,6 +119,8 @@ pub struct VoiceSessionConfig {
     pub temperature: Option<f64>,
     /// Optional end-of-turn silence timeout in ms (server-VAD).
     pub end_of_turn_timeout_ms: Option<u64>,
+    /// Disable server VAD and let the client explicitly commit each user turn.
+    pub manual_turn_detection: bool,
     /// Optional output speed multiplier.
     pub output_speed: Option<f64>,
     /// When `true`, `connect` includes a cold-start user item + response
@@ -181,6 +183,12 @@ pub trait VoiceSink: Send {
     /// Ask the model to produce a response now (used when `server_vad` is
     /// off, or after a tool result).
     async fn request_response(&mut self) -> Result<(), VoiceError>;
+    /// Commit the current input-audio buffer as one user turn, then ask the
+    /// model to answer. Used by manual push-to-talk sessions. Server-VAD
+    /// sessions keep the default behaviour.
+    async fn commit_user_turn(&mut self) -> Result<(), VoiceError> {
+        self.request_response().await
+    }
     /// Close the connection.
     async fn close(&mut self) -> Result<(), VoiceError>;
 }

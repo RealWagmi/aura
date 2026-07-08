@@ -8,7 +8,6 @@ description: >-
 trigger: >-
   The user is installing or running Aura on Windows, or asks for Windows-specific
   setup details.
-allowed-tools: PowerShell
 ---
 
 # Aura on Windows
@@ -43,7 +42,7 @@ echo, or log `XAI_API_KEY` or the `AURA_CONNECT` secret.
 From the repo root:
 
 ```powershell
-Set-Location C:\New\WagmiV3\aura
+Set-Location <AURA_REPO>
 .\install.ps1
 ```
 
@@ -99,7 +98,7 @@ reload it automatically.
 For a repo-local setup, the file is:
 
 ```text
-C:\New\WagmiV3\aura\.env
+<AURA_REPO>\.env
 ```
 
 Minimum required value:
@@ -120,6 +119,7 @@ AURA_FEEDER=false
 AURA_END_OF_TURN_TIMEOUT_MS=2000
 AURA_INPUT_MODE=voice
 AURA_PUSH_TO_TALK_HOTKEY=ctrl+space
+AURA_PUSH_TO_TALK_MAX_RECORDING_MS=300000
 ```
 
 Do not add an empty `AURA_BIND=` line. In this project, if `AURA_BIND` exists,
@@ -136,9 +136,9 @@ AURA_END_OF_TURN_TIMEOUT_MS=2500
 ```
 
 The provider clamps the value to `300..3000` ms in `voice` mode. When
-`AURA_INPUT_MODE=push_to_talk`, Aura ignores `AURA_END_OF_TURN_TIMEOUT_MS` and
-uses `0` automatically. Set it before starting `aura-server`; changing `.env`
-does not affect an already-running call.
+`AURA_INPUT_MODE=push_to_talk`, Aura uses manual hotkey turn commit and ignores
+`AURA_END_OF_TURN_TIMEOUT_MS`. Set it before starting `aura-server`; changing
+`.env` does not affect an already-running call.
 
 `AURA_INPUT_MODE` controls how the client sends the user's speech:
 
@@ -149,8 +149,8 @@ AURA_INPUT_MODE=push_to_talk
 
 In `voice` mode, Aura listens normally and uses voice/silence detection. In
 Windows `push_to_talk` mode, the user presses the global hotkey once to start
-recording, speaks, then presses the hotkey again to send the recorded voice to
-Aura. The default hotkey is:
+sending mic audio, speaks, then presses the hotkey again to commit the turn and
+ask Aura to answer. The default hotkey is:
 
 ```env
 AURA_PUSH_TO_TALK_HOTKEY=ctrl+space
@@ -159,6 +159,10 @@ AURA_PUSH_TO_TALK_HOTKEY=ctrl+space
 The hotkey is global on Windows, so it works while Cursor, a browser, or another
 app has focus. Set these values before starting `aura-cli`; changing `.env` does
 not affect an already-running client.
+
+`AURA_PUSH_TO_TALK_MAX_RECORDING_MS` is a client safety cap for an accidentally
+open mic. The default is `300000` ms, about five minutes. Three seconds before
+the cap, Aura warns the user that the voice message limit is near.
 
 Do not print, echo, or log `XAI_API_KEY`. Paste it only into `.env`, the process
 environment, or Windows Credential Manager.
@@ -224,7 +228,7 @@ Use this section when the user asks for a voice call on Windows.
    For repo-local setup:
 
    ```powershell
-   Test-Path C:\New\WagmiV3\aura\.env
+   Test-Path <AURA_REPO>\.env
    ```
 
    The file must contain `XAI_API_KEY=<real key>` before a real call can work.
@@ -299,10 +303,10 @@ in `%USERPROFILE%\.local\bin`. To discuss a specific repository, launch
 `aura-server.exe` with that repository as the working directory. The server's
 working directory is the project context for the call.
 
-Example repository used during local testing:
+Target repository placeholder:
 
 ```text
-C:\New\WagmiV3\heyanon-github-analyzer
+<TARGET_REPO>
 ```
 
 Use the Aura repo `.env` to load `XAI_API_KEY`, start the server from the target
@@ -310,8 +314,8 @@ repo, capture the one-time connection string internally, and pass it directly to
 `aura-cli.exe`. Do not print the connection string.
 
 ```powershell
-$repo = 'C:\New\WagmiV3\heyanon-github-analyzer'
-$envFile = 'C:\New\WagmiV3\aura\.env'
+$repo = '<TARGET_REPO>'
+$envFile = '<AURA_REPO>\.env'
 
 Get-Content -LiteralPath $envFile | ForEach-Object {
     $line = $_.Trim()
@@ -372,8 +376,8 @@ For a local call on the same Windows machine:
   logs `speak when you hear Aura`, the mic is open and the user can speak
   normally.
 - In `AURA_INPUT_MODE=push_to_talk`, the user presses the global hotkey once to
-  start recording, speaks, then presses the same hotkey again to send the voice
-  message to Aura.
+  start sending mic audio, speaks, then presses the same hotkey again to commit
+  the turn and ask Aura to answer.
 - Windows microphone settings should show `aura-cli.exe` under desktop apps as
   currently using the microphone. `Voice Recorder` does not need to be enabled.
 - Verified local audio device log shape:

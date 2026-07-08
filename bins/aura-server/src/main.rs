@@ -146,7 +146,7 @@ fn print_server_help() {
          AURA_STATE_DIR        root for .aura state (call-status, inbox); default = cwd\n  \
          AURA_TRANSPORT=iroh   NAT/CGNAT P2P transport (no open port needed)\n  \
          AURA_DISPATCH_MODEL   pin the in-call dispatch model\n  \
-         AURA_END_OF_TURN_TIMEOUT_MS  silence before Aura replies (300..3000 ms)\n  \
+         AURA_END_OF_TURN_TIMEOUT_MS  silence before Aura replies in voice mode\n  \
          AURA_FEEDER=1         opt in to the live ambient feeder\n\n\
          Connection string printed for the caller (single-use, ~120 s):\n  \
          direct:  aura://HOST:PORT#k=<secret>&c=<call>\n  \
@@ -271,8 +271,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         choice.as_str(),
         provider.model_id()
     );
+    let input_mode = std::env::var("AURA_INPUT_MODE").ok();
+    let ptt_mode = is_push_to_talk_mode(input_mode.as_deref());
     let end_of_turn_timeout_ms = resolve_end_of_turn_timeout_ms(
-        std::env::var("AURA_INPUT_MODE").ok().as_deref(),
+        input_mode.as_deref(),
         std::env::var("AURA_END_OF_TURN_TIMEOUT_MS").ok().as_deref(),
     )?;
     if let Some(ms) = end_of_turn_timeout_ms {
@@ -285,6 +287,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         latency_target_ms: 800,
         temperature: Some(0.5),
         end_of_turn_timeout_ms,
+        manual_turn_detection: ptt_mode,
         output_speed: None,
         cold_start_kick: true,
         // ISO-639-1 hint for OpenAI's input transcription (e.g. "ru");
@@ -754,6 +757,7 @@ fn pid_is_aura_server(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
+#[allow(dead_code)]
 fn pid_is_aura_server(_pid: u32) -> bool {
     false // Windows: no portable process-name introspection here → never verified
 }
@@ -863,8 +867,13 @@ fn parse_end_of_turn_timeout_ms(raw: Option<&str>) -> Result<Option<u64>, String
         return Ok(None);
     }
     let ms = trimmed.parse::<u64>().map_err(|_| {
-        format!("AURA_END_OF_TURN_TIMEOUT_MS must be a non-negative number of milliseconds, got {raw:?}")
+        format!(
+            "AURA_END_OF_TURN_TIMEOUT_MS must be a positive number of milliseconds, got {raw:?}"
+        )
     })?;
+    if ms == 0 {
+        return Err("AURA_END_OF_TURN_TIMEOUT_MS must be greater than 0".into());
+    }
     Ok(Some(ms))
 }
 
@@ -872,7 +881,14 @@ fn resolve_end_of_turn_timeout_ms(
     input_mode: Option<&str>,
     raw_timeout: Option<&str>,
 ) -> Result<Option<u64>, String> {
-    if input_mode
+    if is_push_to_talk_mode(input_mode) {
+        return Ok(None);
+    }
+    parse_end_of_turn_timeout_ms(raw_timeout)
+}
+
+fn is_push_to_talk_mode(input_mode: Option<&str>) -> bool {
+    input_mode
         .map(|mode| {
             matches!(
                 mode.trim().to_ascii_lowercase().as_str(),
@@ -880,10 +896,6 @@ fn resolve_end_of_turn_timeout_ms(
             )
         })
         .unwrap_or(false)
-    {
-        return Ok(Some(0));
-    }
-    parse_end_of_turn_timeout_ms(raw_timeout)
 }
 
 /// Resolve the `.aura` state root: `AURA_STATE_DIR` (else the process cwd).
@@ -933,7 +945,7 @@ fn ensure_aura_gitignore(root: &std::path::Path) -> std::io::Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(err),
     };
-    if existing.lines().map(str::trim).any(|line| line == ".aura") {
+    if existing.lines().map(str::trim).any(is_aura_gitignore_entry) {
         return Ok(());
     }
 
@@ -942,7 +954,24 @@ fn ensure_aura_gitignore(root: &std::path::Path) -> std::io::Result<()> {
         next.push('\n');
     }
     next.push_str(".aura\n");
-    std::fs::write(gitignore, next)
+
+    let tmp = root.join(".gitignore.aura.tmp");
+    std::fs::write(&tmp, next)?;
+    match std::fs::rename(&tmp, &gitignore) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(err)
+        }
+    }
+}
+
+fn is_aura_gitignore_entry(line: &str) -> bool {
+    let line = line.trim();
+    if line.starts_with('!') || line.starts_with('#') {
+        return false;
+    }
+    matches!(line.trim_end_matches('/'), ".aura")
 }
 
 fn is_inside_git_worktree(root: &std::path::Path) -> bool {
@@ -1214,25 +1243,25 @@ mod tests {
     fn end_of_turn_timeout_env_parses_optional_ms() {
         assert_eq!(parse_end_of_turn_timeout_ms(None), Ok(None));
         assert_eq!(parse_end_of_turn_timeout_ms(Some("")), Ok(None));
-        assert_eq!(parse_end_of_turn_timeout_ms(Some("0")), Ok(Some(0)));
         assert_eq!(parse_end_of_turn_timeout_ms(Some(" 2000 ")), Ok(Some(2000)));
         assert_eq!(parse_end_of_turn_timeout_ms(Some("3000")), Ok(Some(3000)));
     }
 
     #[test]
     fn end_of_turn_timeout_env_rejects_invalid_values() {
+        assert!(parse_end_of_turn_timeout_ms(Some("0")).is_err());
         assert!(parse_end_of_turn_timeout_ms(Some("abc")).is_err());
     }
 
     #[test]
-    fn push_to_talk_forces_zero_end_of_turn_timeout() {
+    fn push_to_talk_ignores_end_of_turn_timeout() {
         assert_eq!(
             resolve_end_of_turn_timeout_ms(Some("push_to_talk"), Some("2500")),
-            Ok(Some(0))
+            Ok(None)
         );
         assert_eq!(
             resolve_end_of_turn_timeout_ms(Some("ptt"), Some("abc")),
-            Ok(Some(0))
+            Ok(None)
         );
     }
 
@@ -1265,6 +1294,30 @@ mod tests {
 
         let gitignore = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
         assert_eq!(gitignore, "target/\n.aura\n");
+    }
+
+    #[test]
+    fn aura_gitignore_entry_accepts_slash_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "target/\n.aura/\n").unwrap();
+
+        ensure_aura_gitignore(tmp.path()).unwrap();
+
+        let gitignore = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert_eq!(gitignore, "target/\n.aura/\n");
+    }
+
+    #[test]
+    fn aura_gitignore_entry_does_not_treat_negation_as_ignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "!.aura\n").unwrap();
+
+        ensure_aura_gitignore(tmp.path()).unwrap();
+
+        let gitignore = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert_eq!(gitignore, "!.aura\n.aura\n");
     }
 
     #[test]

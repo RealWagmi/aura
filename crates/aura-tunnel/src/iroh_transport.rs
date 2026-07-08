@@ -34,7 +34,10 @@ use crate::jitter::JitterBuffer;
 use crate::noise::{self, Transport, MAX_HANDSHAKE_MSG};
 use crate::reframe::Reframer;
 use crate::session::SessionSecret;
-use crate::wire::{decode_transport, encode_transport, TAG_TRANSPORT};
+use crate::wire::{
+    decode_transport, decode_tunnel_control, encode_transport, encode_tunnel_control,
+    TunnelControl, TunnelInput, TAG_TRANSPORT,
+};
 
 /// ALPN identifying the aura voice tunnel over iroh. Both sides must match, or
 /// iroh aborts the connection in its handshake.
@@ -169,7 +172,7 @@ async fn read_framed<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<Vec<u8>, Iroh
 /// and the reframer. `clear_outbound` resets both so a stale partial frame can't
 /// prepend onto the next response (barge-in).
 struct Outbound {
-    queue: VecDeque<Vec<i16>>,
+    queue: VecDeque<Vec<u8>>,
     reframer: Reframer,
     /// Total frames dropped on overflow (diagnostic; see `MAX_OUTBOUND_FRAMES`).
     dropped_frames: u64,
@@ -270,7 +273,7 @@ pub struct IrohEndpoint {
     // Kept alive so the underlying connection survives; dropping it closes the call.
     _endpoint: Endpoint,
     outbound: Arc<Mutex<Outbound>>,
-    inbound_rx: mpsc::Receiver<Vec<i16>>,
+    inbound_rx: mpsc::Receiver<TunnelInput>,
     _send_task: AbortOnDrop,
     _io_task: AbortOnDrop,
 }
@@ -338,7 +341,7 @@ impl IrohEndpoint {
             reframer: Reframer::new(FRAME_SAMPLES),
             dropped_frames: 0,
         }));
-        let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<i16>>(cfg.inbound_capacity.max(1));
+        let (inbound_tx, inbound_rx) = mpsc::channel::<TunnelInput>(cfg.inbound_capacity.max(1));
 
         // Outbound pacer: every 20 ms send one queued frame as a QUIC datagram,
         // OR (idle) an encrypted empty keepalive — keeps QUIC + any relay/NAT
@@ -358,7 +361,6 @@ impl IrohEndpoint {
                         .expect("outbound lock")
                         .queue
                         .pop_front()
-                        .map(|pcm| pcm_to_bytes(&pcm))
                         .unwrap_or_default();
                     match transport.encrypt(nonce, &bytes) {
                         Ok(ct) => {
@@ -392,7 +394,13 @@ impl IrohEndpoint {
                                     if let Some((nonce, ct)) = decode_transport(&body[1..]) {
                                         if let Ok(pt) = transport.decrypt(nonce, ct) {
                                             // Empty == keepalive (authenticated); not audio.
-                                            if !pt.is_empty() {
+                                            if let Some(control) = decode_tunnel_control(&pt) {
+                                                if inbound_tx.try_send(TunnelInput::Control(control)).is_err()
+                                                    && inbound_tx.is_closed()
+                                                {
+                                                    break;
+                                                }
+                                            } else if !pt.is_empty() {
                                                 jitter.push(nonce as u16, pt);
                                             }
                                         }
@@ -403,7 +411,7 @@ impl IrohEndpoint {
                         },
                         _ = tick.tick() => {
                             if let Some(bytes) = jitter.pop() {
-                                if inbound_tx.try_send(bytes_to_pcm(&bytes)).is_err()
+                                if inbound_tx.try_send(TunnelInput::Audio(bytes_to_pcm(&bytes))).is_err()
                                     && inbound_tx.is_closed()
                                 {
                                     break;
@@ -429,7 +437,7 @@ impl IrohEndpoint {
         let mut out = self.outbound.lock().expect("outbound lock");
         let frames = out.reframer.push(pcm);
         for f in frames {
-            out.queue.push_back(f);
+            out.queue.push_back(pcm_to_bytes(&f));
             while out.queue.len() > MAX_OUTBOUND_FRAMES {
                 out.queue.pop_front();
                 out.dropped_frames += 1;
@@ -453,13 +461,32 @@ impl IrohEndpoint {
         let mut out = self.outbound.lock().expect("outbound lock");
         if let Some(mut tail) = out.reframer.flush() {
             tail.resize(FRAME_SAMPLES, 0);
-            out.queue.push_back(tail);
+            out.queue.push_back(pcm_to_bytes(&tail));
         }
+    }
+
+    /// Queue an authenticated control event for the peer.
+    pub fn send_control(&self, control: TunnelControl) {
+        self.outbound
+            .lock()
+            .expect("outbound lock")
+            .queue
+            .push_back(encode_tunnel_control(control));
+    }
+
+    /// The next inbound audio/control event, or `None` when the tunnel closes.
+    pub async fn recv_input(&mut self) -> Option<TunnelInput> {
+        self.inbound_rx.recv().await
     }
 
     /// The next inbound 20 ms frame, or `None` when the tunnel closes.
     pub async fn recv_pcm24(&mut self) -> Option<Vec<i16>> {
-        self.inbound_rx.recv().await
+        loop {
+            match self.recv_input().await? {
+                TunnelInput::Audio(pcm) => return Some(pcm),
+                TunnelInput::Control(_) => continue,
+            }
+        }
     }
 
     /// Drop everything queued for sending AND reset the reframer carry (barge-in).
@@ -496,6 +523,18 @@ impl IrohTransport {
 impl aura_engine::AudioTransport for IrohTransport {
     async fn recv_pcm24(&mut self) -> Option<Vec<i16>> {
         self.endpoint.recv_pcm24().await
+    }
+
+    async fn recv_input(&mut self) -> Option<aura_engine::TransportInput> {
+        self.endpoint.recv_input().await.map(|input| match input {
+            TunnelInput::Audio(pcm) => aura_engine::TransportInput::Audio(pcm),
+            TunnelInput::Control(TunnelControl::PttOpen) => {
+                aura_engine::TransportInput::Control(aura_engine::TransportControl::PttOpen)
+            }
+            TunnelInput::Control(TunnelControl::PttClose) => {
+                aura_engine::TransportInput::Control(aura_engine::TransportControl::PttClose)
+            }
+        })
     }
 
     async fn send_pcm24(&mut self, pcm: &[i16]) -> Result<(), aura_engine::TransportError> {

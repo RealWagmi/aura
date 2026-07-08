@@ -118,6 +118,7 @@ impl VoiceProvider for XaiRealtimeProvider {
             key,
             frames,
             truncate_enabled,
+            cfg.manual_turn_detection,
         )
         .await
     }

@@ -41,11 +41,14 @@ Push-to-talk mode:
 ```env
 AURA_INPUT_MODE=push_to_talk
 AURA_PUSH_TO_TALK_HOTKEY=ctrl+space
+AURA_PUSH_TO_TALK_MAX_RECORDING_MS=300000
 ```
 
-In `push_to_talk`, the user presses the hotkey once to start recording, speaks,
-then presses the same hotkey again to send. The server ignores
-`AURA_END_OF_TURN_TIMEOUT_MS` and uses effective timeout `0`.
+In `push_to_talk`, the user presses the hotkey once to start streaming mic audio,
+speaks, then presses the same hotkey again to commit the turn and ask Aura to
+answer. The server uses manual turn detection for PTT and ignores
+`AURA_END_OF_TURN_TIMEOUT_MS`; `AURA_PUSH_TO_TALK_MAX_RECORDING_MS` is only a
+client safety cap for an accidentally open mic.
 
 ## What this is
 

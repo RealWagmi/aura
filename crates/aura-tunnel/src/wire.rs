@@ -19,6 +19,25 @@ pub const TAG_HANDSHAKE: u8 = 0x01;
 pub const TAG_TRANSPORT: u8 = 0x02;
 /// `aura://` scheme prefix.
 const SCHEME: &str = "aura://";
+const CONTROL_PREFIX: &[u8] = b"AURA_CTRL_1";
+const CONTROL_PTT_OPEN: u8 = 1;
+const CONTROL_PTT_CLOSE: u8 = 2;
+
+/// Authenticated in-band control events carried over the same encrypted tunnel
+/// as audio. They are deliberately tiny and never pass through the audio jitter
+/// buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelControl {
+    PttOpen,
+    PttClose,
+}
+
+/// What the server can receive from the client side of the tunnel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TunnelInput {
+    Audio(Vec<i16>),
+    Control(TunnelControl),
+}
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ConnError {
@@ -134,6 +153,26 @@ pub fn decode_transport(body: &[u8]) -> Option<(u64, &[u8])> {
     Some((u64::from_be_bytes(n), &body[8..]))
 }
 
+pub fn encode_tunnel_control(control: TunnelControl) -> Vec<u8> {
+    let code = match control {
+        TunnelControl::PttOpen => CONTROL_PTT_OPEN,
+        TunnelControl::PttClose => CONTROL_PTT_CLOSE,
+    };
+    let mut out = Vec::with_capacity(CONTROL_PREFIX.len() + 1);
+    out.extend_from_slice(CONTROL_PREFIX);
+    out.push(code);
+    out
+}
+
+pub fn decode_tunnel_control(body: &[u8]) -> Option<TunnelControl> {
+    let code = *body.strip_prefix(CONTROL_PREFIX)?.first()?;
+    match code {
+        CONTROL_PTT_OPEN => Some(TunnelControl::PttOpen),
+        CONTROL_PTT_CLOSE => Some(TunnelControl::PttClose),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +248,18 @@ mod tests {
         assert_eq!(nonce, 0x0102_0304_0506_0708);
         assert_eq!(body, ct);
         assert!(decode_transport(&[0, 1, 2]).is_none(), "too short → None");
+    }
+
+    #[test]
+    fn tunnel_control_round_trips() {
+        assert_eq!(
+            decode_tunnel_control(&encode_tunnel_control(TunnelControl::PttOpen)),
+            Some(TunnelControl::PttOpen)
+        );
+        assert_eq!(
+            decode_tunnel_control(&encode_tunnel_control(TunnelControl::PttClose)),
+            Some(TunnelControl::PttClose)
+        );
+        assert_eq!(decode_tunnel_control(b"not-control"), None);
     }
 }

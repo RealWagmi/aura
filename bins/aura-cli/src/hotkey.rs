@@ -15,19 +15,26 @@ pub struct PushToTalkWatcher {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Hotkey {
     keys: Vec<i32>,
+    modifiers: ModifierMask,
     label: String,
 }
 
+type ModifierMask = u8;
+const MOD_CTRL: ModifierMask = 1 << 0;
+const MOD_ALT: ModifierMask = 1 << 1;
+const MOD_SHIFT: ModifierMask = 1 << 2;
+const MOD_WIN: ModifierMask = 1 << 3;
+
 pub fn start_push_to_talk_watcher(raw: &str) -> Result<PushToTalkWatcher, String> {
     let hotkey = parse_hotkey(raw)?;
+    let label = hotkey.label.clone();
     let presses = Arc::new(AtomicU64::new(0));
     let watcher_presses = Arc::clone(&presses);
-    let keys = hotkey.keys.clone();
 
     std::thread::spawn(move || {
         let mut was_pressed = false;
         loop {
-            let pressed = keys.iter().all(|key| is_key_down(*key));
+            let pressed = hotkey.is_pressed_exact();
             if pressed && !was_pressed {
                 watcher_presses.fetch_add(1, Ordering::AcqRel);
             }
@@ -36,10 +43,7 @@ pub fn start_push_to_talk_watcher(raw: &str) -> Result<PushToTalkWatcher, String
         }
     });
 
-    Ok(PushToTalkWatcher {
-        presses,
-        label: hotkey.label,
-    })
+    Ok(PushToTalkWatcher { presses, label })
 }
 
 fn parse_hotkey(raw: &str) -> Result<Hotkey, String> {
@@ -53,43 +57,61 @@ fn parse_hotkey(raw: &str) -> Result<Hotkey, String> {
     }
 
     let mut keys = Vec::with_capacity(parts.len());
+    let mut modifiers = 0;
     let mut labels = Vec::with_capacity(parts.len());
     for part in parts {
-        let (key, label) = parse_key(part)?;
+        let (key, label, modifier) = parse_key(part)?;
         if !keys.contains(&key) {
             keys.push(key);
             labels.push(label);
+        }
+        if let Some(modifier) = modifier {
+            modifiers |= modifier;
         }
     }
 
     Ok(Hotkey {
         keys,
+        modifiers,
         label: labels.join("+"),
     })
 }
 
-fn parse_key(raw: &str) -> Result<(i32, String), String> {
+fn parse_key(raw: &str) -> Result<(i32, String, Option<ModifierMask>), String> {
     let normalized = raw.trim().to_ascii_lowercase();
     let key = match normalized.as_str() {
-        "ctrl" | "control" => (VK_CONTROL as i32, "Ctrl".to_owned()),
-        "lctrl" | "leftctrl" | "left_control" => (VK_LCONTROL as i32, "Left Ctrl".to_owned()),
-        "rctrl" | "rightctrl" | "right_control" => (VK_RCONTROL as i32, "Right Ctrl".to_owned()),
-        "alt" => (VK_MENU as i32, "Alt".to_owned()),
-        "lalt" | "leftalt" | "left_alt" => (VK_LMENU as i32, "Left Alt".to_owned()),
-        "ralt" | "rightalt" | "right_alt" => (VK_RMENU as i32, "Right Alt".to_owned()),
-        "shift" => (VK_SHIFT as i32, "Shift".to_owned()),
-        "lshift" | "leftshift" | "left_shift" => (VK_LSHIFT as i32, "Left Shift".to_owned()),
-        "rshift" | "rightshift" | "right_shift" => (VK_RSHIFT as i32, "Right Shift".to_owned()),
-        "win" | "windows" | "meta" => (VK_LWIN as i32, "Win".to_owned()),
-        "lwin" | "leftwin" | "left_win" => (VK_LWIN as i32, "Left Win".to_owned()),
-        "rwin" | "rightwin" | "right_win" => (VK_RWIN as i32, "Right Win".to_owned()),
-        "space" => (VK_SPACE as i32, "Space".to_owned()),
+        "ctrl" | "control" => (VK_CONTROL as i32, "Ctrl".to_owned(), Some(MOD_CTRL)),
+        "lctrl" | "leftctrl" | "left_control" => {
+            (VK_LCONTROL as i32, "Left Ctrl".to_owned(), Some(MOD_CTRL))
+        }
+        "rctrl" | "rightctrl" | "right_control" => {
+            (VK_RCONTROL as i32, "Right Ctrl".to_owned(), Some(MOD_CTRL))
+        }
+        "alt" => (VK_MENU as i32, "Alt".to_owned(), Some(MOD_ALT)),
+        "lalt" | "leftalt" | "left_alt" => (VK_LMENU as i32, "Left Alt".to_owned(), Some(MOD_ALT)),
+        "ralt" | "rightalt" | "right_alt" => {
+            (VK_RMENU as i32, "Right Alt".to_owned(), Some(MOD_ALT))
+        }
+        "shift" => (VK_SHIFT as i32, "Shift".to_owned(), Some(MOD_SHIFT)),
+        "lshift" | "leftshift" | "left_shift" => {
+            (VK_LSHIFT as i32, "Left Shift".to_owned(), Some(MOD_SHIFT))
+        }
+        "rshift" | "rightshift" | "right_shift" => {
+            (VK_RSHIFT as i32, "Right Shift".to_owned(), Some(MOD_SHIFT))
+        }
+        "win" | "windows" | "meta" => (VK_LWIN as i32, "Win".to_owned(), Some(MOD_WIN)),
+        "lwin" | "leftwin" | "left_win" => (VK_LWIN as i32, "Left Win".to_owned(), Some(MOD_WIN)),
+        "rwin" | "rightwin" | "right_win" => {
+            (VK_RWIN as i32, "Right Win".to_owned(), Some(MOD_WIN))
+        }
+        "space" => (VK_SPACE as i32, "Space".to_owned(), None),
         key if key.len() == 1 => {
             let ch = key.chars().next().expect("single-char key");
             if ch.is_ascii_alphanumeric() {
                 (
                     ch.to_ascii_uppercase() as i32,
                     ch.to_ascii_uppercase().to_string(),
+                    None,
                 )
             } else {
                 return Err(format!("unsupported hotkey key {raw:?}"));
@@ -104,21 +126,53 @@ fn is_key_down(key: i32) -> bool {
     unsafe { (GetAsyncKeyState(key) & 0x8000u16 as i16) != 0 }
 }
 
+impl Hotkey {
+    fn is_pressed_exact(&self) -> bool {
+        self.keys.iter().all(|key| is_key_down(*key))
+            && modifier_is_exact(
+                self.modifiers,
+                MOD_CTRL,
+                [VK_LCONTROL as i32, VK_RCONTROL as i32],
+            )
+            && modifier_is_exact(self.modifiers, MOD_ALT, [VK_LMENU as i32, VK_RMENU as i32])
+            && modifier_is_exact(
+                self.modifiers,
+                MOD_SHIFT,
+                [VK_LSHIFT as i32, VK_RSHIFT as i32],
+            )
+            && modifier_is_exact(self.modifiers, MOD_WIN, [VK_LWIN as i32, VK_RWIN as i32])
+    }
+}
+
+fn modifier_is_exact(required: ModifierMask, modifier: ModifierMask, keys: [i32; 2]) -> bool {
+    let required = (required & modifier) != 0;
+    let down = keys.iter().any(|key| is_key_down(*key));
+    required == down
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_hotkey;
+    use super::{parse_hotkey, MOD_ALT, MOD_CTRL, MOD_SHIFT};
 
     #[test]
     fn parses_default_hotkey() {
         let hotkey = parse_hotkey("ctrl+space").expect("hotkey");
         assert_eq!(hotkey.label, "Ctrl+Space");
         assert_eq!(hotkey.keys.len(), 2);
+        assert_eq!(hotkey.modifiers, MOD_CTRL);
     }
 
     #[test]
     fn parses_letter_hotkey() {
         let hotkey = parse_hotkey("alt+a").expect("hotkey");
         assert_eq!(hotkey.label, "Alt+A");
+        assert_eq!(hotkey.modifiers, MOD_ALT);
+    }
+
+    #[test]
+    fn tracks_exact_modifier_families() {
+        let hotkey = parse_hotkey("ctrl+shift+space").expect("hotkey");
+        assert_eq!(hotkey.modifiers, MOD_CTRL | MOD_SHIFT);
     }
 
     #[test]

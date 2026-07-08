@@ -44,6 +44,7 @@ pub(crate) async fn connect_realtime(
     key: Zeroizing<String>,
     handshake_frames: Vec<Value>,
     truncate_enabled: bool,
+    manual_turn_detection: bool,
 ) -> Result<(Box<dyn VoiceSink>, Box<dyn VoiceStream>), VoiceError> {
     ensure_crypto_provider();
     wire::validate_realtime_url_for(url, allowed_host).map_err(|e| match e {
@@ -79,6 +80,7 @@ pub(crate) async fn connect_realtime(
         Box::new(RealtimeSink {
             write,
             truncate_enabled,
+            manual_turn_detection,
         }),
         Box::new(RealtimeStream { read }),
     ))
@@ -118,6 +120,7 @@ struct RealtimeSink {
     /// Whether this provider supports `conversation.item.truncate` (see
     /// [`connect_realtime`]).
     truncate_enabled: bool,
+    manual_turn_detection: bool,
 }
 
 impl RealtimeSink {
@@ -173,6 +176,14 @@ impl VoiceSink for RealtimeSink {
     }
 
     async fn request_response(&mut self) -> Result<(), VoiceError> {
+        self.send(wire::response_create_event()).await
+    }
+
+    async fn commit_user_turn(&mut self) -> Result<(), VoiceError> {
+        if !self.manual_turn_detection {
+            return self.request_response().await;
+        }
+        self.send(wire::input_audio_buffer_commit_event()).await?;
         self.send(wire::response_create_event()).await
     }
 

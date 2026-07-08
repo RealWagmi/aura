@@ -4,6 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 > **Language policy:** all code, comments, and docs are written in **English**.
 
+## Windows Push-To-Talk Notes
+
+For Windows push-to-talk calls:
+
+```env
+AURA_INPUT_MODE=push_to_talk
+AURA_PUSH_TO_TALK_HOTKEY=ctrl+space
+AURA_PUSH_TO_TALK_MAX_RECORDING_MS=300000
+```
+
+The user presses the hotkey once to start streaming mic audio, speaks, then
+presses the same hotkey again to commit the turn and ask Aura to answer. The
+server uses manual turn detection for PTT and ignores
+`AURA_END_OF_TURN_TIMEOUT_MS`; `AURA_PUSH_TO_TALK_MAX_RECORDING_MS` is only a
+client safety cap for an accidentally open mic.
+
 ## What this is
 
 **aura** — voice calls for AI chats: a user types "call me" in a chat with an AI agent → gets a realtime voice call with a model that already knows the conversation context. Voice is a realtime audio-native model (xAI Grok voice or OpenAI `gpt-realtime-2.1`, picked by which BYOK key the user provides), **direct audio, no STT/TTS**. Two modes: **LOCAL** (mic ↔ model on one device; the server runs on `127.0.0.1`) and **REMOTE** (a native thin client ↔ Rust server on a VPS over a dedicated **Noise (NNpsk0) tunnel over UDP**; the server bridges to the model). The per-call session secret travels over the same chat/gateway the user already uses; no domain, no TLS cert, no NAT-traversal servers. **No intermediary broker.** All-Rust, cross-platform (Linux/Windows/macOS).

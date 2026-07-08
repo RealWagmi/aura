@@ -100,7 +100,15 @@ impl VoiceProvider for OpenAiRealtimeProvider {
         // truncate_enabled: GA documents (and on WS effectively requires)
         // `conversation.item.truncate` on barge-in — without it the model's
         // conversation state keeps the unheard tail of a cancelled response.
-        connect_realtime(&url, wire::DIRECT_OPENAI_ALLOWED_HOST, key, frames, true).await
+        connect_realtime(
+            &url,
+            wire::DIRECT_OPENAI_ALLOWED_HOST,
+            key,
+            frames,
+            true,
+            cfg.manual_turn_detection,
+        )
+        .await
     }
 }
 

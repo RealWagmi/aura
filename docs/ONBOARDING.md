@@ -615,15 +615,20 @@ The server is env-driven (no config file is loaded); the skill launches it and
   working directory. If that directory is inside a git worktree, Aura
   best-effort adds `.aura` to its `.gitignore`.
 - `AURA_END_OF_TURN_TIMEOUT_MS=<ms>` — how much silence to wait before Aura
-  treats the user's turn as complete and starts answering. Use a larger value
-  when Aura interrupts pauses too quickly; practical values are `1500`, `2000`,
-  or `2500`. The provider clamps this to `300..3000` ms. If
-  `AURA_INPUT_MODE=push_to_talk`, Aura ignores this value and uses `0`.
+  treats the user's turn as complete and starts answering in `voice` mode. Use a
+  larger value when Aura interrupts pauses too quickly; practical values are
+  `1500`, `2000`, or `2500`. The provider clamps this to `300..3000` ms. In
+  `push_to_talk` mode, Aura uses manual turn commit instead and ignores this
+  value.
 - `AURA_INPUT_MODE=push_to_talk` — on Windows, use a global hotkey instead of
-  normal voice activation. Press the hotkey once to start recording, then press
-  it again to send the recorded voice to Aura. Default mode is `voice`.
+  normal voice activation. Press the hotkey once to start sending mic audio,
+  then press it again to commit the turn and ask Aura to answer. Default mode is
+  `voice`.
 - `AURA_PUSH_TO_TALK_HOTKEY=ctrl+space` — Windows global toggle hotkey for
   `push_to_talk` mode. It works even when another app has focus.
+- `AURA_PUSH_TO_TALK_MAX_RECORDING_MS=300000` — client safety cap for an
+  accidentally open push-to-talk mic. Three seconds before the cap, Aura warns
+  the user that the voice message limit is near.
 - `AURA_FEEDER=1` — opt in to the live ambient-context feeder (needs `claude` on `PATH`).
 
 ---

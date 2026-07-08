@@ -236,6 +236,10 @@ pub fn input_audio_buffer_append_event(audio_base64: &str) -> Value {
     json!({"type": "input_audio_buffer.append", "audio": audio_base64})
 }
 
+pub fn input_audio_buffer_commit_event() -> Value {
+    json!({"type": "input_audio_buffer.commit"})
+}
+
 pub fn user_text_message_event(text: &str) -> Value {
     json!({
         "type": "conversation.item.create",
@@ -311,8 +315,11 @@ fn turn_detection_from_latency(latency_target_ms: u64, silence_override_ms: Opti
 /// Build the xAI `session.update` frame from a [`VoiceSessionConfig`].
 /// Top-level `voice` / `turn_detection` / `temperature`; PCM16 @ 24k both ways.
 pub fn xai_session_update_event(cfg: &VoiceSessionConfig) -> Value {
-    let turn_detection =
-        turn_detection_from_latency(cfg.latency_target_ms, cfg.end_of_turn_timeout_ms);
+    let turn_detection = if cfg.manual_turn_detection {
+        Value::Null
+    } else {
+        turn_detection_from_latency(cfg.latency_target_ms, cfg.end_of_turn_timeout_ms)
+    };
     let mut session = json!({
         "voice": cfg.voice,
         "instructions": cfg.instructions,
@@ -348,8 +355,11 @@ pub fn xai_session_update_event(cfg: &VoiceSessionConfig) -> Value {
 /// recommendation for `gpt-realtime-2.1`; the mini model is raised to
 /// `medium` to compensate for the smaller model.
 pub fn openai_session_update_event(cfg: &VoiceSessionConfig, model: &str) -> Value {
-    let turn_detection =
-        turn_detection_from_latency(cfg.latency_target_ms, cfg.end_of_turn_timeout_ms);
+    let turn_detection = if cfg.manual_turn_detection {
+        Value::Null
+    } else {
+        turn_detection_from_latency(cfg.latency_target_ms, cfg.end_of_turn_timeout_ms)
+    };
     let mut transcription = json!({"model": "whisper-1"});
     if let Some(lang) = &cfg.transcription_language {
         transcription["language"] = json!(lang);
@@ -455,6 +465,7 @@ mod tests {
             latency_target_ms: 800,
             temperature: Some(0.5),
             end_of_turn_timeout_ms: None,
+            manual_turn_detection: false,
             output_speed: None,
             cold_start_kick: true,
             transcription_language: None,
@@ -546,6 +557,23 @@ mod tests {
         cfg.end_of_turn_timeout_ms = Some(0);
         let v = xai_session_update_event(&cfg);
         assert_eq!(v["session"]["turn_detection"]["silence_duration_ms"], 0);
+    }
+
+    #[test]
+    fn manual_turn_detection_disables_vad_for_push_to_talk() {
+        let mut cfg = cfg();
+        cfg.manual_turn_detection = true;
+        let xai = xai_session_update_event(&cfg);
+        assert!(xai["session"]["turn_detection"].is_null());
+
+        let openai = openai_session_update_event(&cfg, OPENAI_DEFAULT_MODEL);
+        assert!(openai["session"]["audio"]["input"]["turn_detection"].is_null());
+    }
+
+    #[test]
+    fn commit_event_shape() {
+        let v = input_audio_buffer_commit_event();
+        assert_eq!(v["type"], "input_audio_buffer.commit");
     }
 
     #[test]

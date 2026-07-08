@@ -410,7 +410,7 @@ if ($BuildServer) {
     Write-Note 'up. Continue with docs/ONBOARDING.md in this same session:'
     Write-Note '    * store the xAI key (BYOK)                  - onboarding step 3'
     Write-Note '    * (REMOTE only) open the one UDP port, once - onboarding step 4'
-    Write-Note '    * drop the host skill (skills/SKILL.md)     - onboarding step 5'
+    Write-Note '    * drop the Windows host skill (skills/SKILL_WINDOWS.md) - onboarding step 5'
     Write-Note 'The aura-call / aura-call-status / aura-inbox helpers are on your PATH'
     Write-Note '(POSIX shell; run the host under git-bash/WSL on Windows). The host launches'
     Write-Note 'aura-server per call; it needs XAI_API_KEY or OPENAI_API_KEY in its'
@@ -422,7 +422,7 @@ if ($BuildServer) {
         Write-Host 'UPDATE detected - refresh the host skill.' -ForegroundColor Yellow
         Write-Note '*** AI AGENT: the skill may have changed in this release, and the copy in'
         Write-Note 'YOUR skills directory is NOT updated automatically. Re-copy it NOW: ***'
-        Write-Note "    Copy-Item '$RepoRoot\skills\SKILL.md' `"$env:USERPROFILE\.claude\skills\voice-call\SKILL.md`""
+        Write-Note "    Copy-Item '$RepoRoot\skills\SKILL_WINDOWS.md' `"$env:USERPROFILE\.claude\skills\voice-call\SKILL.md`""
         Write-Note '(substitute your framework''s skills dir if not Claude Code), then re-read it'
         Write-Note 'before the next call. The onboarding config (key, port) needs NO redo.'
     }
