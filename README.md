@@ -42,10 +42,11 @@ flowchart LR
 
 ### 3. Remote call when the server is behind NAT/CGNAT (iroh)
 
-When the server has no openable port, `AURA_TRANSPORT=iroh` switches the
-transport to an iroh QUIC P2P link (hole-punching, with a blind encrypted relay
-as fallback). **Noise NNpsk0 still runs _inside_ the iroh stream**, so the relay
-only ever sees ciphertext and is used for fallback only.
+When the server has no openable port (no reachable public host is configured), it
+uses an iroh QUIC P2P link automatically (hole-punching, with a blind encrypted
+relay as fallback); `AURA_TRANSPORT=iroh` forces it explicitly. **Noise NNpsk0
+still runs _inside_ the iroh stream**, so the relay only ever sees ciphertext and
+is used for fallback only.
 
 ```mermaid
 flowchart LR

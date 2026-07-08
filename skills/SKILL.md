@@ -16,6 +16,11 @@ allowed-tools: Bash
 
 # Aura voice call — universal host skill
 
+> **Windows only:** read `SKILL_WINDOWS.md` (same `voice-call/` dir) **BEFORE**
+> this flow — it lists the Windows deltas (helpers run under Git Bash/WSL,
+> PowerShell client launch, install, audio). The call flow below is otherwise the
+> same.
+
 ## ⚠️ Read first — the two ways calls silently break
 
 1. **Do not run this flow from memory.** Onboarding installed aura; it did NOT
@@ -61,11 +66,14 @@ running. Pass `--host <kind>` so host resolution is deterministic:
 ```bash
 # LOCAL (binds 127.0.0.1):
 conn="$(aura-call local --host <kind>)"
-# REMOTE (clients dial the VPS public IP):
-conn="$(aura-call remote <VPS_PUBLIC_IP> --host <kind>)"
-# REMOTE behind NAT (AURA_TRANSPORT=iroh was set at onboarding) — no public IP needed:
+# REMOTE (the server auto-picks the transport — see below):
 conn="$(aura-call remote --host <kind>)"
 ```
+
+The transport is resolved by the server: direct UDP if a reachable
+`AURA_PUBLIC_HOST` is configured (persisted in the aura `.env` for a VPS), else
+iroh. To force direct to a specific address, pass it: `aura-call remote <host>
+--host <kind>`.
 
 `<kind>` = `claude` | `codex` | `hermes` | `openclaw` (the host you are — see the
 table). `conn` holds one line; the secret is the `#k=` fragment, single-use, ~120 s.

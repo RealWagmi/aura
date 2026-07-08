@@ -20,7 +20,7 @@ is itself the call endpoint.
 1. **Detect OS + arch + decide LOCAL vs REMOTE** — from the environment → Step 0
 2. **Install the binaries** (`install_bin.sh --server`) — downloads + verifies + puts on PATH → Step 1
 3. **Choose the voice provider + get the API key** — the ONE time you stop and ask the user → Step 2
-4. **(REMOTE only) NAT check first**, then open the UDP port once (`aura-open-port`) — or, behind NAT, set `AURA_TRANSPORT=iroh` and open nothing; LOCAL → skip → Step 3
+4. **(REMOTE only) transport** — run the NAT check, then let it choose: a reachable public VPS → open the UDP port once (`aura-open-port`) and persist `AURA_PUBLIC_HOST` (the server auto-selects **direct**); behind NAT/CGNAT → persist nothing, the server falls back to **iroh**; LOCAL → skip → Step 3
 5. **Drop the host skill** into your framework's skills dir → Step 4
 6. **Set your framework to auto-approve** the orchestrator's tool calls + raise the budget → Step 4b
 7. **Self-check** — verify binaries, key, port, skill, framework prep BEFORE you report done → Step 5
@@ -128,6 +128,15 @@ printf 'AURA_VOICE_MODEL=gpt-realtime-2.1-mini\n' >> ~/.config/aura/.env   # min
 printf 'AURA_TRANSCRIBE_LANG=ru\n' >> ~/.config/aura/.env                  # optional, e.g. Russian
 ```
 
+Verify the key file is present and owner-only, **without printing its contents**:
+
+```bash
+f=~/.config/aura/.env
+test -f "$f" && [ "$(stat -c '%a' "$f" 2>/dev/null || stat -f '%Lp' "$f")" = "600" ] \
+  && echo "$f present and 0600: OK"
+```
+(`stat -c` is GNU/Linux; `stat -f '%Lp'` is macOS/BSD — the line tries both.)
+
 **Never** run `echo "$XAI_API_KEY"`, never put the key on a command line, and
 never write it anywhere but a `0600` `.env` (or the keychain). On macOS/Windows
 you may instead store it in the OS keychain (service `aura`, entry named like
@@ -135,11 +144,12 @@ the env var).
 
 ---
 
-## Step 3 — (REMOTE only) NAT check, then open the port OR choose iroh
+## Step 3 — (REMOTE only) transport: detect reachability, prefer direct, fall back to iroh
 
 A LOCAL call binds loopback and needs **no** open port — **skip this step**.
-For a REMOTE server, first determine whether the machine is directly reachable
-— do NOT open a firewall port before knowing this:
+For a REMOTE server the NAT check auto-selects the transport; the server picks
+**direct** if a reachable `AURA_PUBLIC_HOST` is persisted, else **iroh**. Do NOT
+open a firewall port before the check:
 
 **3a. NAT check (do not skip).** Compare the machine's interface IPs with its
 public IP:
@@ -151,28 +161,30 @@ case " $(echo $LOCAL_IPS) " in
   *)                echo "BEHIND NAT: no interface has $PUBLIC_IP (local: $(echo $LOCAL_IPS))" ;;
 esac
 ```
-- **DIRECT** (typical VPS) → continue with 3b + 3c below; `AURA_PUBLIC_HOST=$PUBLIC_IP`.
+- **DIRECT** (typical VPS) → continue with 3b + 3c below for the direct path.
 - **BEHIND NAT** (home server, VM with a private 10.x/192.168.x address) —
   opening the OS firewall would be useless; pick ONE of:
-  1. **iroh transport (recommended — zero network config).** Persist it next to
-     the key and **skip 3b/3c entirely**:
-     ```bash
-     printf 'AURA_TRANSPORT=iroh\n' >> ~/.config/aura/.env
-     ```
-     iroh hole-punches through NAT (blind encrypted relay as fallback); the
-     connection string then carries a node id instead of `host:port`
-     (`aura://<node-id>#k=...&t=iroh`), and `aura-call remote` needs **no**
-     public host argument. No port is ever opened.
+  1. **iroh (the automatic fallback — zero network config).** Persist **no**
+     `AURA_PUBLIC_HOST` and **skip 3b/3c**: with none configured the server
+     selects iroh for a `aura-call remote` call. iroh hole-punches through NAT
+     (blind encrypted relay as fallback); no port is ever opened.
   2. **Router port-forwarding** — only if the user controls the router AND has a
      real public IP on it: forward WAN UDP 47821 → this machine's LAN IP, use
-     the router's WAN IP as `AURA_PUBLIC_HOST`, then do 3b + 3c. **CGNAT** (the
+     the router's WAN IP as `AURA_PUBLIC_HOST` (do 3b + 3c). **CGNAT** (the
      router's WAN address is itself private / differs from `$PUBLIC_IP`) makes
      inbound impossible — use option 1.
 
-**3b. (DIRECT only)** Use the public address found above as `AURA_PUBLIC_HOST`
-when launching.
+**3b. (DIRECT only) Persist `AURA_PUBLIC_HOST`** so every later call reuses it and
+the server auto-selects direct. Replace any prior line (the server takes the
+FIRST `AURA_PUBLIC_HOST`); write a bare value — no quotes, no `export`:
+```bash
+mkdir -p ~/.config/aura; f=~/.config/aura/.env; touch "$f"; chmod 600 "$f"
+{ grep -v '^AURA_PUBLIC_HOST=' "$f" 2>/dev/null; printf 'AURA_PUBLIC_HOST=%s\n' "$PUBLIC_IP"; } > "$f.tmp"
+chmod 600 "$f.tmp"; mv "$f.tmp" "$f"
+```
+(Use the user's preferred DNS name instead of the IP if they have one.)
 
-**3c. (DIRECT only)** Open the port with the bundled helper (now on your PATH):
+**3c. (DIRECT only) Open the port** with the bundled helper (now on your PATH):
 ```bash
 aura-open-port            # opens UDP 47821 (or: aura-open-port <PORT>)
 ```
@@ -274,20 +286,18 @@ Any unchecked box → go back to that step. Only when all pass, continue to Step
 
 ---
 
-## Step 6 — Tell the user how to start a call
+## Step 6 — Hand off to the skill and tell the user how to call
 
-**And a rule for YOU, the agent:** when the user later asks for a call, OPEN
-AND FOLLOW the skill you installed in Step 4 — do not run the call flow from
-onboarding memory. Onboarding taught you to INSTALL; the skill teaches you to
-CALL (they are different procedures, and the skill's Step 4.1 check is what
-prevents the most common silent failure).
+Onboarding sets up the server; **the skill runs the call.** When the user later
+asks for a call, OPEN AND FOLLOW the skill you installed in Step 4 — do not run a
+call from onboarding memory. Onboarding taught you to INSTALL; the skill owns the
+call protocol (launch, connection string, connect, orchestrate, recap) and its
+Step 4.1 check prevents the most common silent failure.
 
-Explain in plain language: *"To start a call, say 'call me' (or use the host's
-command) in your chat. I'll launch the voice server; you'll either be connected
-automatically (local) or I'll send you a one-line `AURA_CONNECT=... aura-cli`
-command to paste on your machine (remote)."* The connection string's secret is
-single-use and valid ~120 s. After the call the server posts a short recap of the
-conversation back into the chat.
+Tell the user in plain language: *"To start a call, say 'call me' (or use the
+host's command) in your chat. I'll launch the voice server; you'll either be
+connected automatically (local) or I'll send you a one-line `AURA_CONNECT=...
+aura-cli` command to paste on your machine (remote)."*
 
 For a REMOTE call the user needs `aura-cli` on **their own** machine — they get it
 the same way, client-only:
@@ -302,5 +312,5 @@ curl -fsSL https://raw.githubusercontent.com/RealWagmi/aura/main/install_bin.sh 
 - **"no prebuilt binary for this platform".** Your OS/arch isn't published (Windows, or an unusual arch). Build from source: `docs/ONBOARDING.md` (or the command the installer printed).
 - **SHA-256 mismatch.** The installer aborts on purpose — do not work around it. Re-run (a partial download), and if it persists, report it; do not install an unverified binary.
 - **`aura-server` exits immediately with `no BYOK key found` (or `no BYOK xAI/OpenAI key found`).** The key didn't resolve — re-do Step 2 (is `~/.config/aura/.env` present with a `XAI_API_KEY=...` / `OPENAI_API_KEY=...` line and `0600`?). Never print the key to debug it.
-- **Client can't reach a REMOTE server.** The UDP port is almost always blocked **outside** the VM by the cloud security group / NAT — add an inbound UDP 47821 rule there. Confirm `AURA_PUBLIC_HOST` is the reachable public IP/DNS. If the server sits behind NAT/CGNAT (Step 3a says BEHIND NAT), switch to `AURA_TRANSPORT=iroh` instead of fighting the firewall.
+- **Client can't reach a REMOTE server.** The UDP port is almost always blocked **outside** the VM by the cloud security group / NAT — add an inbound UDP 47821 rule there. Confirm `AURA_PUBLIC_HOST` is the reachable public IP/DNS. If the server sits behind NAT/CGNAT (Step 3a says BEHIND NAT), persist no `AURA_PUBLIC_HOST` so the server uses iroh instead of fighting the firewall.
 - **`aura-server` / `aura-cli` not found after install.** `~/.local/bin` is not on `PATH` yet — restart the shell or `source` your rc, or use the full path.

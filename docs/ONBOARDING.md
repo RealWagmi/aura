@@ -21,7 +21,7 @@ You are the AI setting up the server. Read this whole file first, then execute:
 2. **Clone the repo** into a stable working dir (`~/aura`) → Step 1
 3. **Build + install the server** (`./install.sh --server`) — this also puts `aura-call` / `aura-call-status` on PATH → Step 2
 4. **Choose the voice provider + get the API key** — the ONE time you stop and ask the user → Step 3
-5. **(REMOTE only) NAT check first**, then open the UDP port once (`scripts/aura-open-port.sh`) — or, behind NAT, set `AURA_TRANSPORT=iroh` and open nothing; LOCAL → skip → Step 4
+5. **(REMOTE only) transport** — run the NAT check, then let it choose: a reachable public VPS → open the UDP port once (`scripts/aura-open-port.sh`) and use **direct UDP** (lower latency, no broker); behind NAT/CGNAT → **iroh** automatically, open nothing; LOCAL → skip → Step 4
 6. **Copy the skill** `skills/SKILL.md` into your framework's skills dir (`mkdir -p` first) → Step 5
 7. **Set your framework to auto-approve** the orchestrator's tool calls + raise the turn/timeout budget → Step 5b
 8. **Self-check** — verify binaries, key, port, skill, framework prep BEFORE you report done → Step 6
@@ -36,7 +36,6 @@ You are the AI setting up the server. Read this whole file first, then execute:
 - ❌ **Echoing, printing, or logging the API key or the session secret**, or putting either on a command line (`argv` is visible in `ps`).
 - ❌ **Opening the firewall per call.** The UDP port is opened ONCE at Step 4 and never touched again.
 - ❌ **Asking the user where the skill goes.** You know your own skills directory — copy `SKILL.md` there yourself (`mkdir -p` the directory first).
-- ❌ **Pasting the connection string anywhere public.** For REMOTE it goes only to the one user over the existing chat; it is single-use and ~120 s.
 - ❌ **Continuing past a failed step.** On any failure: stop, tell the user exactly what failed and the fix, do not proceed.
 
 ## When to ask the user (the ONLY interactive points)
@@ -44,7 +43,7 @@ You are the AI setting up the server. Read this whole file first, then execute:
 - **Proceed autonomously** — OS detection, the mode decision (when it is clear), cloning, building, installing, copying the skill, opening the port when you have root, and every verification. Report what you did in plain language; do not ask permission for these.
 - **Ask the user — only these:**
   1. **The API key** — which provider and the key itself (Step 3); BYOK, you cannot proceed without it.
-  2. **LOCAL or REMOTE** (Step 0) — *only* if you genuinely cannot tell from the environment.
+  2. **LOCAL or REMOTE** (Step 0) — _only_ if you genuinely cannot tell from the environment.
   3. **Run the `sudo` firewall commands** (Step 4) — only when you lack root; you print the exact commands and the user runs them.
 - **Never** sign in, paste the key, or change anything outside this machine on the user's behalf.
 
@@ -67,12 +66,11 @@ installs `aura-cli` too.
 - **Never echo, print, or log the API key or the session secret.** Never
   place either on a command line (`argv`) — anything on a command line is
   visible in `ps`. The key lives only in the environment, the OS keychain, or a
-  `chmod 600` `./.env` file. The session secret travels only inside the
+  `chmod 600` aura `.env` (`~/.config/aura/.env`). The session secret travels only inside the
   connection string via the `AURA_CONNECT` environment variable or stdin.
 - **One predictable UDP port, opened once.** The tunnel uses a fixed port
   (default **47821**). For a REMOTE server you open it **once** at onboarding
   (step 4), **never per call**.
-- **English only.** All output and any file you write is English.
 - **No silent failure.** If a step fails, stop, tell the user exactly what
   failed and how to fix it, and do not continue to a later step.
 
@@ -95,7 +93,7 @@ Decide the **call mode** for this server up front:
   over loopback (`127.0.0.1`). Steps 1–6 apply **except step 4** (no firewall:
   loopback is never exposed).
 
-A quick heuristic: if you are on a cloud VM / SSH host that the user is *not*
+A quick heuristic: if you are on a cloud VM / SSH host that the user is _not_
 sitting at, treat it as **REMOTE**. If the host is the user's personal
 workstation, treat it as **LOCAL**. When unsure, ask the user one question:
 "Is this server on your own machine (local) or on a remote/VPS host?"
@@ -116,9 +114,9 @@ command -v curl   || echo "curl missing — install it for downloads / IP lookup
 > cloned the repo to `~/aura` and built the server for you — Steps 1–2 are done.
 > `cd ~/aura` and continue from **Step 3**. Otherwise, do Steps 1–2 below.
 
-Pick a stable working directory the server will run from (this is also where the
-`./.env` key file and any `.aura/` callback files live). `~/aura` is a good
-default.
+Pick a stable working directory the server will run from (its `.aura/` callback
+files live here; the key itself goes in the global `~/.config/aura/.env` — step
+3). `~/aura` is a good default.
 
 ```bash
 # If you already have the repo, skip the clone and just cd into it.
@@ -185,11 +183,11 @@ re-run `./install.sh --server`.
 providers. **Ask the user which API key they can provide** — this is where you
 stop for input. Offer exactly these options:
 
-| Choice | Key to provide | Voice model | Cost ballpark |
-|---|---|---|---|
-| **xAI Grok** | `XAI_API_KEY` | `grok-voice-think-fast-1.0` | flat **$0.05/min** — predictable |
-| **OpenAI** | `OPENAI_API_KEY` | `gpt-realtime-2.1` | token-billed, ≈$0.05–0.10/min — smartest, 128k context |
-| **OpenAI mini** | `OPENAI_API_KEY` | `gpt-realtime-2.1-mini` | token-billed, ≈$0.02–0.04/min — cheapest |
+| Choice          | Key to provide   | Voice model                 | Cost ballpark                                          |
+| --------------- | ---------------- | --------------------------- | ------------------------------------------------------ |
+| **xAI Grok**    | `XAI_API_KEY`    | `grok-voice-think-fast-1.0` | flat **$0.05/min** — predictable                       |
+| **OpenAI**      | `OPENAI_API_KEY` | `gpt-realtime-2.1`          | token-billed, ≈$0.05–0.10/min — smartest, 128k context |
+| **OpenAI mini** | `OPENAI_API_KEY` | `gpt-realtime-2.1-mini`     | token-billed, ≈$0.02–0.04/min — cheapest               |
 
 The server auto-picks the provider by which key it finds (xAI wins when both
 are present). To pin it explicitly, add `AURA_VOICE_PROVIDER=xai|openai` to the
@@ -215,7 +213,7 @@ by how the server runs.
 **Recommended — a user-global `~/.config/aura/.env`.** The host (e.g. Claude
 Code) launches the server from whatever directory it is in, so a key tied to one
 project directory may not be found. The global file is read **regardless of the
-launch directory**, so it is the safe default. Create it owner-only *first*, then
+launch directory**, so it is the safe default. Create it owner-only _first_, then
 have the user paste the key so it never appears in your transcript or shell history:
 
 ```bash
@@ -267,25 +265,20 @@ never write it anywhere but a `0600` `.env` (or the keychain).
 
 ---
 
-## Step 4 — (REMOTE only) NAT check, then open the port OR choose iroh
+## Step 4 — (REMOTE only) transport: detect reachability, prefer direct UDP, fall back to iroh
 
-A LOCAL call binds loopback (`127.0.0.1`) and needs **no** open port — loopback is
-never exposed and never touches the firewall. Only a REMOTE call needs the UDP
-port reachable. **Use the mode you already decided in Step 0 — do not re-ask the
-user:**
+A LOCAL call binds loopback and needs no open port. A REMOTE call picks its
+transport from a one-time reachability check — **do not re-ask the user:**
 
-- **LOCAL → skip 4a–4c entirely.** Open no port. Tell the user once: "No
-  firewall port was opened — local calls don't need one. To allow remote calls
-  later, run `scripts/aura-open-port.sh` once (and, on a cloud host, also add an
-  inbound UDP 47821 rule in your provider's security group / NAT)." Continue to
-  Step 5.
-- **REMOTE → run the NAT check (4a) FIRST**, then either open the port once
-  (4b + 4c) or switch to the iroh transport and open nothing. One-time action;
-  you never touch the firewall again on later calls.
+- **LOCAL → skip 4a–4c.** Open no port. Continue to Step 5.
+- **REMOTE → run the NAT check (4a) FIRST, then:** a reachable public IP (a VPS) → open
+  the port (4b + 4c) and persist `AURA_PUBLIC_HOST` to the aura `.env` — the
+  server reads it back and auto-selects **direct UDP** (lowest latency, no third
+  party); behind NAT/CGNAT → persist nothing, the server falls back to **iroh**.
 
-**4a. NAT check (do not skip).** A REMOTE machine behind NAT (home server, a VM
-with a private 10.x/192.168.x address) cannot accept direct inbound UDP no
-matter what the OS firewall says — detect this BEFORE opening anything:
+**4a. NAT check (do not skip).** A REMOTE machine behind NAT (private 10.x/192.168.x address)
+cannot accept direct inbound UDP whatever the OS firewall says — run this BEFORE
+opening anything:
 
 ```bash
 PUBLIC_IP="$(curl -fsS ifconfig.me || curl -fsS https://api.ipify.org)"; echo "public IP = $PUBLIC_IP"
@@ -298,15 +291,11 @@ esac
 
 - **DIRECT** (typical VPS) → continue with 4b + 4c.
 - **BEHIND NAT** → pick ONE:
-  1. **iroh transport (recommended — zero network config).** Persist it in the
-     same `./.env` that holds the key (Step 3), then **skip 4b/4c**:
-     ```bash
-     printf 'AURA_TRANSPORT=iroh\n' >> ./.env
-     ```
-     iroh hole-punches through NAT (blind encrypted relay as fallback); the
-     connection string then carries a node id instead of `host:port`
-     (`aura://<node-id>#k=...&t=iroh`) and `aura-call remote` needs **no**
-     public host argument. No port is ever opened.
+  1. **iroh transport (the automatic fallback — zero network config).** Do
+     nothing here and **skip 4b/4c**: with no `AURA_PUBLIC_HOST` persisted, the
+     server selects iroh automatically for a `aura-call remote` call — no `.env`
+     edit and no port opened. iroh hole-punches through NAT (blind encrypted relay
+     as fallback).
   2. **Router port-forwarding** — only if the user controls the router AND it
      has a real public WAN IP: forward WAN UDP 47821 → this machine's LAN IP,
      use the router's WAN IP as `AURA_PUBLIC_HOST`, then do 4b + 4c. Under
@@ -318,12 +307,20 @@ esac
 server to bind all interfaces (a non-loopback value) instead of loopback-only —
 you already have it from 4a:
 
+Persist it to the aura `.env` so every later call reuses it with no argument — the
+server reads it back and auto-selects direct. Replace any prior line rather than
+appending (the server takes the FIRST `AURA_PUBLIC_HOST`, so a stale duplicate
+would win); use the user's preferred DNS name instead of the IP if they have one:
+
 ```bash
-echo "public IP = ${PUBLIC_IP}"
-# You will pass AURA_PUBLIC_HOST=${PUBLIC_IP} when you launch the server (step 7).
+mkdir -p ~/.config/aura; f=~/.config/aura/.env; touch "$f"; chmod 600 "$f"
+{ grep -v '^AURA_PUBLIC_HOST=' "$f" 2>/dev/null; printf 'AURA_PUBLIC_HOST=%s\n' "${PUBLIC_IP}"; } > "$f.tmp"
+chmod 600 "$f.tmp"; mv "$f.tmp" "$f"
 ```
 
-If the host has a DNS name the user prefers, use that string instead of the IP.
+Persist it ONLY for the DIRECT/VPS path — a NAT'd server stays iroh and records
+nothing (a stored public host would wrongly push it onto the direct path). Write a
+bare `AURA_PUBLIC_HOST=<host>` line — no quotes, no `export` prefix.
 
 **4c. (DIRECT only) Open the UDP port once** with the bundled script. The
 default port is **47821**; pass a different one only if the user overrides
@@ -354,10 +351,10 @@ output):
     (WAN UDP `PORT` → this PC's LAN IP) and use the router's **public WAN IP** as
     `AURA_PUBLIC_HOST` (dynamic DNS if it changes). **CGNAT:** if the ISP gives no
     real public IP (compare the router's WAN IP with `curl -fsS ifconfig.me`),
-    inbound is impossible for the direct transport — so advise the **iroh
-    transport** (`AURA_TRANSPORT=iroh`, which hole-punches and can fall back to a
-    blind encrypted relay, needing no open port), or a VPS, a VPN/overlay
-    (WireGuard / Tailscale), or LOCAL-only calls.
+    inbound is impossible for the direct transport — so use the **iroh transport**
+    (persist no `AURA_PUBLIC_HOST` and the server picks iroh automatically; it
+    hole-punches and can fall back to a blind encrypted relay, needing no open
+    port), or a VPS, a VPN/overlay (WireGuard / Tailscale), or LOCAL-only calls.
 
 Opening the port is a **one-time** onboarding action. You never touch the
 firewall again on later calls.
@@ -384,6 +381,12 @@ For another runtime, substitute its skills directory — e.g.
 `~/.codex/skills/voice-call/`, `~/.hermes/skills/voice-call/`, `~/.openclaw/skills/voice-call/`, or
 wherever your host scans. The file you copy is the same in every case.
 
+**On Windows:** also copy `skills/SKILL_WINDOWS.md` into the **same `voice-call/`
+skill dir** next to `SKILL.md` (e.g.
+`cp skills/SKILL_WINDOWS.md ~/.claude/skills/voice-call/SKILL_WINDOWS.md`). It
+holds the Windows-only deltas; `SKILL.md` still owns the call flow and now points
+to the companion at the top, so the model reads it before running the flow.
+
 The `aura-call`, `aura-call-status`, and `aura-inbox` helpers the skill uses are
 **already on your `PATH`** — `install.sh` installed them next to `aura-server` in
 step 2 (the server install ships them; a client-only install does not). Confirm:
@@ -392,12 +395,8 @@ step 2 (the server install ships them; a client-only install does not). Confirm:
 command -v aura-call && command -v aura-call-status && command -v aura-inbox && echo "helpers on PATH: OK"
 ```
 
-Reload your host (e.g. restart Claude Code) so it picks up the new skill. The
-skill is what lets the user say "call me" (or use the host's command) to have the
-host launch `aura-server` (via `aura-call --host <kind>`) and relay the connection
-string. The server resolves the host adapter automatically where it can — Claude
-is the default; Codex and OpenClaw also auto-resolve from their own launch env;
-Hermes needs `--host hermes`, which `aura-call` passes for you.
+Reload your host (e.g. restart Claude Code) so it picks up the new skill. From
+here the skill owns the call flow.
 
 ---
 
@@ -425,16 +424,18 @@ falls back to a cold worker. Configure your framework **once**:
   all prompts instead.
 - **Codex** — set the approval policy so the loop's commands don't block, e.g.
   `--dangerously-bypass-approvals-and-sandbox` (or the equivalent `approval_policy`
-  setting). *Verify the exact knob for your Codex version.*
+  setting). _Verify the exact knob for your Codex version._
 - **Hermes** — the dispatch runs as an unattended worker (`delegate_task`), so
   auto-approve its commands:
   ```
   hermes config set approvals.cron_mode approve
   ```
   Also enable aura's direct-dispatch fallback (used when your watch-loop is not
-  running): persist the worker command next to the key, in the same `./.env`:
+  running): persist the worker command next to the key, in the same user-global
+  `~/.config/aura/.env` (Hermes' exec tool gives each command a fresh cwd, so a
+  `./.env` here would not be found reliably):
   ```
-  printf 'AURA_HERMES_WORKER=hermes -z\n' >> ./.env
+  printf 'AURA_HERMES_WORKER=hermes -z\n' >> ~/.config/aura/.env
   ```
   (`hermes -z` is Hermes' oneshot mode: prints only the final answer to stdout
   and bypasses approval prompts — exactly what a headless worker needs. aura
@@ -498,7 +499,8 @@ key **before** it binds or mints anything; if the key is missing it exits
 non-zero immediately with a clear message.
 
 ```bash
-# From the server working directory (where ./.env lives).
+# Run from the server working directory. The key comes from ~/.config/aura/.env
+# (or the environment / OS keychain).
 # It prints "host = ..." / "composed context ..." and then the connection-string
 # line on stderr. Reaching that line proves the key resolved. We stop it there.
 timeout 8s aura-server 2>&1 | grep -m1 -E 'AURA_CONNECT=|composed context|host =' \
@@ -507,10 +509,10 @@ timeout 8s aura-server 2>&1 | grep -m1 -E 'AURA_CONNECT=|composed context|host =
 ```
 
 If instead you see `no BYOK key found` (or `no BYOK xAI/OpenAI key found`), the
-key is not resolving — revisit step 3 (is `./.env` in *this* directory, is the
-line `XAI_API_KEY=...` / `OPENAI_API_KEY=...`, is the env var unset so `./.env` is consulted?). The
-connection string printed during this probe is throwaway (single-use, ~120 s) —
-it is never used and expires harmlessly.
+key isn't where step 3 put it — confirm `~/.config/aura/.env` holds the line
+`XAI_API_KEY=...` / `OPENAI_API_KEY=...`, and that no set-but-empty env var of
+that name is shadowing it. The connection string printed during this probe is
+throwaway (single-use, ~120 s) — it is never used and expires harmlessly.
 
 **6c. State-dir agreement.** Compare the directory the server posts in-call
 tasks to with the one the helpers resolve — run BOTH commands and compare:
@@ -556,62 +558,32 @@ checked do you continue to Step 7 and tell the user how to start a call.
 
 ---
 
-## Step 7 — Tell the user how to start a call
+## Step 7 — Hand off to the skill and tell the user how to call
 
-**And a rule for YOU, the agent:** when the user later asks for a call, OPEN
-AND FOLLOW the skill you installed in Step 5 — do not run the call flow from
-onboarding memory. Onboarding taught you to INSTALL; the skill teaches you to
-CALL (they are different procedures, and the skill's Step 4.1 check is what
-prevents the most common silent failure).
+Onboarding sets up the server; **the skill runs the call.** When the user later
+asks for a call, OPEN AND FOLLOW the skill you installed in Step 5 — do not run
+a call from onboarding memory. Onboarding taught you to INSTALL; the skill owns
+the call protocol (launch, connection string, connect, orchestrate, recap) and
+its Step 4.1 check prevents the most common silent failure.
 
-Onboarding is done. Explain to the user, in plain language, what happens next.
-The host skill (step 5) launches `aura-server` for them on each call; they do
-not normally run it by hand. For reference, this is what a call does:
+Onboarding is done. Tell the user in plain language how to start one — they run
+nothing by hand; the skill launches the server for them:
 
-**LOCAL call (server on the user's own machine):**
-
-1. The host launches the server on loopback (`AURA_PUBLIC_HOST=127.0.0.1`, the
-   default).
-2. The server prints, on stderr, exactly:
-   `    AURA_CONNECT='aura://127.0.0.1:47821#k=...&c=...' aura-cli`
-3. The user (or the skill, on their behalf) runs that line — `aura-cli` opens the
-   mic and the call begins.
-
-**REMOTE call (server on the VPS):**
-
-1. The host launches the server with `AURA_PUBLIC_HOST=<the VPS public IP from
-   step 4>` (the port was already opened once at onboarding).
-2. The server prints the connection string on stderr.
-3. The skill **sends the connection string to the user over the chat**.
-4. On **their own** machine the user runs:
-   `AURA_CONNECT='aura://<vps-ip>:47821#k=...&c=...' aura-cli`
-   (they install `aura-cli` once via `install.sh --client` — see the README).
-
-Tell the user plainly: *"To start a call, say 'call me' (or use the host's call
-command) in your chat. I'll launch the voice server; you'll either be connected
-automatically (local) or I'll send you a one-line `AURA_CONNECT=... aura-cli`
-command to paste on your machine (remote)."*
-
-The connection string's secret is **single-use** and valid for about **120
-seconds** — if it expires, just start another call. After the call ends, the
-server posts a short recap of the conversation back into the chat through the
-host callback (for Claude this is a file under `.aura/` in the repo that the
-skill reads and summarizes).
+_"To start a call, say 'call me' (or use the host's call command) in your chat.
+I'll launch the voice server; you'll either be connected automatically (local) or
+I'll send you a one-line `AURA_CONNECT=... aura-cli` command to paste on your
+machine (remote)."_
 
 ### Optional server knobs (environment)
 
 The server is env-driven (no config file is loaded); the skill launches it and
 `aura-call` passes the environment through. All optional:
 
-- `AURA_DISPATCH_MODEL=<model>` — pin the in-call dispatch model for delegated
-  work. By default **Claude** auto-matches the dispatched sub-agent to the live
-  chat session's model (read from the transcript); **Codex** does NOT auto-match —
-  without a pin it runs on the app-server's default model. Set this to force a
-  specific model on either, e.g. `AURA_DISPATCH_MODEL=claude-opus-4-8`. Only Claude
-  and Codex have a per-call model knob; OpenClaw/Hermes ignore it.
-- `AURA_PORT` / `AURA_PUBLIC_HOST` / `AURA_TRANSPORT=iroh` — UDP port, the public
-  host clients dial, and the optional P2P transport (all covered above).
-- `AURA_FEEDER=1` — opt in to the live ambient-context feeder (needs `claude` on `PATH`).
+- `AURA_PORT` / `AURA_PUBLIC_HOST` / `AURA_TRANSPORT` — UDP port, the public host
+  clients dial, and the REMOTE transport. The server auto-selects the transport
+  from `AURA_PUBLIC_HOST`: a reachable value → `direct`, none on a REMOTE call →
+  `iroh`. `AURA_TRANSPORT=iroh|direct` forces it; you rarely set it by hand (all
+  covered above).
 
 ---
 
@@ -621,19 +593,18 @@ The server is env-driven (no config file is loaded); the skill launches it and
   almost always blocked **outside** the VM by the cloud **security group / NAT**.
   The in-VM firewall (step 4c) is necessary but **not sufficient** — add an
   inbound **UDP 47821** rule in the cloud provider console. Confirm
-  `AURA_PUBLIC_HOST` is the *reachable* public IP/DNS name, not a private/loopback
+  `AURA_PUBLIC_HOST` is the _reachable_ public IP/DNS name, not a private/loopback
   address. If the server is behind NAT/CGNAT (Step 4a says BEHIND NAT), stop
-  fighting the firewall and switch to `AURA_TRANSPORT=iroh`.
+  fighting the firewall — persist no `AURA_PUBLIC_HOST` so the server uses iroh.
 - **`aura-server` exits immediately with a key error
-  (`no BYOK key found`).** The API key did not resolve. Check, in
-  order: is the env var exported in *this* shell? is there a `./.env` with a
-  `XAI_API_KEY=...` / `OPENAI_API_KEY=...` line in the server's working directory? is the env var unset
-  so `./.env` is even consulted (a set-but-empty env var does not fall through to
-  `./.env`)? Re-do step 3. Never print the key to debug it.
+  (`no BYOK key found`).** The API key did not resolve. Check: does
+  `~/.config/aura/.env` (step 3) hold a `XAI_API_KEY=...` / `OPENAI_API_KEY=...`
+  line? is a set-but-empty env var of that name shadowing it (a set var beats the
+  `.env`)? Re-do step 3. Never print the key to debug it.
 - **Build error mentioning `alsa` / `libasound` / `asound`.** That dependency is
   **client-only** — only `aura-cli` pulls cpal/ALSA. If you are building the
   **server**, you do not need it; make sure you ran `./install.sh --server`
-  (not the default which also builds the client). If you *are* building the
+  (not the default which also builds the client). If you _are_ building the
   client on Linux, install the ALSA dev headers: `libasound2-dev`
   (Debian/Ubuntu, `apt`), `alsa-lib-devel` (Fedora/RHEL, `dnf`), `alsa-lib`
   (Arch, `pacman`), `alsa-lib-devel` (openSUSE, `zypper`). macOS and Windows
@@ -644,8 +615,6 @@ The server is env-driven (no config file is loaded); the skill launches it and
 - **`aura-server` / `aura-cli` not found after install.** `~/.local/bin` is not
   on `PATH` yet. Restart the shell or `source ~/.bashrc` (or `~/.zshrc` /
   `~/.profile`), or run with the full path `~/.local/bin/aura-server`.
-- **Connection string expired.** It is single-use and lasts ~120 s. Start a new
-  call to mint a fresh one.
 - **`scripts/aura-open-port.sh` printed `sudo` commands.** That means it ran
   without root and could not change the firewall itself — relay those exact
   commands to the user to run, then re-verify reachability.

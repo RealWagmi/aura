@@ -141,10 +141,10 @@ fn print_server_help() {
          AURA_VOICE_PROVIDER   xai | openai (default: auto by which key is present; xai wins)\n  \
          AURA_VOICE_MODEL      realtime model override (e.g. gpt-realtime-2.1-mini, ~3x cheaper)\n  \
          AURA_TRANSCRIBE_LANG  ISO-639-1 hint for OpenAI input transcription (e.g. ru)\n  \
-         AURA_PUBLIC_HOST      host clients dial (default 127.0.0.1 = LOCAL)\n  \
+         AURA_PUBLIC_HOST      host clients dial; a reachable value auto-selects direct\n                               (default 127.0.0.1 = LOCAL loopback)\n  \
          AURA_PORT             UDP port (default 47821)\n  \
          AURA_STATE_DIR        root for .aura state (call-status, inbox); default = cwd\n  \
-         AURA_TRANSPORT=iroh   NAT/CGNAT P2P transport (no open port needed)\n  \
+         AURA_TRANSPORT        force the transport: iroh (NAT/CGNAT P2P, no open port) |\n                               direct (Noise/UDP). Unset = auto: direct if AURA_PUBLIC_HOST\n                               is reachable, else iroh for a REMOTE call.\n  \
          AURA_DISPATCH_MODEL   pin the in-call dispatch model\n  \
          AURA_FEEDER=1         opt in to the live ambient feeder\n\n\
          Connection string printed for the caller (single-use, ~120 s):\n  \
@@ -270,10 +270,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         choice.as_str(),
         provider.model_id()
     );
+    // The model's tool guidance references the ambient feeder ONLY when it is
+    // actually opted in; with the feeder off (the default) the schemas are
+    // feeder-free so the model is never told to wait for a digest that won't come.
+    let feeder_enabled = feeder_opt_in();
     let cfg = VoiceSessionConfig {
         instructions: instructions_from_brief(PERSONA, &brief, INSTRUCTION_BUDGET_TOKENS),
         voice: provider.default_voice().to_owned(),
-        tools: aura_core::local_function_schemas(),
+        tools: aura_core::local_function_schemas(feeder_enabled),
         latency_target_ms: 800,
         temperature: Some(0.5),
         end_of_turn_timeout_ms: None,
@@ -291,12 +295,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let secret = SessionSecret::generate()?;
     write_status("ringing", &call_id, None);
 
-    // Transport selection. Default `direct` = Noise/UDP (needs a
-    // reachable host:port). `AURA_TRANSPORT=iroh` = QUIC P2P for a NAT/CGNAT
-    // server (holepunch + blind relay fallback; no firewall port to open).
-    let use_iroh = std::env::var("AURA_TRANSPORT")
-        .map(|v| v.trim().eq_ignore_ascii_case("iroh"))
+    // Transport selection is resolved HERE (not in the launcher) so the robust
+    // `.env` loader above is the single source of truth: a VPS that persisted
+    // `AURA_PUBLIC_HOST` picks direct with no per-call argument, a NAT'd server
+    // falls back to iroh. `direct` = Noise/UDP (needs a reachable host:port);
+    // `iroh` = QUIC P2P for a NAT/CGNAT server (holepunch + blind relay
+    // fallback). `AURA_REMOTE=1` is the launcher's LOCAL-vs-REMOTE signal.
+    let remote_call = std::env::var("AURA_REMOTE")
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        })
         .unwrap_or(false);
+    let public_host_cfg = std::env::var("AURA_PUBLIC_HOST").ok();
+    let use_iroh = resolve_transport(
+        std::env::var("AURA_TRANSPORT").ok().as_deref(),
+        remote_call,
+        public_host_cfg.as_deref(),
+    )?;
 
     let transport: Box<dyn aura_engine::AudioTransport> = if use_iroh {
         // The connection string carries the server's EndpointId; the client
@@ -887,6 +903,47 @@ fn is_loopback_host(host: &str) -> bool {
     host == "localhost" || host == "::1" || host.starts_with("127.")
 }
 
+/// Resolve the REMOTE transport to `use_iroh` (`true` = iroh QUIC P2P, `false` =
+/// direct Noise/UDP). An explicit `AURA_TRANSPORT` (`iroh`|`direct`) always
+/// wins; a typo (`quic`, `irohh`) is a hard error, never a silent fallback.
+/// With no explicit value the choice is AUTOMATIC: a call the launcher flagged
+/// REMOTE (`remote = true`) uses iroh UNLESS a reachable public host is
+/// configured (`AURA_PUBLIC_HOST` from env or `.env`, non-empty and
+/// non-loopback), in which case — and for any LOCAL call — it uses direct. This
+/// lets a VPS that persisted `AURA_PUBLIC_HOST` at onboarding pick direct with
+/// no per-call argument, while a NAT'd server falls back to iroh. Explicit
+/// `direct` on a REMOTE call with no reachable host is a hard error (the request
+/// cannot be satisfied) rather than a silent bind to loopback. Case- and
+/// whitespace-insensitive.
+fn resolve_transport(
+    transport: Option<&str>,
+    remote: bool,
+    public_host: Option<&str>,
+) -> Result<bool, String> {
+    let reachable = public_host
+        .map(|h| h.trim())
+        .map(|h| !h.is_empty() && !is_loopback_host(h))
+        .unwrap_or(false);
+    match transport.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("iroh") => Ok(true),
+        Some("direct") => {
+            if remote && !reachable {
+                Err(
+                    "AURA_TRANSPORT=direct needs a reachable AURA_PUBLIC_HOST for a REMOTE \
+                     call — set it in the aura .env or pass `aura-call remote <host>`, or use iroh"
+                        .to_owned(),
+                )
+            } else {
+                Ok(false)
+            }
+        }
+        None | Some("") => Ok(remote && !reachable),
+        Some(other) => Err(format!(
+            "AURA_TRANSPORT must be 'iroh' or 'direct', got {other:?}"
+        )),
+    }
+}
+
 /// A short, opaque, never-reused call id (4 random bytes as hex).
 fn mint_call_id() -> String {
     let mut b = [0u8; 4];
@@ -894,17 +951,23 @@ fn mint_call_id() -> String {
     format!("call-{:02x}{:02x}{:02x}{:02x}", b[0], b[1], b[2], b[3])
 }
 
-/// Start the live ambient-context feeder if opted in via `AURA_FEEDER`
-/// (`1`/`true`/`on`/`yes`). Best-effort: if `claude` is not on `PATH` the call
-/// proceeds with the startup brief but no live deltas.
-async fn maybe_start_feeder(cwd: &std::path::Path) -> Option<Arc<dyn AmbientFeeder>> {
-    let enabled = std::env::var("AURA_FEEDER")
+/// Is the ambient feeder opted in? `AURA_FEEDER` ∈ {`1`,`true`,`on`,`yes`}
+/// (case/space-insensitive). Off by default. Drives both whether the feeder
+/// starts AND whether the model's tool guidance mentions it.
+fn feeder_opt_in() -> bool {
+    std::env::var("AURA_FEEDER")
         .map(|v| {
             let v = v.trim().to_ascii_lowercase();
             v == "1" || v == "true" || v == "on" || v == "yes"
         })
-        .unwrap_or(false);
-    if !enabled {
+        .unwrap_or(false)
+}
+
+/// Start the live ambient-context feeder if opted in via `AURA_FEEDER`.
+/// Best-effort: if `claude` is not on `PATH` the call proceeds with the startup
+/// brief but no live deltas.
+async fn maybe_start_feeder(cwd: &std::path::Path) -> Option<Arc<dyn AmbientFeeder>> {
+    if !feeder_opt_in() {
         return None;
     }
     match aura_feeder::Feeder::start_for_call(cwd).await {
@@ -1240,5 +1303,72 @@ mod tests {
         assert!(err.contains("XAI_API_KEY"));
         assert!(err.contains("OPENAI_API_KEY"));
         assert!(err.contains("AURA_VOICE_PROVIDER"));
+    }
+
+    #[test]
+    fn resolve_transport_local_is_always_direct() {
+        // A LOCAL call (remote = false) is direct on loopback regardless of host.
+        assert_eq!(resolve_transport(None, false, None), Ok(false));
+        assert_eq!(resolve_transport(None, false, Some("127.0.0.1")), Ok(false));
+        assert_eq!(resolve_transport(Some(""), false, None), Ok(false));
+        assert_eq!(resolve_transport(Some("  "), false, None), Ok(false));
+    }
+
+    #[test]
+    fn resolve_transport_auto_picks_by_reachable_host() {
+        // REMOTE + a reachable public host (env or .env) -> direct.
+        assert_eq!(
+            resolve_transport(None, true, Some("203.0.113.7")),
+            Ok(false)
+        );
+        assert_eq!(
+            resolve_transport(None, true, Some("  vps.example.com ")),
+            Ok(false)
+        );
+        // REMOTE + no / empty / loopback host -> iroh fallback.
+        assert_eq!(resolve_transport(None, true, None), Ok(true));
+        assert_eq!(resolve_transport(None, true, Some("")), Ok(true));
+        assert_eq!(resolve_transport(None, true, Some("127.0.0.1")), Ok(true));
+        assert_eq!(resolve_transport(None, true, Some("localhost")), Ok(true));
+    }
+
+    #[test]
+    fn resolve_transport_explicit_overrides_win() {
+        // Explicit iroh always wins, case/space-insensitive, even with a host.
+        assert_eq!(
+            resolve_transport(Some("iroh"), true, Some("203.0.113.7")),
+            Ok(true)
+        );
+        assert_eq!(resolve_transport(Some("  IROH  "), false, None), Ok(true));
+        // Explicit direct with a reachable host is direct.
+        assert_eq!(
+            resolve_transport(Some("direct"), true, Some("203.0.113.7")),
+            Ok(false)
+        );
+        // Explicit direct on a LOCAL call is direct (loopback).
+        assert_eq!(resolve_transport(Some("Direct"), false, None), Ok(false));
+    }
+
+    #[test]
+    fn resolve_transport_explicit_direct_without_reachable_host_errors() {
+        // A REMOTE call that demands direct but has no reachable host cannot be
+        // satisfied — a hard error, not a silent loopback bind.
+        let err = resolve_transport(Some("direct"), true, None).unwrap_err();
+        assert!(err.contains("AURA_PUBLIC_HOST"), "{err}");
+        let err = resolve_transport(Some("direct"), true, Some("127.0.0.1")).unwrap_err();
+        assert!(err.contains("reachable"), "{err}");
+    }
+
+    #[test]
+    fn resolve_transport_rejects_typos_instead_of_degrading() {
+        // A typo must be a hard error, never a silent fall-through to direct.
+        for bad in ["quic", "irohh", "udp", "iro"] {
+            let err = resolve_transport(Some(bad), true, None).unwrap_err();
+            assert!(err.contains("AURA_TRANSPORT"), "for {bad:?}: {err}");
+            assert!(
+                err.contains("iroh") && err.contains("direct"),
+                "for {bad:?}: {err}"
+            );
+        }
     }
 }
