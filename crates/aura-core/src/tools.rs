@@ -618,24 +618,47 @@ fn string_arg(tool: &str, args: &Value, key: &str) -> Result<String, ToolError> 
     })
 }
 
-pub fn local_function_schemas() -> Value {
-    local_function_schemas_with_options(true)
+pub fn local_function_schemas(feeder_enabled: bool) -> Value {
+    local_function_schemas_with_options(true, feeder_enabled)
 }
 
-pub fn local_function_schemas_without_read_only_worker_query() -> Value {
-    local_function_schemas_with_options(false)
+pub fn local_function_schemas_without_read_only_worker_query(feeder_enabled: bool) -> Value {
+    local_function_schemas_with_options(false, feeder_enabled)
 }
 
-fn local_function_schemas_with_options(include_read_only_worker_query: bool) -> Value {
+fn local_function_schemas_with_options(
+    include_read_only_worker_query: bool,
+    feeder_enabled: bool,
+) -> Value {
+    // The ambient feeder (opt-in via `AURA_FEEDER`) is inject-only — it pushes
+    // context digests into the call; the model never calls a tool for it. So its
+    // guidance is woven into these two descriptions ONLY when the feeder is
+    // actually enabled. With the feeder off (the default) the model must NOT be
+    // told to "wait for the feeder digest" or that repo facts "arrive from the
+    // feeder" — that source will never appear, so the guidance is feeder-free.
+    let context_desc = format!(
+        "Return speech-safe worker/coordinator status, including active worker progress and ETA status when available. Use this for dispatched-worker status, active-task recap, coordinator state, or 'how much longer' questions only when the user is not also asking for an edit/write/update. It does not read files, does not fetch repo/source facts, {}",
+        if feeder_enabled {
+            "does not query the feeder, and does not start a coding worker; exact source snippets and repo context should arrive from the feeder digest."
+        } else {
+            "and does not start a coding worker."
+        }
+    );
+    let task_desc = format!(
+        "Request a downstream coding task after the user has clearly approved worker execution. Use for code edits, docs updates, repo commands, verification, shipping, combined lookup+update requests, or explicit deep passes. If the user says to dispatch, run it, set up the task, set up the task for the worker, fix this, or have Codex/the worker handle it, this is the tool to call before speaking. Do not use for exact wording/source lookup/onboarding greeting questions, read-only repo inspection, code/source wiring explanations, \"look in the code\", \"pull that up\", \"pull this data from the code\", token/context-size lookup, or requests for file references/key snippets{}",
+        if feeder_enabled {
+            "; wait for feeder digest unless the user explicitly asks to dispatch Codex, run a task, update files, verify with tests, or do a deep pass. If the user says to pull/check/read something \"with the feeder\" or \"through the feeder\", that is not worker approval. Aura validates the approval locally."
+        } else {
+            " — these are read-only and do not need a coding worker; dispatch only when the user explicitly asks to dispatch Codex, run a task, update files, verify with tests, or do a deep pass. Aura validates the approval locally."
+        }
+    );
     let mut tools = vec![
         json!({"type":"function","name":"get_agent_status","description":"Return current coding agent status, including active worker progress and ETA bands when the agent provides them.","parameters":{"type":"object","properties":{}}}),
-        json!({"type":"function","name":"get_context_summary","description":"Return speech-safe worker/coordinator status, including active worker progress and ETA status when available. Use this for dispatched-worker status, active-task recap, coordinator state, or 'how much longer' questions only when the user is not also asking for an edit/write/update. It does not read files, does not fetch repo/source facts, does not query the feeder, and does not start a coding worker; exact source snippets and repo context should arrive from the feeder digest.","parameters":{"type":"object","properties":{}}}),
-        // NOTE: there is no `request_feeder_lookup` tool. The ambient feeder is
-        // inject-only: it pushes digests into the call; the model
-        // does not pull lookups. (A `request_feeder_lookup` routed by a CLI
-        // live-loop interceptor existed before; aura's engine has no such lane,
-        // so offering it would hand the model a tool that only errors — removed.)
-        json!({"type":"function","name":"start_agent_task","description":"Request a downstream coding task after the user has clearly approved worker execution. Use for code edits, docs updates, repo commands, verification, shipping, combined lookup+update requests, or explicit deep passes. If the user says to dispatch, run it, set up the task, set up the task for the worker, fix this, or have Codex/the worker handle it, this is the tool to call before speaking. Do not use for exact wording/source lookup/onboarding greeting questions, read-only repo inspection, code/source wiring explanations, \"look in the code\", \"pull that up\", \"pull this data from the code\", token/context-size lookup, or requests for file references/key snippets; wait for feeder digest unless the user explicitly asks to dispatch Codex, run a task, update files, verify with tests, or do a deep pass. If the user says to pull/check/read something \"with the feeder\" or \"through the feeder\", that is not worker approval. Aura validates the approval locally.","parameters":{"type":"object","properties":{"user_intent":{"type":"string"},"constraints":{"type":"array","items":{"type":"string"}},"project":{"type":"string"},"callback_mode":{"type":"string","description":"How to deliver the result when it lands. Valid values: 'ping_first' (default — ping then speak), 'speak_immediately' (just speak when it lands), 'silent_notification' (queue silently), 'hangup' (alias for ping_first)."}},"required":["user_intent"]}}),
+        json!({"type":"function","name":"get_context_summary","description": context_desc,"parameters":{"type":"object","properties":{}}}),
+        // NOTE: there is no `request_feeder_lookup` tool — the ambient feeder is
+        // inject-only (it pushes digests; the model never pulls). A lookup tool
+        // the engine cannot route would only error, so none is published.
+        json!({"type":"function","name":"start_agent_task","description": task_desc,"parameters":{"type":"object","properties":{"user_intent":{"type":"string"},"constraints":{"type":"array","items":{"type":"string"}},"project":{"type":"string"},"callback_mode":{"type":"string","description":"How to deliver the result when it lands. Valid values: 'ping_first' (default — ping then speak), 'speak_immediately' (just speak when it lands), 'silent_notification' (queue silently), 'hangup' (alias for ping_first)."}},"required":["user_intent"]}}),
     ];
     if include_read_only_worker_query {
         // V2 step 1: publish the worker-agnostic canonical name FIRST
@@ -1119,7 +1142,7 @@ mod tests {
         // The schema published to Grok must surface the new canonical
         // FIRST so models pick it preferentially, with the legacy
         // alias retained for backward compatibility.
-        let schemas = local_function_schemas();
+        let schemas = local_function_schemas(false);
         let names: Vec<&str> = schemas
             .as_array()
             .unwrap()
@@ -1168,7 +1191,7 @@ mod tests {
 
     #[test]
     fn local_function_schemas_includes_ask_claude_question() {
-        let schemas = local_function_schemas();
+        let schemas = local_function_schemas(false);
         let arr = schemas.as_array().expect("schemas is array");
         let names: Vec<&str> = arr
             .iter()
@@ -1191,7 +1214,8 @@ mod tests {
 
     #[test]
     fn local_function_schemas_keep_exact_wording_out_of_worker_tools() {
-        let schemas = local_function_schemas_without_read_only_worker_query();
+        // Feeder ON: the feeder-referencing guidance is present.
+        let schemas = local_function_schemas_without_read_only_worker_query(true);
         let arr = schemas.as_array().expect("schemas is array");
 
         let context_description = arr
@@ -1236,6 +1260,41 @@ mod tests {
         assert!(task_description.contains("\"with the feeder\""));
         assert!(task_description.contains("requests for file references/key snippets"));
         assert!(task_description.contains("wait for feeder digest"));
+    }
+
+    #[test]
+    fn feeder_disabled_schemas_carry_no_feeder_wording() {
+        // Feeder OFF (the default): no tool description may mention the feeder —
+        // the model must not be told to wait for a digest that never arrives.
+        let schemas = local_function_schemas(false);
+        let arr = schemas.as_array().expect("schemas is array");
+        for tool in arr {
+            let desc = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                !desc.to_ascii_lowercase().contains("feeder"),
+                "feeder-off schema must not mention the feeder, but {:?} does: {desc}",
+                tool.get("name").and_then(Value::as_str).unwrap_or("?")
+            );
+        }
+        // The feeder-free guidance still gates dispatch correctly.
+        let task_description = arr
+            .iter()
+            .find(|s| s.get("name").and_then(Value::as_str) == Some("start_agent_task"))
+            .and_then(|s| s.get("description"))
+            .and_then(Value::as_str)
+            .expect("start_agent_task description");
+        assert!(task_description.contains("do not need a coding worker"));
+        assert!(task_description.contains("dispatch only when the user explicitly asks"));
+        let context_description = arr
+            .iter()
+            .find(|s| s.get("name").and_then(Value::as_str) == Some("get_context_summary"))
+            .and_then(|s| s.get("description"))
+            .and_then(Value::as_str)
+            .expect("get_context_summary description");
+        assert!(context_description.contains("does not start a coding worker"));
     }
 
     #[test]

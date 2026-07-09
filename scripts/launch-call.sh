@@ -17,19 +17,33 @@
 #
 # Usage:
 #   aura-call local                          LOCAL loopback call (binds 127.0.0.1)
-#   aura-call remote <PUBLIC_HOST>           REMOTE call; clients dial PUBLIC_HOST
-#   aura-call remote                         REMOTE via iroh (AURA_TRANSPORT=iroh):
-#                                            no public host / open port needed
+#   aura-call remote                          REMOTE call; the SERVER auto-picks
+#                                            direct (if AURA_PUBLIC_HOST is set in
+#                                            the aura .env) or iroh otherwise
+#   aura-call remote <PUBLIC_HOST>           REMOTE, forcing direct UDP to this
+#                                            reachable host (needs an open port)
 # Options:
 #   --host <claude|codex|hermes|openclaw>    select the host adapter (default: claude)
 #   -h, --help                               show this help
 #
+# REMOTE transport selection lives in the SERVER (it robustly loads the aura
+# .env), so this launcher only signals a remote call (AURA_REMOTE=1) and forwards
+# an optional explicit host:
+#   - `aura-call remote`                -> the server picks direct if a reachable
+#     AURA_PUBLIC_HOST is configured (env or the aura .env), else iroh (P2P
+#     hole-punch + blind relay fallback; NAT/CGNAT-safe).
+#   - `aura-call remote <PUBLIC_HOST>`  -> exports AURA_PUBLIC_HOST, so the server
+#     uses direct Noise/UDP to that host.
+#   - AURA_TRANSPORT=iroh|direct in the environment overrides on the server.
+#
 # Env overrides honoured:
 #   AURA_SERVER_BIN   explicit path to aura-server (else PATH, else ~/.local/bin)
 #   AURA_PORT         fixed UDP port (default 47821); read by aura-server itself
-#   AURA_TRANSPORT    'iroh' = NAT/CGNAT-friendly QUIC transport (hole-punch +
-#                     blind relay fallback); the connection string then carries
-#                     the server's node id instead of host:port
+#   AURA_TRANSPORT    force the REMOTE transport on the server: 'iroh' (NAT/CGNAT
+#                     QUIC, hole-punch + blind relay fallback; the connection
+#                     string carries the node id instead of host:port) or
+#                     'direct' (Noise/UDP; needs a reachable public host). Unset =
+#                     the server auto-selects from AURA_PUBLIC_HOST reachability.
 #   AURA_CALL_LOG     append the server's MID-CALL stderr (reconnects, dispatch
 #                     inbox path, truncate markers, call end) to this file
 #                     instead of discarding it — for diagnostics/experiments.
@@ -54,9 +68,10 @@ usage() {
   cat >&2 <<'EOF'
 Usage:
   aura-call local                       Start a LOCAL (loopback) call on 127.0.0.1
-  aura-call remote <PUBLIC_HOST>        Start a REMOTE call; clients dial PUBLIC_HOST
-  aura-call remote                      REMOTE via iroh (needs AURA_TRANSPORT=iroh):
-                                        no public host and no open port required
+  aura-call remote                      Start a REMOTE call; the server auto-picks
+                                        direct (AURA_PUBLIC_HOST set) or iroh
+  aura-call remote <PUBLIC_HOST>        REMOTE, forcing direct UDP to PUBLIC_HOST
+                                        (needs an open port)
 Options:
   --host <claude|codex|hermes|openclaw> Select the host adapter (default: claude)
   -h, --help                            Show this help and exit
@@ -98,14 +113,16 @@ case "$mode" in
   local)
     export AURA_PUBLIC_HOST="127.0.0.1" ;;
   remote)
-    if [ "${AURA_TRANSPORT:-}" = "iroh" ]; then
-      # iroh transport: the connection string carries the server's node id and
-      # the client resolves it via iroh discovery — no public host, no open
-      # port. A host argument, if given, is accepted but not used.
-      [ -z "$public_host" ] \
-        || printf '%s: note: AURA_TRANSPORT=iroh — ignoring the public host argument (%s)\n' "$prog" "$public_host" >&2
-    else
-      [ -n "$public_host" ] || die "remote mode needs a public host: aura-call remote <PUBLIC_HOST> (or set AURA_TRANSPORT=iroh for a NAT'd server — then no host is needed)"
+    # Signal a REMOTE call and let the SERVER resolve the transport: direct if a
+    # reachable AURA_PUBLIC_HOST is configured (the host arg below, or one
+    # persisted in the aura .env), else iroh (NAT/CGNAT-safe P2P). An explicit
+    # AURA_TRANSPORT still overrides on the server; reject a typo early here.
+    case "${AURA_TRANSPORT:-}" in
+      ""|iroh|direct) : ;;
+      *) die "AURA_TRANSPORT must be 'iroh' or 'direct', got '${AURA_TRANSPORT}'" ;;
+    esac
+    export AURA_REMOTE=1
+    if [ -n "$public_host" ]; then
       case "$public_host" in
         127.*|localhost|::1|0.0.0.0)
           die "remote mode needs a real public host, not a loopback/wildcard ($public_host)" ;;
