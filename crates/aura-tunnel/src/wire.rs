@@ -65,6 +65,13 @@ pub enum TransportKind {
     Iroh,
 }
 
+/// Input mode selected by the server and carried in the connection string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelInputMode {
+    Voice,
+    PushToTalk,
+}
+
 /// A parsed connection string. For [`TransportKind::Direct`] `authority` is the
 /// `host:port` to dial; for [`TransportKind::Iroh`] it is the server's
 /// `EndpointId`.
@@ -74,25 +81,38 @@ pub struct ConnectionString {
     pub call_id: String,
     pub secret: SessionSecret,
     pub transport: TransportKind,
+    pub input_mode: Option<TunnelInputMode>,
 }
 
 impl ConnectionString {
     /// Build a DIRECT (Noise/UDP) connection string for `host:port`.
-    pub fn format_direct(authority: &str, call_id: &str, secret: &SessionSecret) -> String {
+    pub fn format_direct(
+        authority: &str,
+        call_id: &str,
+        secret: &SessionSecret,
+        input_mode: TunnelInputMode,
+    ) -> String {
         format!(
-            "{SCHEME}{authority}#k={}&c={}&t=direct",
+            "{SCHEME}{authority}#k={}&c={}&t=direct&m={}",
             secret.to_base64url(),
-            call_id
+            call_id,
+            encode_input_mode(input_mode)
         )
     }
 
     /// Build an IROH connection string for a server `EndpointId`. The client
     /// resolves the server's addresses via iroh discovery (no host:port needed).
-    pub fn format_iroh(endpoint_id: &str, call_id: &str, secret: &SessionSecret) -> String {
+    pub fn format_iroh(
+        endpoint_id: &str,
+        call_id: &str,
+        secret: &SessionSecret,
+        input_mode: TunnelInputMode,
+    ) -> String {
         format!(
-            "{SCHEME}{endpoint_id}#k={}&c={}&t=iroh",
+            "{SCHEME}{endpoint_id}#k={}&c={}&t=iroh&m={}",
             secret.to_base64url(),
-            call_id
+            call_id,
+            encode_input_mode(input_mode)
         )
     }
 
@@ -107,6 +127,7 @@ impl ConnectionString {
         let mut secret_b64: Option<&str> = None;
         let mut call_id: Option<&str> = None;
         let mut transport = TransportKind::Direct; // legacy strings (no `t=`) are direct
+        let mut input_mode = None; // legacy strings fall back to local env.
         for pair in fragment.split('&') {
             if let Some(v) = pair.strip_prefix("k=") {
                 secret_b64 = Some(v);
@@ -117,6 +138,8 @@ impl ConnectionString {
                     "iroh" => TransportKind::Iroh,
                     _ => TransportKind::Direct,
                 };
+            } else if let Some(v) = pair.strip_prefix("m=") {
+                input_mode = parse_input_mode_tag(v);
             }
         }
         let secret = SessionSecret::from_base64url(secret_b64.ok_or(ConnError::MissingSecret)?)?;
@@ -129,7 +152,23 @@ impl ConnectionString {
             call_id: call_id.to_owned(),
             secret,
             transport,
+            input_mode,
         })
+    }
+}
+
+pub fn encode_input_mode(mode: TunnelInputMode) -> &'static str {
+    match mode {
+        TunnelInputMode::Voice => "voice",
+        TunnelInputMode::PushToTalk => "ptt",
+    }
+}
+
+fn parse_input_mode_tag(raw: &str) -> Option<TunnelInputMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "voice" | "vad" => Some(TunnelInputMode::Voice),
+        "push_to_talk" | "push-to-talk" | "ptt" => Some(TunnelInputMode::PushToTalk),
+        _ => None,
     }
 }
 
@@ -180,7 +219,12 @@ mod tests {
     #[test]
     fn direct_connection_string_round_trips() {
         let secret = SessionSecret::generate().unwrap();
-        let s = ConnectionString::format_direct("203.0.113.7:9443", "call-abc12345", &secret);
+        let s = ConnectionString::format_direct(
+            "203.0.113.7:9443",
+            "call-abc12345",
+            &secret,
+            TunnelInputMode::Voice,
+        );
         assert!(s.starts_with("aura://203.0.113.7:9443#k="));
         assert!(s.contains("&t=direct"));
         let parsed = ConnectionString::parse(&s).unwrap();
@@ -188,6 +232,7 @@ mod tests {
         assert_eq!(parsed.call_id, "call-abc12345");
         assert_eq!(parsed.secret.as_bytes(), secret.as_bytes());
         assert_eq!(parsed.transport, TransportKind::Direct);
+        assert_eq!(parsed.input_mode, Some(TunnelInputMode::Voice));
     }
 
     #[test]
@@ -195,13 +240,19 @@ mod tests {
         let secret = SessionSecret::generate().unwrap();
         // An opaque EndpointId-like authority (base32; no host:port).
         let id = "ci6ej5hsqs4u4xx7m4t4i7s2yqd3kq4gqf6h2c4xk7h6w7a";
-        let s = ConnectionString::format_iroh(id, "call-iroh0001", &secret);
+        let s = ConnectionString::format_iroh(
+            id,
+            "call-iroh0001",
+            &secret,
+            TunnelInputMode::PushToTalk,
+        );
         assert!(s.contains("&t=iroh"));
         let parsed = ConnectionString::parse(&s).unwrap();
         assert_eq!(parsed.authority, id);
         assert_eq!(parsed.call_id, "call-iroh0001");
         assert_eq!(parsed.secret.as_bytes(), secret.as_bytes());
         assert_eq!(parsed.transport, TransportKind::Iroh);
+        assert_eq!(parsed.input_mode, Some(TunnelInputMode::PushToTalk));
     }
 
     #[test]
@@ -212,6 +263,7 @@ mod tests {
             ConnectionString::parse(&s).unwrap().transport,
             TransportKind::Direct
         );
+        assert_eq!(ConnectionString::parse(&s).unwrap().input_mode, None);
     }
 
     #[test]

@@ -162,6 +162,13 @@ impl VoiceSink for RealtimeSink {
         Ok(())
     }
 
+    async fn clear_user_audio(&mut self) -> Result<(), VoiceError> {
+        if !self.manual_turn_detection {
+            return Ok(());
+        }
+        self.send(wire::input_audio_buffer_clear_event()).await
+    }
+
     async fn send_tool_result(
         &mut self,
         call_id: Option<&str>,

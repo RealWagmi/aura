@@ -613,7 +613,7 @@ The server is env-driven (no config file is loaded); the skill launches it and
   host clients dial, and the optional P2P transport (all covered above).
 - `.aura/` — Aura writes runtime state under `AURA_STATE_DIR` or the server
   working directory. If that directory is inside a git worktree, Aura
-  best-effort adds `.aura` to its `.gitignore`.
+  best-effort adds `.aura/` to `.git/info/exclude`, never to tracked `.gitignore`.
 - `AURA_END_OF_TURN_TIMEOUT_MS=<ms>` — how much silence to wait before Aura
   treats the user's turn as complete and starts answering in `voice` mode. Use a
   larger value when Aura interrupts pauses too quickly; practical values are

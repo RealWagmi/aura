@@ -234,6 +234,8 @@ struct CallState {
     /// still-queued milliseconds it approximates what the user actually HEARD
     /// — the `audio_end_ms` for `VoiceSink::truncate_item`.
     item_delivered_samples: u64,
+    /// PCM samples received for the current manual push-to-talk user turn.
+    ptt_input_samples: u64,
 }
 
 impl CallState {
@@ -245,8 +247,11 @@ impl CallState {
         self.user_speaking = false;
         self.current_item = None;
         self.item_delivered_samples = 0;
+        self.ptt_input_samples = 0;
     }
 }
+
+const MIN_PTT_COMMIT_SAMPLES: u64 = 2_400; // 100 ms at 24 kHz
 
 /// What the event loop should do after handling one event.
 enum Flow {
@@ -352,6 +357,11 @@ impl CallSession {
                 tokio::select! {
                     mic = transport.recv_input() => match mic {
                         Some(TransportInput::Audio(pcm)) => {
+                            if cfg.manual_turn_detection {
+                                state.ptt_input_samples = state
+                                    .ptt_input_samples
+                                    .saturating_add(pcm.len() as u64);
+                            }
                             if sink.send_audio(&pcm).await.is_err() {
                                 match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "mic-audio send failed").await {
                                     Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
@@ -360,9 +370,29 @@ impl CallSession {
                             }
                         }
                         Some(TransportInput::Control(TransportControl::PttOpen)) => {
-                            transport.clear_playout();
+                            if cfg.manual_turn_detection {
+                                state.ptt_input_samples = 0;
+                                transport.clear_playout();
+                            } else {
+                                eprintln!("aura-engine: ignoring PTT open in voice mode.");
+                            }
                         }
                         Some(TransportInput::Control(TransportControl::PttClose)) => {
+                            if !cfg.manual_turn_detection {
+                                eprintln!("aura-engine: ignoring PTT close in voice mode.");
+                                continue;
+                            }
+                            if state.ptt_input_samples < MIN_PTT_COMMIT_SAMPLES {
+                                state.ptt_input_samples = 0;
+                                if sink.clear_user_audio().await.is_err() {
+                                    match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk clear failed").await {
+                                        Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
+                                        None => break Transition::Ended(EndReason::ReconnectExhausted),
+                                    }
+                                }
+                                continue;
+                            }
+                            state.ptt_input_samples = 0;
                             if sink.commit_user_turn().await.is_err() {
                                 match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk commit failed").await {
                                     Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
@@ -1125,6 +1155,7 @@ mod tests {
         tool_results: usize,
         requests: usize,
         commits: usize,
+        clears: usize,
         closed: bool,
     }
 
@@ -1174,6 +1205,10 @@ mod tests {
             let mut log = self.log.lock().unwrap();
             log.commits += 1;
             log.requests += 1;
+            Ok(())
+        }
+        async fn clear_user_audio(&mut self) -> Result<(), VoiceError> {
+            self.log.lock().unwrap().clears += 1;
             Ok(())
         }
         async fn close(&mut self) -> Result<(), VoiceError> {
@@ -1361,6 +1396,13 @@ mod tests {
         }
     }
 
+    fn ptt_cfg() -> VoiceSessionConfig {
+        VoiceSessionConfig {
+            manual_turn_detection: true,
+            ..cfg()
+        }
+    }
+
     #[tokio::test]
     async fn push_to_talk_close_commits_user_turn() {
         let h = harness_input(
@@ -1369,7 +1411,32 @@ mod tests {
                 end: End::Pending,
             }],
             vec![
-                TransportInput::Audio(vec![1, 2, 3]),
+                TransportInput::Control(TransportControl::PttOpen),
+                TransportInput::Audio(vec![1; MIN_PTT_COMMIT_SAMPLES as usize]),
+                TransportInput::Control(TransportControl::PttClose),
+            ],
+            true,
+        );
+
+        let _ = CallSession::run(h.transport, h.provider, host(), None, ptt_cfg())
+            .await
+            .unwrap();
+
+        let log = h.sink_log.lock().unwrap();
+        assert_eq!(log.audio, vec![vec![1; MIN_PTT_COMMIT_SAMPLES as usize]]);
+        assert_eq!(log.commits, 1);
+        assert_eq!(log.requests, 1);
+    }
+
+    #[tokio::test]
+    async fn ptt_controls_are_ignored_in_a_vad_session() {
+        let h = harness_input(
+            vec![Script::Ok {
+                events: vec![VoiceEvent::SessionReady],
+                end: End::Pending,
+            }],
+            vec![
+                TransportInput::Control(TransportControl::PttOpen),
                 TransportInput::Control(TransportControl::PttClose),
             ],
             true,
@@ -1380,9 +1447,33 @@ mod tests {
             .unwrap();
 
         let log = h.sink_log.lock().unwrap();
-        assert_eq!(log.audio, vec![vec![1, 2, 3]]);
-        assert_eq!(log.commits, 1);
-        assert_eq!(log.requests, 1);
+        assert_eq!(log.commits, 0);
+        assert_eq!(log.clears, 0);
+    }
+
+    #[tokio::test]
+    async fn push_to_talk_close_with_too_little_audio_is_dropped_not_committed() {
+        let h = harness_input(
+            vec![Script::Ok {
+                events: vec![VoiceEvent::SessionReady],
+                end: End::Pending,
+            }],
+            vec![
+                TransportInput::Control(TransportControl::PttOpen),
+                TransportInput::Audio(vec![1; 100]),
+                TransportInput::Control(TransportControl::PttClose),
+            ],
+            true,
+        );
+
+        let _ = CallSession::run(h.transport, h.provider, host(), None, ptt_cfg())
+            .await
+            .unwrap();
+
+        let log = h.sink_log.lock().unwrap();
+        assert_eq!(log.commits, 0);
+        assert_eq!(log.requests, 0);
+        assert_eq!(log.clears, 1);
     }
 
     #[tokio::test]

@@ -140,7 +140,7 @@ The provider clamps the value to `300..3000` ms in `voice` mode. When
 `AURA_END_OF_TURN_TIMEOUT_MS`. Set it before starting `aura-server`; changing
 `.env` does not affect an already-running call.
 
-`AURA_INPUT_MODE` controls how the client sends the user's speech:
+`AURA_INPUT_MODE` is set on the server and controls how the client sends the user's speech:
 
 ```env
 AURA_INPUT_MODE=voice
@@ -369,7 +369,7 @@ For a local call on the same Windows machine:
   from `aura-server`, passed to `aura-cli.exe` through `AURA_CONNECT` or stdin.
 - Aura creates a local `.aura/` runtime folder in `AURA_STATE_DIR` or the
   server working directory. If that folder is inside a git worktree, Aura
-  best-effort adds `.aura` to that directory's `.gitignore`.
+  best-effort adds `.aura/` to `.git/info/exclude`, never to tracked `.gitignore`.
 - `AURA_END_OF_TURN_TIMEOUT_MS` must be set before launch if the user wants a
   longer pause before Aura answers.
 - In default `voice` mode, the user does not press a button. When `aura-cli`

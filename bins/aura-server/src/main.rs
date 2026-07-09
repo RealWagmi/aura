@@ -17,7 +17,7 @@ use aura_voice::{OpenAiRealtimeProvider, VoiceProvider, VoiceSessionConfig, XaiR
 
 use aura_tunnel::{
     ConnectionString, IrohPreset, IrohServer, IrohTransport, SessionSecret, TunnelConfig,
-    TunnelError, TunnelServer, TunnelTransport,
+    TunnelError, TunnelInputMode, TunnelServer, TunnelTransport,
 };
 
 /// Base persona prepended to the composed chat context.
@@ -271,10 +271,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         choice.as_str(),
         provider.model_id()
     );
-    let input_mode = std::env::var("AURA_INPUT_MODE").ok();
-    let ptt_mode = is_push_to_talk_mode(input_mode.as_deref());
+    let input_mode = parse_input_mode(std::env::var("AURA_INPUT_MODE").ok().as_deref())?;
+    let ptt_mode = input_mode == TunnelInputMode::PushToTalk;
     let end_of_turn_timeout_ms = resolve_end_of_turn_timeout_ms(
-        input_mode.as_deref(),
+        input_mode,
         std::env::var("AURA_END_OF_TURN_TIMEOUT_MS").ok().as_deref(),
     )?;
     if let Some(ms) = end_of_turn_timeout_ms {
@@ -314,7 +314,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         // resolves the address via iroh discovery. No `AURA_PUBLIC_HOST`/port.
         let server = IrohServer::bind(IrohPreset::Production).await?;
         let endpoint_id = server.endpoint_id().to_string();
-        let conn = ConnectionString::format_iroh(&endpoint_id, &call_id, &secret);
+        let conn = ConnectionString::format_iroh(&endpoint_id, &call_id, &secret, input_mode);
         eprintln!("aura-server: iroh transport; endpoint {endpoint_id}; call {call_id}.");
         eprintln!("aura-server: GIVE THE CALLER THIS CONNECTION STRING (single-use, valid ~120s):");
         eprintln!("    AURA_CONNECT='{conn}' aura-cli");
@@ -355,7 +355,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         };
         let local = server.local_addr()?;
         let authority = format!("{public_host}:{}", local.port());
-        let conn = ConnectionString::format_direct(&authority, &call_id, &secret);
+        let conn = ConnectionString::format_direct(&authority, &call_id, &secret, input_mode);
         eprintln!("aura-server: tunnel UDP bound on {local}; call {call_id}.");
         if !is_loopback_host(&public_host) {
             eprintln!(
@@ -878,24 +878,26 @@ fn parse_end_of_turn_timeout_ms(raw: Option<&str>) -> Result<Option<u64>, String
 }
 
 fn resolve_end_of_turn_timeout_ms(
-    input_mode: Option<&str>,
+    input_mode: TunnelInputMode,
     raw_timeout: Option<&str>,
 ) -> Result<Option<u64>, String> {
-    if is_push_to_talk_mode(input_mode) {
+    if input_mode == TunnelInputMode::PushToTalk {
         return Ok(None);
     }
     parse_end_of_turn_timeout_ms(raw_timeout)
 }
 
-fn is_push_to_talk_mode(input_mode: Option<&str>) -> bool {
-    input_mode
-        .map(|mode| {
-            matches!(
-                mode.trim().to_ascii_lowercase().as_str(),
-                "push_to_talk" | "push-to-talk" | "ptt"
-            )
-        })
-        .unwrap_or(false)
+fn parse_input_mode(raw: Option<&str>) -> Result<TunnelInputMode, String> {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(TunnelInputMode::Voice),
+        Some(v) => match v.to_ascii_lowercase().as_str() {
+            "voice" | "vad" => Ok(TunnelInputMode::Voice),
+            "push_to_talk" | "push-to-talk" | "ptt" => Ok(TunnelInputMode::PushToTalk),
+            other => Err(format!(
+                "AURA_INPUT_MODE must be voice or push_to_talk, got {other:?}"
+            )),
+        },
+    }
 }
 
 /// Resolve the `.aura` state root: `AURA_STATE_DIR` (else the process cwd).
@@ -928,45 +930,40 @@ fn write_status(state: &str, call_id: &str, reason: Option<&str>) {
         std::process::id()
     );
     let root = state_root();
-    let _ = ensure_aura_gitignore(&root);
+    let _ = ensure_aura_excluded(&root);
     let dir = root.join(".aura");
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join("call-status.json"), body);
 }
 
-fn ensure_aura_gitignore(root: &std::path::Path) -> std::io::Result<()> {
-    if !is_inside_git_worktree(root) {
+fn ensure_aura_excluded(root: &std::path::Path) -> std::io::Result<()> {
+    let Some(git_dir) = nearest_git_dir(root) else {
         return Ok(());
-    }
-
-    let gitignore = root.join(".gitignore");
-    let existing = match std::fs::read_to_string(&gitignore) {
+    };
+    let info = git_dir.join("info");
+    std::fs::create_dir_all(&info)?;
+    let exclude = info.join("exclude");
+    let existing = match std::fs::read_to_string(&exclude) {
         Ok(body) => body,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(err),
     };
-    if existing.lines().map(str::trim).any(is_aura_gitignore_entry) {
+    if existing.lines().map(str::trim).any(is_aura_exclude_entry) {
         return Ok(());
     }
-
-    let mut next = existing;
-    if !next.is_empty() && !next.ends_with('\n') {
-        next.push('\n');
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&exclude)?;
+    use std::io::Write;
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        writeln!(file)?;
     }
-    next.push_str(".aura\n");
-
-    let tmp = root.join(".gitignore.aura.tmp");
-    std::fs::write(&tmp, next)?;
-    match std::fs::rename(&tmp, &gitignore) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(err)
-        }
-    }
+    writeln!(file, ".aura/")?;
+    Ok(())
 }
 
-fn is_aura_gitignore_entry(line: &str) -> bool {
+fn is_aura_exclude_entry(line: &str) -> bool {
     let line = line.trim();
     if line.starts_with('!') || line.starts_with('#') {
         return false;
@@ -974,15 +971,19 @@ fn is_aura_gitignore_entry(line: &str) -> bool {
     matches!(line.trim_end_matches('/'), ".aura")
 }
 
-fn is_inside_git_worktree(root: &std::path::Path) -> bool {
+fn nearest_git_dir(root: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut cursor = Some(root);
     while let Some(path) = cursor {
-        if path.join(".git").exists() {
-            return true;
+        let git = path.join(".git");
+        if git.is_dir() {
+            return Some(git);
+        }
+        if git.is_file() {
+            return None;
         }
         cursor = path.parent();
     }
-    false
+    None
 }
 
 /// Is `host` a loopback name/address? A LOCAL call then binds loopback-only so
@@ -1256,11 +1257,11 @@ mod tests {
     #[test]
     fn push_to_talk_ignores_end_of_turn_timeout() {
         assert_eq!(
-            resolve_end_of_turn_timeout_ms(Some("push_to_talk"), Some("2500")),
+            resolve_end_of_turn_timeout_ms(TunnelInputMode::PushToTalk, Some("2500")),
             Ok(None)
         );
         assert_eq!(
-            resolve_end_of_turn_timeout_ms(Some("ptt"), Some("abc")),
+            resolve_end_of_turn_timeout_ms(TunnelInputMode::PushToTalk, Some("abc")),
             Ok(None)
         );
     }
@@ -1268,65 +1269,100 @@ mod tests {
     #[test]
     fn voice_mode_uses_configured_end_of_turn_timeout() {
         assert_eq!(
-            resolve_end_of_turn_timeout_ms(Some("voice"), Some("2500")),
+            resolve_end_of_turn_timeout_ms(TunnelInputMode::Voice, Some("2500")),
             Ok(Some(2500))
         );
     }
 
     #[test]
-    fn aura_gitignore_entry_is_added_inside_git_worktree() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join(".git")).unwrap();
-
-        ensure_aura_gitignore(tmp.path()).unwrap();
-
-        let gitignore = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
-        assert_eq!(gitignore, ".aura\n");
+    fn input_mode_accepts_the_same_values_as_the_client() {
+        assert_eq!(parse_input_mode(None), Ok(TunnelInputMode::Voice));
+        assert_eq!(parse_input_mode(Some("voice")), Ok(TunnelInputMode::Voice));
+        assert_eq!(parse_input_mode(Some("vad")), Ok(TunnelInputMode::Voice));
+        assert_eq!(
+            parse_input_mode(Some("push_to_talk")),
+            Ok(TunnelInputMode::PushToTalk)
+        );
+        assert_eq!(
+            parse_input_mode(Some("push-to-talk")),
+            Ok(TunnelInputMode::PushToTalk)
+        );
+        assert_eq!(
+            parse_input_mode(Some("ptt")),
+            Ok(TunnelInputMode::PushToTalk)
+        );
     }
 
     #[test]
-    fn aura_gitignore_entry_is_not_duplicated() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join(".git")).unwrap();
-        std::fs::write(tmp.path().join(".gitignore"), "target/\n.aura\n").unwrap();
-
-        ensure_aura_gitignore(tmp.path()).unwrap();
-
-        let gitignore = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
-        assert_eq!(gitignore, "target/\n.aura\n");
+    fn input_mode_typo_is_a_hard_error_not_silent_voice() {
+        assert!(parse_input_mode(Some("push")).is_err());
     }
 
     #[test]
-    fn aura_gitignore_entry_accepts_slash_variant() {
+    fn aura_exclude_entry_is_added_inside_git_worktree() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join(".git")).unwrap();
-        std::fs::write(tmp.path().join(".gitignore"), "target/\n.aura/\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git").join("info")).unwrap();
 
-        ensure_aura_gitignore(tmp.path()).unwrap();
+        ensure_aura_excluded(tmp.path()).unwrap();
 
-        let gitignore = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
-        assert_eq!(gitignore, "target/\n.aura/\n");
+        let exclude = std::fs::read_to_string(tmp.path().join(".git/info/exclude")).unwrap();
+        assert_eq!(exclude, ".aura/\n");
+        assert!(!tmp.path().join(".gitignore").exists());
     }
 
     #[test]
-    fn aura_gitignore_entry_does_not_treat_negation_as_ignore() {
+    fn aura_exclude_entry_is_not_duplicated() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join(".git")).unwrap();
-        std::fs::write(tmp.path().join(".gitignore"), "!.aura\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git").join("info")).unwrap();
+        std::fs::write(tmp.path().join(".git/info/exclude"), "target/\n.aura/\n").unwrap();
 
-        ensure_aura_gitignore(tmp.path()).unwrap();
+        ensure_aura_excluded(tmp.path()).unwrap();
 
-        let gitignore = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
-        assert_eq!(gitignore, "!.aura\n.aura\n");
+        let exclude = std::fs::read_to_string(tmp.path().join(".git/info/exclude")).unwrap();
+        assert_eq!(exclude, "target/\n.aura/\n");
     }
 
     #[test]
-    fn aura_gitignore_entry_skips_non_git_directories() {
+    fn aura_exclude_entry_accepts_no_slash_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git").join("info")).unwrap();
+        std::fs::write(tmp.path().join(".git/info/exclude"), "target/\n.aura\n").unwrap();
+
+        ensure_aura_excluded(tmp.path()).unwrap();
+
+        let exclude = std::fs::read_to_string(tmp.path().join(".git/info/exclude")).unwrap();
+        assert_eq!(exclude, "target/\n.aura\n");
+    }
+
+    #[test]
+    fn aura_exclude_entry_does_not_treat_negation_as_ignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git").join("info")).unwrap();
+        std::fs::write(tmp.path().join(".git/info/exclude"), "!.aura\n").unwrap();
+
+        ensure_aura_excluded(tmp.path()).unwrap();
+
+        let exclude = std::fs::read_to_string(tmp.path().join(".git/info/exclude")).unwrap();
+        assert_eq!(exclude, "!.aura\n.aura/\n");
+    }
+
+    #[test]
+    fn aura_exclude_entry_skips_non_git_directories() {
         let tmp = tempfile::tempdir().unwrap();
 
-        ensure_aura_gitignore(tmp.path()).unwrap();
+        ensure_aura_excluded(tmp.path()).unwrap();
 
         assert!(!tmp.path().join(".gitignore").exists());
+    }
+
+    #[test]
+    fn aura_exclude_entry_skips_git_file_worktrees() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".git"), "gitdir: ../real.git\n").unwrap();
+
+        ensure_aura_excluded(tmp.path()).unwrap();
+
+        assert!(!tmp.path().join(".git/info/exclude").exists());
     }
 
     #[test]

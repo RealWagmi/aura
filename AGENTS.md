@@ -20,7 +20,7 @@ changes.
   Windows support.
 - Aura writes runtime state under `AURA_STATE_DIR` or the server working
   directory as `.aura`; when inside a git worktree, Aura best-effort adds
-  `.aura` to `.gitignore`.
+  `.aura/` to `.git/info/exclude`, never to tracked `.gitignore`.
 - For Windows install/run details, read `skills/SKILL_WINDOWS.md`.
 
 ## Codex and Windows quick notes
@@ -48,7 +48,9 @@ In `push_to_talk`, the user presses the hotkey once to start streaming mic audio
 speaks, then presses the same hotkey again to commit the turn and ask Aura to
 answer. The server uses manual turn detection for PTT and ignores
 `AURA_END_OF_TURN_TIMEOUT_MS`; `AURA_PUSH_TO_TALK_MAX_RECORDING_MS` is only a
-client safety cap for an accidentally open mic.
+client safety cap for an accidentally open mic. Set `AURA_INPUT_MODE` on the
+server; the connection string carries the mode to `aura-cli` as `m=voice` or
+`m=ptt`, and the client follows it automatically.
 
 ## What this is
 

@@ -14,9 +14,28 @@ pub struct PushToTalkWatcher {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Hotkey {
-    keys: Vec<i32>,
+    keys: Vec<KeyGroup>,
     modifiers: ModifierMask,
     label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyGroup {
+    keys: Vec<i32>,
+}
+
+impl KeyGroup {
+    fn one(key: i32) -> Self {
+        Self { keys: vec![key] }
+    }
+
+    fn any(keys: impl Into<Vec<i32>>) -> Self {
+        Self { keys: keys.into() }
+    }
+
+    fn is_down(&self) -> bool {
+        self.keys.iter().any(|key| is_key_down(*key))
+    }
 }
 
 type ModifierMask = u8;
@@ -77,39 +96,75 @@ fn parse_hotkey(raw: &str) -> Result<Hotkey, String> {
     })
 }
 
-fn parse_key(raw: &str) -> Result<(i32, String, Option<ModifierMask>), String> {
+fn parse_key(raw: &str) -> Result<(KeyGroup, String, Option<ModifierMask>), String> {
     let normalized = raw.trim().to_ascii_lowercase();
     let key = match normalized.as_str() {
-        "ctrl" | "control" => (VK_CONTROL as i32, "Ctrl".to_owned(), Some(MOD_CTRL)),
-        "lctrl" | "leftctrl" | "left_control" => {
-            (VK_LCONTROL as i32, "Left Ctrl".to_owned(), Some(MOD_CTRL))
-        }
-        "rctrl" | "rightctrl" | "right_control" => {
-            (VK_RCONTROL as i32, "Right Ctrl".to_owned(), Some(MOD_CTRL))
-        }
-        "alt" => (VK_MENU as i32, "Alt".to_owned(), Some(MOD_ALT)),
-        "lalt" | "leftalt" | "left_alt" => (VK_LMENU as i32, "Left Alt".to_owned(), Some(MOD_ALT)),
-        "ralt" | "rightalt" | "right_alt" => {
-            (VK_RMENU as i32, "Right Alt".to_owned(), Some(MOD_ALT))
-        }
-        "shift" => (VK_SHIFT as i32, "Shift".to_owned(), Some(MOD_SHIFT)),
-        "lshift" | "leftshift" | "left_shift" => {
-            (VK_LSHIFT as i32, "Left Shift".to_owned(), Some(MOD_SHIFT))
-        }
-        "rshift" | "rightshift" | "right_shift" => {
-            (VK_RSHIFT as i32, "Right Shift".to_owned(), Some(MOD_SHIFT))
-        }
-        "win" | "windows" | "meta" => (VK_LWIN as i32, "Win".to_owned(), Some(MOD_WIN)),
-        "lwin" | "leftwin" | "left_win" => (VK_LWIN as i32, "Left Win".to_owned(), Some(MOD_WIN)),
-        "rwin" | "rightwin" | "right_win" => {
-            (VK_RWIN as i32, "Right Win".to_owned(), Some(MOD_WIN))
-        }
-        "space" => (VK_SPACE as i32, "Space".to_owned(), None),
+        "ctrl" | "control" => (
+            KeyGroup::one(VK_CONTROL as i32),
+            "Ctrl".to_owned(),
+            Some(MOD_CTRL),
+        ),
+        "lctrl" | "leftctrl" | "left_control" => (
+            KeyGroup::one(VK_LCONTROL as i32),
+            "Left Ctrl".to_owned(),
+            Some(MOD_CTRL),
+        ),
+        "rctrl" | "rightctrl" | "right_control" => (
+            KeyGroup::one(VK_RCONTROL as i32),
+            "Right Ctrl".to_owned(),
+            Some(MOD_CTRL),
+        ),
+        "alt" => (
+            KeyGroup::one(VK_MENU as i32),
+            "Alt".to_owned(),
+            Some(MOD_ALT),
+        ),
+        "lalt" | "leftalt" | "left_alt" => (
+            KeyGroup::one(VK_LMENU as i32),
+            "Left Alt".to_owned(),
+            Some(MOD_ALT),
+        ),
+        "ralt" | "rightalt" | "right_alt" => (
+            KeyGroup::one(VK_RMENU as i32),
+            "Right Alt".to_owned(),
+            Some(MOD_ALT),
+        ),
+        "shift" => (
+            KeyGroup::one(VK_SHIFT as i32),
+            "Shift".to_owned(),
+            Some(MOD_SHIFT),
+        ),
+        "lshift" | "leftshift" | "left_shift" => (
+            KeyGroup::one(VK_LSHIFT as i32),
+            "Left Shift".to_owned(),
+            Some(MOD_SHIFT),
+        ),
+        "rshift" | "rightshift" | "right_shift" => (
+            KeyGroup::one(VK_RSHIFT as i32),
+            "Right Shift".to_owned(),
+            Some(MOD_SHIFT),
+        ),
+        "win" | "windows" | "meta" => (
+            KeyGroup::any([VK_LWIN as i32, VK_RWIN as i32]),
+            "Win".to_owned(),
+            Some(MOD_WIN),
+        ),
+        "lwin" | "leftwin" | "left_win" => (
+            KeyGroup::one(VK_LWIN as i32),
+            "Left Win".to_owned(),
+            Some(MOD_WIN),
+        ),
+        "rwin" | "rightwin" | "right_win" => (
+            KeyGroup::one(VK_RWIN as i32),
+            "Right Win".to_owned(),
+            Some(MOD_WIN),
+        ),
+        "space" => (KeyGroup::one(VK_SPACE as i32), "Space".to_owned(), None),
         key if key.len() == 1 => {
             let ch = key.chars().next().expect("single-char key");
             if ch.is_ascii_alphanumeric() {
                 (
-                    ch.to_ascii_uppercase() as i32,
+                    KeyGroup::one(ch.to_ascii_uppercase() as i32),
                     ch.to_ascii_uppercase().to_string(),
                     None,
                 )
@@ -128,7 +183,7 @@ fn is_key_down(key: i32) -> bool {
 
 impl Hotkey {
     fn is_pressed_exact(&self) -> bool {
-        self.keys.iter().all(|key| is_key_down(*key))
+        self.keys.iter().all(KeyGroup::is_down)
             && modifier_is_exact(
                 self.modifiers,
                 MOD_CTRL,
@@ -173,6 +228,13 @@ mod tests {
     fn tracks_exact_modifier_families() {
         let hotkey = parse_hotkey("ctrl+shift+space").expect("hotkey");
         assert_eq!(hotkey.modifiers, MOD_CTRL | MOD_SHIFT);
+    }
+
+    #[test]
+    fn generic_win_accepts_either_side() {
+        let hotkey = parse_hotkey("win+space").expect("hotkey");
+        assert_eq!(hotkey.label, "Win+Space");
+        assert_eq!(hotkey.keys[0].keys.len(), 2);
     }
 
     #[test]

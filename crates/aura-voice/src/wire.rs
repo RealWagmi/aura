@@ -240,6 +240,10 @@ pub fn input_audio_buffer_commit_event() -> Value {
     json!({"type": "input_audio_buffer.commit"})
 }
 
+pub fn input_audio_buffer_clear_event() -> Value {
+    json!({"type": "input_audio_buffer.clear"})
+}
+
 pub fn user_text_message_event(text: &str) -> Value {
     json!({
         "type": "conversation.item.create",
@@ -502,6 +506,12 @@ mod tests {
         assert_eq!(v["item_id"], "it_9");
         assert_eq!(v["content_index"], 0);
         assert_eq!(v["audio_end_ms"], 1234);
+    }
+
+    #[test]
+    fn clear_event_shape() {
+        let v = input_audio_buffer_clear_event();
+        assert_eq!(v["type"], "input_audio_buffer.clear");
     }
 
     #[test]

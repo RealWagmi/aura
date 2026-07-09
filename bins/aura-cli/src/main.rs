@@ -10,6 +10,7 @@ use aura_audio::{AudioSettings, CpalTransport};
 use aura_tunnel::TunnelControl;
 use aura_tunnel::{
     ConnectionString, IrohEndpoint, IrohPreset, TransportKind, TunnelConfig, TunnelEndpoint,
+    TunnelInputMode,
 };
 #[cfg(windows)]
 use std::sync::Arc;
@@ -32,11 +33,18 @@ struct PushToTalkGate {
 }
 
 impl InputMode {
-    fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+    fn from_mode(mode: TunnelInputMode) -> Result<Self, Box<dyn std::error::Error>> {
+        match mode {
+            TunnelInputMode::Voice => Ok(Self::Voice),
+            TunnelInputMode::PushToTalk => start_push_to_talk(),
+        }
+    }
+
+    fn local_mode_from_env() -> Result<TunnelInputMode, Box<dyn std::error::Error>> {
         let mode = std::env::var("AURA_INPUT_MODE").unwrap_or_else(|_| "voice".to_owned());
         match mode.trim().to_ascii_lowercase().as_str() {
-            "" | "voice" | "vad" => Ok(Self::Voice),
-            "push_to_talk" | "push-to-talk" | "ptt" => start_push_to_talk(),
+            "" | "voice" | "vad" => Ok(TunnelInputMode::Voice),
+            "push_to_talk" | "push-to-talk" | "ptt" => Ok(TunnelInputMode::PushToTalk),
             other => {
                 Err(format!("AURA_INPUT_MODE must be voice or push_to_talk, got {other:?}").into())
             }
@@ -146,6 +154,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let raw = read_connection_string()?;
     let conn = ConnectionString::parse(&raw)?;
+    let input_mode = resolve_input_mode(conn.input_mode)?;
     eprintln!(
         "aura: opening a secure tunnel to {} (call {})…",
         conn.authority, conn.call_id
@@ -157,7 +166,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match conn.transport {
         TransportKind::Direct => {
             let tunnel = TunnelEndpoint::connect_client(&conn.authority, &conn.secret, cfg).await?;
-            pump(tunnel).await?;
+            pump(tunnel, input_mode).await?;
         }
         TransportKind::Iroh => {
             let tunnel = IrohEndpoint::connect_by_id(
@@ -167,12 +176,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 cfg,
             )
             .await?;
-            pump(tunnel).await?;
+            pump(tunnel, input_mode).await?;
         }
     }
 
     eprintln!("aura: call ended.");
     Ok(())
+}
+
+fn resolve_input_mode(
+    connection_mode: Option<TunnelInputMode>,
+) -> Result<TunnelInputMode, Box<dyn std::error::Error>> {
+    let local_mode = InputMode::local_mode_from_env()?;
+    if let Some(mode) = connection_mode {
+        if mode != local_mode {
+            eprintln!("aura: connection string input mode wins over local AURA_INPUT_MODE.");
+        }
+        Ok(mode)
+    } else {
+        Ok(local_mode)
+    }
 }
 
 /// One audio-tunnel surface regardless of transport (direct Noise/UDP or iroh).
@@ -213,10 +236,13 @@ impl VoiceTunnel for IrohEndpoint {
 /// Pump mic → tunnel and tunnel → speaker until either side closes. `select!`
 /// drops the losing branch's borrow before the handler runs, so the two `&mut`
 /// endpoints don't conflict (the discipline the engine's loop relies on).
-async fn pump<T: VoiceTunnel>(mut tunnel: T) -> Result<(), Box<dyn std::error::Error>> {
+async fn pump<T: VoiceTunnel>(
+    mut tunnel: T,
+    tunnel_input_mode: TunnelInputMode,
+) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("aura: tunnel up. Acquiring microphone and speaker…");
     let mut audio = CpalTransport::start(AudioSettings::default())?;
-    let input_mode = InputMode::from_env()?;
+    let input_mode = InputMode::from_mode(tunnel_input_mode)?;
     #[cfg(windows)]
     let mut ptt_recording = false;
     #[cfg(windows)]
@@ -249,20 +275,33 @@ async fn pump<T: VoiceTunnel>(mut tunnel: T) -> Result<(), Box<dyn std::error::E
                         if presses != ptt_seen_presses {
                             let toggles = presses.saturating_sub(ptt_seen_presses);
                             ptt_seen_presses = presses;
-                            for _ in 0..toggles {
-                                if ptt_recording {
-                                    ptt_recording = false;
-                                    ptt_frames_open = 0;
-                                    ptt_warned_near_limit = false;
-                                    tunnel.send_control(TunnelControl::PttClose);
-                                    eprintln!("aura: sent push-to-talk message.");
-                                } else {
+                            match resolve_ptt_toggles(
+                                ptt_recording,
+                                toggles,
+                                ptt_frames_open,
+                                PUSH_TO_TALK_MIN_RECORDING_FRAMES,
+                            ) {
+                                PttBatchAction::None => {}
+                                PttBatchAction::Start => {
                                     ptt_recording = true;
                                     ptt_frames_open = 0;
                                     ptt_warned_near_limit = false;
                                     tunnel.send_control(TunnelControl::PttOpen);
                                     audio.clear_playout();
                                     eprintln!("aura: recording push-to-talk message.");
+                                }
+                                PttBatchAction::Send => {
+                                    ptt_recording = false;
+                                    ptt_frames_open = 0;
+                                    ptt_warned_near_limit = false;
+                                    tunnel.send_control(TunnelControl::PttClose);
+                                    eprintln!("aura: sent push-to-talk message.");
+                                }
+                                PttBatchAction::DiscardTooShort => {
+                                    ptt_recording = false;
+                                    ptt_frames_open = 0;
+                                    ptt_warned_near_limit = false;
+                                    eprintln!("aura: push-to-talk message was too short; discarded.");
                                 }
                             }
                         }
@@ -275,9 +314,9 @@ async fn pump<T: VoiceTunnel>(mut tunnel: T) -> Result<(), Box<dyn std::error::E
                             {
                                 ptt_warned_near_limit = true;
                                 eprintln!(
-                                    "aura: push-to-talk recording reached the limit. You can increase it with AURA_PUSH_TO_TALK_MAX_RECORDING_MS."
+                                    "aura: push-to-talk recording is near the limit; sending in about 3 seconds. You can increase it with AURA_PUSH_TO_TALK_MAX_RECORDING_MS."
                                 );
-                                speak_push_to_talk_limit_warning();
+                                signal_push_to_talk_limit_warning();
                             }
                             if ptt_frames_open >= ptt_max_frames {
                                 ptt_recording = false;
@@ -306,6 +345,37 @@ const DEFAULT_PUSH_TO_TALK_MAX_RECORDING_MS: u64 = 300_000;
 const PUSH_TO_TALK_FRAME_MS: u64 = 20;
 #[cfg(windows)]
 const PUSH_TO_TALK_LIMIT_WARNING_MS: u64 = 3_000;
+#[cfg(windows)]
+const PUSH_TO_TALK_MIN_RECORDING_FRAMES: usize = 10;
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PttBatchAction {
+    None,
+    Start,
+    Send,
+    DiscardTooShort,
+}
+
+#[cfg(windows)]
+fn resolve_ptt_toggles(
+    recording: bool,
+    toggles: u64,
+    recorded_frames: usize,
+    min_frames: usize,
+) -> PttBatchAction {
+    if toggles == 0 {
+        return PttBatchAction::None;
+    }
+    let net_recording = recording ^ (toggles % 2 == 1);
+    match (recording, net_recording) {
+        (false, false) => PttBatchAction::DiscardTooShort,
+        (false, true) => PttBatchAction::Start,
+        (true, false) if recorded_frames >= min_frames => PttBatchAction::Send,
+        (true, false) => PttBatchAction::DiscardTooShort,
+        (true, true) => PttBatchAction::None,
+    }
+}
 
 #[cfg(windows)]
 fn push_to_talk_max_recording_frames() -> Result<usize, Box<dyn std::error::Error>> {
@@ -349,13 +419,8 @@ fn push_to_talk_limit_warning_frame(max_frames: usize) -> usize {
 }
 
 #[cfg(windows)]
-fn speak_push_to_talk_limit_warning() {
-    let script = "Add-Type -AssemblyName System.Speech; \
-        $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
-        $s.Speak('You reached the voice message limit. You can increase it in settings.')";
-    let _ = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .spawn();
+fn signal_push_to_talk_limit_warning() {
+    eprint!("\x07");
 }
 
 /// Read the connection string from `AURA_CONNECT`, else one line from stdin.
@@ -468,7 +533,8 @@ fn expand_home(value: &str) -> String {
 mod tests {
     use super::{
         global_config_dir_from, parse_push_to_talk_max_recording_ms,
-        push_to_talk_limit_warning_frame, DEFAULT_PUSH_TO_TALK_MAX_RECORDING_MS,
+        push_to_talk_limit_warning_frame, resolve_ptt_toggles, PttBatchAction,
+        DEFAULT_PUSH_TO_TALK_MAX_RECORDING_MS,
     };
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -528,5 +594,20 @@ mod tests {
     fn push_to_talk_max_recording_rejects_invalid_values() {
         assert!(parse_push_to_talk_max_recording_ms(Some("0")).is_err());
         assert!(parse_push_to_talk_max_recording_ms(Some("abc")).is_err());
+    }
+
+    #[test]
+    fn ptt_toggle_batch_resolves_to_one_action() {
+        assert_eq!(resolve_ptt_toggles(false, 1, 0, 10), PttBatchAction::Start);
+        assert_eq!(resolve_ptt_toggles(true, 1, 10, 10), PttBatchAction::Send);
+        assert_eq!(
+            resolve_ptt_toggles(true, 1, 9, 10),
+            PttBatchAction::DiscardTooShort
+        );
+        assert_eq!(
+            resolve_ptt_toggles(false, 2, 0, 10),
+            PttBatchAction::DiscardTooShort
+        );
+        assert_eq!(resolve_ptt_toggles(true, 2, 20, 10), PttBatchAction::None);
     }
 }

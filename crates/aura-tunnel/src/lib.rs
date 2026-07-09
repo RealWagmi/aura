@@ -37,4 +37,4 @@ pub use reframe::Reframer;
 pub use session::SessionSecret;
 #[cfg(feature = "server")]
 pub use transport::TunnelTransport;
-pub use wire::{ConnectionString, TransportKind, TunnelControl, TunnelInput};
+pub use wire::{ConnectionString, TransportKind, TunnelControl, TunnelInput, TunnelInputMode};

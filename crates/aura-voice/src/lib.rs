@@ -172,6 +172,11 @@ pub trait VoiceSink: Send {
     ) -> Result<(), VoiceError> {
         Ok(())
     }
+    /// Clear the provider-side input audio buffer. Useful when a manual
+    /// push-to-talk turn is discarded before commit.
+    async fn clear_user_audio(&mut self) -> Result<(), VoiceError> {
+        Ok(())
+    }
     /// Return a tool result to the model.
     async fn send_tool_result(
         &mut self,
