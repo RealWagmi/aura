@@ -16,6 +16,7 @@
 pub mod endpoint;
 pub mod jitter;
 pub mod noise;
+pub(crate) mod outbound;
 pub mod reframe;
 pub mod session;
 pub mod wire;

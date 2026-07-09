@@ -979,11 +979,55 @@ fn nearest_git_dir(root: &std::path::Path) -> Option<std::path::PathBuf> {
             return Some(git);
         }
         if git.is_file() {
-            return None;
+            // Linked `git worktree` or submodule checkout: `.git` is a
+            // pointer file ("gitdir: <path>"). Resolve it so those checkouts
+            // get the same `.aura/` exclusion as a primary checkout.
+            return resolve_gitdir_pointer(path, &git);
         }
         cursor = path.parent();
     }
     None
+}
+
+/// Resolve a `.git` plain-file pointer to the git directory whose
+/// `info/exclude` git actually reads for this checkout: the pointed-to
+/// directory's `commondir` redirection when present (a linked worktree shares
+/// `info/` with the main repository), else the pointed-to directory itself (a
+/// submodule's own git dir). Returns `None` for an unreadable or dangling
+/// pointer — then no exclude is written anywhere, same as a non-git root.
+fn resolve_gitdir_pointer(
+    worktree: &std::path::Path,
+    git_file: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let body = std::fs::read_to_string(git_file).ok()?;
+    let target = body.strip_prefix("gitdir:")?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let target = std::path::Path::new(target);
+    let git_dir = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        worktree.join(target)
+    };
+    if !git_dir.is_dir() {
+        return None;
+    }
+    if let Ok(common) = std::fs::read_to_string(git_dir.join("commondir")) {
+        let common = common.trim();
+        if !common.is_empty() {
+            let common_path = std::path::Path::new(common);
+            let common_dir = if common_path.is_absolute() {
+                common_path.to_path_buf()
+            } else {
+                git_dir.join(common_path)
+            };
+            if common_dir.is_dir() {
+                return Some(common_dir);
+            }
+        }
+    }
+    Some(git_dir)
 }
 
 /// Is `host` a loopback name/address? A LOCAL call then binds loopback-only so
@@ -1356,13 +1400,56 @@ mod tests {
     }
 
     #[test]
-    fn aura_exclude_entry_skips_git_file_worktrees() {
+    fn aura_exclude_entry_reaches_linked_worktrees_via_the_gitdir_pointer() {
+        // Layout of `git worktree add`: the main repo's `.git/worktrees/<name>`
+        // is the linked worktree's git dir; its `commondir` file points back
+        // at the shared `.git`, which owns `info/exclude`.
+        let tmp = tempfile::tempdir().unwrap();
+        let main_git = tmp.path().join("main/.git");
+        let wt_gitdir = main_git.join("worktrees/feature");
+        std::fs::create_dir_all(&wt_gitdir).unwrap();
+        std::fs::write(wt_gitdir.join("commondir"), "../..\n").unwrap();
+        let worktree = tmp.path().join("feature-checkout");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", wt_gitdir.display()),
+        )
+        .unwrap();
+
+        ensure_aura_excluded(&worktree).unwrap();
+
+        let exclude = std::fs::read_to_string(main_git.join("info/exclude")).unwrap();
+        assert_eq!(exclude, ".aura/\n");
+    }
+
+    #[test]
+    fn aura_exclude_entry_reaches_submodules_via_the_gitdir_pointer() {
+        // Submodule layout: `.git` points at the superproject's
+        // `.git/modules/<name>`, which has no `commondir` — that dir itself
+        // owns the submodule's `info/exclude`.
+        let tmp = tempfile::tempdir().unwrap();
+        let module_git = tmp.path().join("super/.git/modules/child");
+        std::fs::create_dir_all(&module_git).unwrap();
+        let submodule = tmp.path().join("super/child");
+        std::fs::create_dir_all(&submodule).unwrap();
+        std::fs::write(submodule.join(".git"), "gitdir: ../.git/modules/child\n").unwrap();
+
+        ensure_aura_excluded(&submodule).unwrap();
+
+        let exclude = std::fs::read_to_string(module_git.join("info/exclude")).unwrap();
+        assert_eq!(exclude, ".aura/\n");
+    }
+
+    #[test]
+    fn aura_exclude_entry_skips_dangling_gitdir_pointers() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(".git"), "gitdir: ../real.git\n").unwrap();
 
         ensure_aura_excluded(tmp.path()).unwrap();
 
         assert!(!tmp.path().join(".git/info/exclude").exists());
+        assert!(!tmp.path().join("../real.git").exists());
     }
 
     #[test]

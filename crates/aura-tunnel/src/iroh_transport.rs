@@ -4,7 +4,7 @@
 //! the default build is untouched.
 //!
 //! It is a faithful analog of [`crate::endpoint::TunnelEndpoint`]: the SAME
-//! Noise_NNpsk0 session, [`Reframer`], [`JitterBuffer`] and 20 ms pacer. Only
+//! Noise_NNpsk0 session, reframer, [`JitterBuffer`] and 20 ms pacer. Only
 //! the "socket" changes:
 //! - **audio** rides iroh **QUIC datagrams** (unreliable, unordered — exactly
 //!   like our UDP path, so the per-packet-nonce framing + jitter buffer apply
@@ -18,7 +18,6 @@
 //! peer's endpoint key and moves bytes through NAT; the per-call PSK authorises
 //! *this* call. Security model unchanged from the direct transport.
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,11 +31,11 @@ use tokio::time::{interval, timeout, MissedTickBehavior};
 use crate::endpoint::TunnelConfig;
 use crate::jitter::JitterBuffer;
 use crate::noise::{self, Transport, MAX_HANDSHAKE_MSG};
-use crate::reframe::Reframer;
+use crate::outbound::{bytes_to_pcm, Outbound};
 use crate::session::SessionSecret;
 use crate::wire::{
-    decode_transport, decode_tunnel_control, encode_transport, encode_tunnel_control,
-    TunnelControl, TunnelInput, TAG_TRANSPORT,
+    decode_transport, decode_tunnel_control, encode_transport, TunnelControl, TunnelInput,
+    TAG_TRANSPORT,
 };
 
 /// ALPN identifying the aura voice tunnel over iroh. Both sides must match, or
@@ -46,12 +45,6 @@ pub const ALPN: &[u8] = b"aura/voice/0";
 /// 20 ms @ 24 kHz mono.
 const FRAME_SAMPLES: usize = 480;
 const FRAME_MS: u64 = 20;
-/// Outbound queue cap — a MEMORY backstop only (matches the direct transport).
-/// The model bursts a full answer faster than realtime, so the queue must hold
-/// a whole LONG answer or drop-oldest audibly eats words (live-diagnosed on the
-/// direct transport at the old 30 s cap; see `endpoint.rs`). 5 min @ 50
-/// frames/s = 15 000 frames ≈ 14 MB; overflow is logged loudly.
-const MAX_OUTBOUND_FRAMES: usize = 15_000;
 
 /// Which iroh preset (relay + discovery) to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,21 +72,6 @@ pub enum IrohError {
 /// Map any `Display` error (iroh's `n0_error`, io, quinn) into [`IrohError`].
 fn ierr<E: std::fmt::Display>(e: E) -> IrohError {
     IrohError::Iroh(e.to_string())
-}
-
-fn pcm_to_bytes(pcm: &[i16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(pcm.len() * 2);
-    for s in pcm {
-        out.extend_from_slice(&s.to_le_bytes());
-    }
-    out
-}
-
-fn bytes_to_pcm(bytes: &[u8]) -> Vec<i16> {
-    bytes
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
-        .collect()
 }
 
 /// Generate an ephemeral iroh endpoint identity (one per call — the per-call
@@ -166,16 +144,6 @@ async fn read_framed<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<Vec<u8>, Iroh
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await.map_err(ierr)?;
     Ok(buf)
-}
-
-/// Outbound state behind one lock (same shape as the UDP path): the pacer queue
-/// and the reframer. `clear_outbound` resets both so a stale partial frame can't
-/// prepend onto the next response (barge-in).
-struct Outbound {
-    queue: VecDeque<Vec<u8>>,
-    reframer: Reframer,
-    /// Total frames dropped on overflow (diagnostic; see `MAX_OUTBOUND_FRAMES`).
-    dropped_frames: u64,
 }
 
 /// Aborts the spawned task when the endpoint is dropped.
@@ -336,11 +304,7 @@ impl IrohEndpoint {
         transport: Arc<Transport>,
         cfg: TunnelConfig,
     ) -> Self {
-        let outbound = Arc::new(Mutex::new(Outbound {
-            queue: VecDeque::new(),
-            reframer: Reframer::new(FRAME_SAMPLES),
-            dropped_frames: 0,
-        }));
+        let outbound = Arc::new(Mutex::new(Outbound::new(FRAME_SAMPLES)));
         let (inbound_tx, inbound_rx) = mpsc::channel::<TunnelInput>(cfg.inbound_capacity.max(1));
 
         // Outbound pacer: every 20 ms send one queued frame as a QUIC datagram,
@@ -359,8 +323,7 @@ impl IrohEndpoint {
                     let bytes = outbound
                         .lock()
                         .expect("outbound lock")
-                        .queue
-                        .pop_front()
+                        .pop_next()
                         .unwrap_or_default();
                     match transport.encrypt(nonce, &bytes) {
                         Ok(ct) => {
@@ -394,13 +357,10 @@ impl IrohEndpoint {
                                     if let Some((nonce, ct)) = decode_transport(&body[1..]) {
                                         if let Ok(pt) = transport.decrypt(nonce, ct) {
                                             // Empty == keepalive (authenticated); not audio.
-                                            if let Some(control) = decode_tunnel_control(&pt) {
-                                                if inbound_tx.try_send(TunnelInput::Control(control)).is_err()
-                                                    && inbound_tx.is_closed()
-                                                {
-                                                    break;
-                                                }
-                                            } else if !pt.is_empty() {
+                                            // Control frames go through the SAME jitter
+                                            // buffer as audio so they cannot overtake
+                                            // the turn's trailing frames (see endpoint.rs).
+                                            if !pt.is_empty() {
                                                 jitter.push(nonce as u16, pt);
                                             }
                                         }
@@ -411,7 +371,14 @@ impl IrohEndpoint {
                         },
                         _ = tick.tick() => {
                             if let Some(bytes) = jitter.pop() {
-                                if inbound_tx.try_send(TunnelInput::Audio(bytes_to_pcm(&bytes))).is_err()
+                                if let Some(control) = decode_tunnel_control(&bytes) {
+                                    // A control is a state transition, not a
+                                    // droppable sample: await channel space
+                                    // (a lost PttClose strands the turn).
+                                    if inbound_tx.send(TunnelInput::Control(control)).await.is_err() {
+                                        break;
+                                    }
+                                } else if inbound_tx.try_send(TunnelInput::Audio(bytes_to_pcm(&bytes))).is_err()
                                     && inbound_tx.is_closed()
                                 {
                                     break;
@@ -434,44 +401,22 @@ impl IrohEndpoint {
 
     /// Queue model/mic audio for sending, reframed to exact 20 ms frames.
     pub fn send_pcm24(&self, pcm: &[i16]) {
-        let mut out = self.outbound.lock().expect("outbound lock");
-        let frames = out.reframer.push(pcm);
-        for f in frames {
-            out.queue.push_back(pcm_to_bytes(&f));
-            while out.queue.len() > MAX_OUTBOUND_FRAMES {
-                out.queue.pop_front();
-                out.dropped_frames += 1;
-                // Loud, rate-limited (first drop, then ~1/s of loss): overflow
-                // eats the audio the listener is ABOUT TO HEAR.
-                if out.dropped_frames == 1 || out.dropped_frames.is_multiple_of(50) {
-                    eprintln!(
-                        "aura-tunnel: outbound pacer queue FULL ({} min cap) — {} ms of audio \
-                         dropped; words are being skipped",
-                        MAX_OUTBOUND_FRAMES as u64 / 50 / 60,
-                        out.dropped_frames * FRAME_MS
-                    );
-                }
-            }
-        }
+        self.outbound.lock().expect("outbound lock").push_pcm(pcm);
     }
 
     /// Flush the `<20 ms` reframer tail (padded with silence) so a phrase ending
     /// isn't held back.
     pub fn flush_output(&self) {
-        let mut out = self.outbound.lock().expect("outbound lock");
-        if let Some(mut tail) = out.reframer.flush() {
-            tail.resize(FRAME_SAMPLES, 0);
-            out.queue.push_back(pcm_to_bytes(&tail));
-        }
+        self.outbound.lock().expect("outbound lock").flush_tail();
     }
 
-    /// Queue an authenticated control event for the peer.
+    /// Queue an authenticated control event for the peer, in-order with the
+    /// audio queued before it.
     pub fn send_control(&self, control: TunnelControl) {
         self.outbound
             .lock()
             .expect("outbound lock")
-            .queue
-            .push_back(encode_tunnel_control(control));
+            .push_control(control);
     }
 
     /// The next inbound audio/control event, or `None` when the tunnel closes.
@@ -489,16 +434,15 @@ impl IrohEndpoint {
         }
     }
 
-    /// Drop everything queued for sending AND reset the reframer carry (barge-in).
+    /// Drop the queued AUDIO and reset the reframer carry (barge-in). Queued
+    /// control frames are preserved.
     pub fn clear_outbound(&self) {
-        let mut out = self.outbound.lock().expect("outbound lock");
-        out.queue.clear();
-        out.reframer = Reframer::new(FRAME_SAMPLES);
+        self.outbound.lock().expect("outbound lock").clear_audio();
     }
 
     /// Milliseconds of audio queued for sending.
     pub fn outbound_queued_ms(&self) -> u64 {
-        self.outbound.lock().expect("outbound lock").queue.len() as u64 * FRAME_MS
+        self.outbound.lock().expect("outbound lock").queued_ms()
     }
 }
 
@@ -533,6 +477,9 @@ impl aura_engine::AudioTransport for IrohTransport {
             }
             TunnelInput::Control(TunnelControl::PttClose) => {
                 aura_engine::TransportInput::Control(aura_engine::TransportControl::PttClose)
+            }
+            TunnelInput::Control(TunnelControl::PttCancel) => {
+                aura_engine::TransportInput::Control(aura_engine::TransportControl::PttCancel)
             }
         })
     }

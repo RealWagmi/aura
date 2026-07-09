@@ -22,14 +22,21 @@ const SCHEME: &str = "aura://";
 const CONTROL_PREFIX: &[u8] = b"AURA_CTRL_1";
 const CONTROL_PTT_OPEN: u8 = 1;
 const CONTROL_PTT_CLOSE: u8 = 2;
+const CONTROL_PTT_CANCEL: u8 = 3;
 
 /// Authenticated in-band control events carried over the same encrypted tunnel
-/// as audio. They are deliberately tiny and never pass through the audio jitter
-/// buffer.
+/// as audio. They ride the SAME jitter buffer as audio on the receive side so
+/// delivery order matches send order (a control that overtakes the audio sent
+/// before it would commit a turn missing its trailing frames).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TunnelControl {
     PttOpen,
     PttClose,
+    /// Abandon the open turn WITHOUT committing it: the client discarded a
+    /// too-short recording, so the server must drop the already-streamed
+    /// frames from the provider input buffer (a plain `PttClose` would commit
+    /// them and answer a message the user explicitly discarded).
+    PttCancel,
 }
 
 /// What the server can receive from the client side of the tunnel.
@@ -196,6 +203,7 @@ pub fn encode_tunnel_control(control: TunnelControl) -> Vec<u8> {
     let code = match control {
         TunnelControl::PttOpen => CONTROL_PTT_OPEN,
         TunnelControl::PttClose => CONTROL_PTT_CLOSE,
+        TunnelControl::PttCancel => CONTROL_PTT_CANCEL,
     };
     let mut out = Vec::with_capacity(CONTROL_PREFIX.len() + 1);
     out.extend_from_slice(CONTROL_PREFIX);
@@ -208,8 +216,16 @@ pub fn decode_tunnel_control(body: &[u8]) -> Option<TunnelControl> {
     match code {
         CONTROL_PTT_OPEN => Some(TunnelControl::PttOpen),
         CONTROL_PTT_CLOSE => Some(TunnelControl::PttClose),
+        CONTROL_PTT_CANCEL => Some(TunnelControl::PttCancel),
         _ => None,
     }
+}
+
+/// Is this decrypted frame payload a control frame? Used by the outbound queue
+/// to never evict a control on overflow (dropping audio degrades quality;
+/// dropping a `PttClose` strands the whole turn).
+pub(crate) fn is_tunnel_control(body: &[u8]) -> bool {
+    decode_tunnel_control(body).is_some()
 }
 
 #[cfg(test)]
@@ -311,6 +327,10 @@ mod tests {
         assert_eq!(
             decode_tunnel_control(&encode_tunnel_control(TunnelControl::PttClose)),
             Some(TunnelControl::PttClose)
+        );
+        assert_eq!(
+            decode_tunnel_control(&encode_tunnel_control(TunnelControl::PttCancel)),
+            Some(TunnelControl::PttCancel)
         );
         assert_eq!(decode_tunnel_control(b"not-control"), None);
     }

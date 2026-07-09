@@ -11,9 +11,11 @@
 //! - **inbound**: an I/O task reads datagrams, decrypts by the carried nonce,
 //!   and pushes into the jitter buffer; on a 20 ms tick it pops one in-order
 //!   frame to a channel that `recv_pcm24` awaits. A lost packet is a dropped
-//!   20 ms (PLC silence), never a stall.
+//!   20 ms (PLC silence), never a stall. Control frames ride the SAME jitter
+//!   buffer so they cannot overtake the audio sent before them (a `PttClose`
+//!   that outruns the turn's trailing frames clips the user's final word and
+//!   leaks it into the next turn).
 
-use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,11 +27,11 @@ use tokio::time::{interval, timeout, MissedTickBehavior};
 
 use crate::jitter::JitterBuffer;
 use crate::noise::{self, Transport, MAX_HANDSHAKE_MSG};
-use crate::reframe::Reframer;
+use crate::outbound::{bytes_to_pcm, Outbound};
 use crate::session::SessionSecret;
 use crate::wire::{
-    decode_transport, decode_tunnel_control, encode_transport, encode_tunnel_control,
-    TunnelControl, TunnelInput, TAG_HANDSHAKE, TAG_TRANSPORT,
+    decode_transport, decode_tunnel_control, encode_transport, TunnelControl, TunnelInput,
+    TAG_HANDSHAKE, TAG_TRANSPORT,
 };
 
 /// 20 ms @ 24 kHz mono.
@@ -66,29 +68,6 @@ impl Default for TunnelConfig {
     }
 }
 
-/// Cap on the outbound queue — a MEMORY backstop for a dead/stalled pacer, NOT
-/// an audio limiter. The realtime API streams a full answer's PCM far faster
-/// than the 20 ms realtime pacer drains it, so a LONG answer legitimately backs
-/// up MINUTES here. Live-diagnosed 2026-07-07: a ~90 s fable overflowed the old
-/// 30 s cap about 40 s into playback and the silent drop-oldest audibly ate
-/// words ("stumbles ~40 s into long speech"). The cap must exceed any single
-/// answer: 5 min @ 50 frames/s = 15 000 frames ≈ 14 MB — still a trivial
-/// backstop. Barge-in (`clear_outbound`) drains the whole queue instantly
-/// regardless of size, so a large cap costs zero interruption latency; hitting
-/// the cap is logged loudly (never silent again).
-const MAX_OUTBOUND_FRAMES: usize = 15_000;
-
-/// Outbound state behind one lock: the queue the pacer drains, plus the
-/// reframer that chops engine audio into exact 20 ms frames. Co-locating them
-/// lets `clear_outbound` (barge-in) also reset the reframer carry so a stale
-/// `<20 ms` partial frame can't prepend onto the next response.
-struct Outbound {
-    queue: VecDeque<Vec<u8>>,
-    reframer: Reframer,
-    /// Total frames dropped on overflow (diagnostic; see `MAX_OUTBOUND_FRAMES`).
-    dropped_frames: u64,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum TunnelError {
     #[error("tunnel io: {0}")]
@@ -97,21 +76,6 @@ pub enum TunnelError {
     Noise(#[from] noise::NoiseError),
     #[error("handshake timed out")]
     HandshakeTimeout,
-}
-
-fn pcm_to_bytes(pcm: &[i16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(pcm.len() * 2);
-    for s in pcm {
-        out.extend_from_slice(&s.to_le_bytes());
-    }
-    out
-}
-
-fn bytes_to_pcm(bytes: &[u8]) -> Vec<i16> {
-    bytes
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
-        .collect()
 }
 
 /// Aborts the spawned task when the endpoint is dropped (no lingering UDP
@@ -257,11 +221,7 @@ impl TunnelEndpoint {
         cfg: TunnelConfig,
         handshake_retx: Option<Vec<u8>>,
     ) -> Self {
-        let outbound = Arc::new(Mutex::new(Outbound {
-            queue: VecDeque::new(),
-            reframer: Reframer::new(FRAME_SAMPLES),
-            dropped_frames: 0,
-        }));
+        let outbound = Arc::new(Mutex::new(Outbound::new(FRAME_SAMPLES)));
         let (inbound_tx, inbound_rx) = mpsc::channel::<TunnelInput>(cfg.inbound_capacity.max(1));
 
         // Outbound pacer: every 20 ms send one queued frame, OR — when the queue
@@ -283,8 +243,7 @@ impl TunnelEndpoint {
                     let bytes = outbound
                         .lock()
                         .expect("outbound lock")
-                        .queue
-                        .pop_front()
+                        .pop_next()
                         .unwrap_or_default();
                     match transport.encrypt(nonce, &bytes) {
                         Ok(ct) => {
@@ -321,14 +280,14 @@ impl TunnelEndpoint {
                                     if let Ok(pt) = transport.decrypt(nonce, ct) {
                                         // Any authenticated frame proves liveness;
                                         // empty == keepalive (not pushed to audio).
+                                        // Control frames go through the SAME jitter
+                                        // buffer as audio: release order == send
+                                        // order, and the control's sequence number
+                                        // no longer reads as a lost audio packet
+                                        // (which stalled the turn's trailing frames
+                                        // past the commit).
                                         last_recv = tokio::time::Instant::now();
-                                        if let Some(control) = decode_tunnel_control(&pt) {
-                                            if inbound_tx.try_send(TunnelInput::Control(control)).is_err()
-                                                && inbound_tx.is_closed()
-                                            {
-                                                break;
-                                            }
-                                        } else if !pt.is_empty() {
+                                        if !pt.is_empty() {
                                             jitter.push(nonce as u16, pt);
                                         }
                                     }
@@ -346,14 +305,21 @@ impl TunnelEndpoint {
                         },
                         _ = tick.tick() => {
                             if last_recv.elapsed() > idle_timeout {
-                                break; // peer vanished silently → hang up
+                                break; // peer vanished with no close → hang up
                             }
                             if let Some(bytes) = jitter.pop() {
-                                // Drop this frame if the consumer is far behind
-                                // (channel full); a closed channel ends the task.
-                                if inbound_tx.try_send(TunnelInput::Audio(bytes_to_pcm(&bytes))).is_err()
+                                if let Some(control) = decode_tunnel_control(&bytes) {
+                                    // A control is a state transition, not a
+                                    // droppable sample: await channel space
+                                    // (a lost PttClose strands the turn).
+                                    if inbound_tx.send(TunnelInput::Control(control)).await.is_err() {
+                                        break;
+                                    }
+                                } else if inbound_tx.try_send(TunnelInput::Audio(bytes_to_pcm(&bytes))).is_err()
                                     && inbound_tx.is_closed()
                                 {
+                                    // Drop this frame if the consumer is far behind
+                                    // (channel full); a closed channel ends the task.
                                     break;
                                 }
                             }
@@ -372,46 +338,25 @@ impl TunnelEndpoint {
     }
 
     /// Queue model/mic audio for sending, reframed to exact 20 ms frames. The
-    /// queue is bounded (drop-oldest) so a stalled/dead pacer can't grow memory.
+    /// queue is bounded (drop-oldest audio; controls survive) so a stalled/dead
+    /// pacer can't grow memory.
     pub fn send_pcm24(&self, pcm: &[i16]) {
-        let mut out = self.outbound.lock().expect("outbound lock");
-        let frames = out.reframer.push(pcm);
-        for f in frames {
-            out.queue.push_back(pcm_to_bytes(&f));
-            while out.queue.len() > MAX_OUTBOUND_FRAMES {
-                out.queue.pop_front();
-                out.dropped_frames += 1;
-                // Loud, rate-limited (first drop, then ~1/s of loss): overflow
-                // eats the audio the listener is ABOUT TO HEAR.
-                if out.dropped_frames == 1 || out.dropped_frames.is_multiple_of(50) {
-                    eprintln!(
-                        "aura-tunnel: outbound pacer queue FULL ({} min cap) — {} ms of audio \
-                         dropped; words are being skipped",
-                        MAX_OUTBOUND_FRAMES as u64 / 50 / 60,
-                        out.dropped_frames * FRAME_MS
-                    );
-                }
-            }
-        }
+        self.outbound.lock().expect("outbound lock").push_pcm(pcm);
     }
 
     /// Flush the `<20 ms` reframer tail (padded with silence) so a phrase
     /// ending isn't held back.
     pub fn flush_output(&self) {
-        let mut out = self.outbound.lock().expect("outbound lock");
-        if let Some(mut tail) = out.reframer.flush() {
-            tail.resize(FRAME_SAMPLES, 0);
-            out.queue.push_back(pcm_to_bytes(&tail));
-        }
+        self.outbound.lock().expect("outbound lock").flush_tail();
     }
 
-    /// Queue an authenticated control event for the peer.
+    /// Queue an authenticated control event for the peer, in-order with the
+    /// audio queued before it.
     pub fn send_control(&self, control: TunnelControl) {
         self.outbound
             .lock()
             .expect("outbound lock")
-            .queue
-            .push_back(encode_tunnel_control(control));
+            .push_control(control);
     }
 
     /// The next inbound audio/control event, or `None` when the tunnel closes.
@@ -429,17 +374,16 @@ impl TunnelEndpoint {
         }
     }
 
-    /// Drop everything queued for sending AND reset the reframer carry (barge-in
-    /// must not leave a stale partial frame to prepend onto the next response).
+    /// Drop the queued AUDIO and reset the reframer carry (barge-in must not
+    /// leave a stale partial frame to prepend onto the next response). Queued
+    /// control frames are preserved.
     pub fn clear_outbound(&self) {
-        let mut out = self.outbound.lock().expect("outbound lock");
-        out.queue.clear();
-        out.reframer = Reframer::new(FRAME_SAMPLES);
+        self.outbound.lock().expect("outbound lock").clear_audio();
     }
 
     /// Milliseconds of audio queued for sending.
     pub fn outbound_queued_ms(&self) -> u64 {
-        self.outbound.lock().expect("outbound lock").queue.len() as u64 * FRAME_MS
+        self.outbound.lock().expect("outbound lock").queued_ms()
     }
 }
 
@@ -484,6 +428,57 @@ mod tests {
             .expect("client recv timed out")
             .expect("client tunnel closed");
         assert_eq!(got_client[0], 200, "first server frame");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_frame_does_not_overtake_audio_sent_before_it() {
+        let secret = SessionSecret::generate().unwrap();
+        let server = TunnelServer::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap().to_string();
+
+        let server_secret = secret.clone();
+        let server_handle = tokio::spawn(async move {
+            server
+                .accept(&server_secret, TunnelConfig::default())
+                .await
+                .unwrap()
+        });
+        let client = TunnelEndpoint::connect_client(&addr, &secret, TunnelConfig::default())
+            .await
+            .unwrap();
+        let mut server_ep = server_handle.await.unwrap();
+
+        // A push-to-talk turn: audio frames, then the PttClose that commits
+        // them. The server must observe ALL the audio before the control —
+        // over the old direct-delivery path the control overtook the jitter
+        // buffer and clipped the turn's trailing ~40-80 ms.
+        const TURN_FRAMES: usize = 8;
+        for i in 0..TURN_FRAMES {
+            client.send_pcm24(&[i as i16 + 1; FRAME_SAMPLES]);
+        }
+        client.send_control(TunnelControl::PttClose);
+
+        let mut audio_seen = 0usize;
+        loop {
+            let input = timeout(Duration::from_secs(3), server_ep.recv_input())
+                .await
+                .expect("server recv timed out")
+                .expect("server tunnel closed");
+            match input {
+                TunnelInput::Audio(pcm) => {
+                    audio_seen += 1;
+                    assert_eq!(pcm[0] as usize, audio_seen, "audio released in order");
+                }
+                TunnelInput::Control(c) => {
+                    assert_eq!(c, TunnelControl::PttClose);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            audio_seen, TURN_FRAMES,
+            "every audio frame of the turn must arrive before its PttClose"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -298,10 +298,36 @@ async fn pump<T: VoiceTunnel>(
                                     eprintln!("aura: sent push-to-talk message.");
                                 }
                                 PttBatchAction::DiscardTooShort => {
+                                    // Frames were already streamed live; tell
+                                    // the server to drop them, or they would
+                                    // prefix the next committed turn. (From
+                                    // idle — open+close in one batch — nothing
+                                    // was streamed and no control ever sent.)
+                                    if ptt_recording {
+                                        tunnel.send_control(TunnelControl::PttCancel);
+                                    }
                                     ptt_recording = false;
                                     ptt_frames_open = 0;
                                     ptt_warned_near_limit = false;
                                     eprintln!("aura: push-to-talk message was too short; discarded.");
+                                }
+                                PttBatchAction::SendThenRestart => {
+                                    ptt_frames_open = 0;
+                                    ptt_warned_near_limit = false;
+                                    tunnel.send_control(TunnelControl::PttClose);
+                                    eprintln!("aura: sent push-to-talk message.");
+                                    tunnel.send_control(TunnelControl::PttOpen);
+                                    audio.clear_playout();
+                                    eprintln!("aura: recording push-to-talk message.");
+                                }
+                                PttBatchAction::DiscardThenRestart => {
+                                    ptt_frames_open = 0;
+                                    ptt_warned_near_limit = false;
+                                    tunnel.send_control(TunnelControl::PttCancel);
+                                    eprintln!("aura: push-to-talk message was too short; discarded.");
+                                    tunnel.send_control(TunnelControl::PttOpen);
+                                    audio.clear_playout();
+                                    eprintln!("aura: recording push-to-talk message.");
                                 }
                             }
                         }
@@ -355,6 +381,14 @@ enum PttBatchAction {
     Start,
     Send,
     DiscardTooShort,
+    /// Two-plus presses landed in one poll gap while recording: the user
+    /// closed the in-flight turn (long enough to send) and reopened. The close
+    /// must not be collapsed away — a lost `PttClose` leaves the turn open and
+    /// the sent-message feedback never prints.
+    SendThenRestart,
+    /// Same batch shape, but the in-flight turn was under the minimum:
+    /// discard it (cancel server-side) and keep recording the fresh turn.
+    DiscardThenRestart,
 }
 
 #[cfg(windows)]
@@ -369,11 +403,14 @@ fn resolve_ptt_toggles(
     }
     let net_recording = recording ^ (toggles % 2 == 1);
     match (recording, net_recording) {
+        // Opened and closed within one batch: zero frames were streamed in
+        // between, so there is nothing to send or cancel.
         (false, false) => PttBatchAction::DiscardTooShort,
         (false, true) => PttBatchAction::Start,
         (true, false) if recorded_frames >= min_frames => PttBatchAction::Send,
         (true, false) => PttBatchAction::DiscardTooShort,
-        (true, true) => PttBatchAction::None,
+        (true, true) if recorded_frames >= min_frames => PttBatchAction::SendThenRestart,
+        (true, true) => PttBatchAction::DiscardThenRestart,
     }
 }
 
@@ -608,6 +645,24 @@ mod tests {
             resolve_ptt_toggles(false, 2, 0, 10),
             PttBatchAction::DiscardTooShort
         );
-        assert_eq!(resolve_ptt_toggles(true, 2, 20, 10), PttBatchAction::None);
+        // Three presses from idle: the intermediate open+close pair streamed
+        // zero frames, so a single Start is the whole batch.
+        assert_eq!(resolve_ptt_toggles(false, 3, 0, 10), PttBatchAction::Start);
+    }
+
+    #[test]
+    fn ptt_double_press_while_recording_preserves_the_close() {
+        // Two presses in one poll gap while recording is close+reopen — the
+        // in-flight turn must be SENT (or cancelled), never collapsed to None:
+        // a swallowed PttClose leaves the turn open until the safety cap.
+        assert_eq!(
+            resolve_ptt_toggles(true, 2, 20, 10),
+            PttBatchAction::SendThenRestart
+        );
+        assert_eq!(
+            resolve_ptt_toggles(true, 2, 9, 10),
+            PttBatchAction::DiscardThenRestart
+        );
+        assert_eq!(resolve_ptt_toggles(true, 3, 20, 10), PttBatchAction::Send);
     }
 }

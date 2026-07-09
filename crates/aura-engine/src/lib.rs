@@ -150,6 +150,10 @@ pub trait AudioTransport: Send {
 pub enum TransportControl {
     PttOpen,
     PttClose,
+    /// Abandon the open push-to-talk turn WITHOUT committing it (the client
+    /// discarded a too-short recording): drop the already-streamed frames from
+    /// the provider input buffer so they cannot prefix the next turn.
+    PttCancel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,8 +375,26 @@ impl CallSession {
                         }
                         Some(TransportInput::Control(TransportControl::PttOpen)) => {
                             if cfg.manual_turn_detection {
+                                // A PTT press while Aura is speaking is a
+                                // barge-in and gets the SAME atomic unit as the
+                                // VAD path: heard-position capture → clear
+                                // playout → cancel + suppress → truncate at the
+                                // heard position. Plus PTT hygiene: clear any
+                                // un-committed provider input (a discarded
+                                // too-short snippet, or a prior turn's stray
+                                // tail) so it cannot prepend onto this turn.
                                 state.ptt_input_samples = 0;
-                                transport.clear_playout();
+                                if let Err(flow_reason) = ptt_barge_in(transport.as_mut(), sink.as_mut(), &mut state).await {
+                                    match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), flow_reason).await {
+                                        Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
+                                        None => break Transition::Ended(EndReason::ReconnectExhausted),
+                                    }
+                                } else if sink.clear_user_audio().await.is_err() {
+                                    match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk clear failed").await {
+                                        Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
+                                        None => break Transition::Ended(EndReason::ReconnectExhausted),
+                                    }
+                                }
                             } else {
                                 eprintln!("aura-engine: ignoring PTT open in voice mode.");
                             }
@@ -395,6 +417,22 @@ impl CallSession {
                             state.ptt_input_samples = 0;
                             if sink.commit_user_turn().await.is_err() {
                                 match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk commit failed").await {
+                                    Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
+                                    None => break Transition::Ended(EndReason::ReconnectExhausted),
+                                }
+                            }
+                        }
+                        Some(TransportInput::Control(TransportControl::PttCancel)) => {
+                            if !cfg.manual_turn_detection {
+                                eprintln!("aura-engine: ignoring PTT cancel in voice mode.");
+                                continue;
+                            }
+                            // The client discarded the open turn: drop the
+                            // frames it already streamed so they cannot prefix
+                            // the next committed turn.
+                            state.ptt_input_samples = 0;
+                            if sink.clear_user_audio().await.is_err() {
+                                match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk clear failed").await {
                                     Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
                                     None => break Transition::Ended(EndReason::ReconnectExhausted),
                                 }
@@ -687,6 +725,38 @@ async fn handle_event(
             }
         }
     }
+}
+
+/// The barge-in unit for a push-to-talk press, mirroring the VAD
+/// `UserSpeechStarted` path: heard-position capture BEFORE the queue is wiped,
+/// clear playout, cancel + suppress as one block (all tool calls are gated on
+/// `suppress`, so a barged-over response can't pause/hang up the call), then
+/// `conversation.item.truncate` at the heard position so the model's context
+/// drops the unheard tail. Unlike the VAD path there is no decision table: a
+/// PTT press is an explicit interruption, so the unit runs unconditionally.
+/// `Err(reason)` asks the caller to reconnect (same contract as the other
+/// sink-send failures in the loop).
+async fn ptt_barge_in(
+    transport: &mut dyn AudioTransport,
+    sink: &mut dyn VoiceSink,
+    state: &mut CallState,
+) -> Result<(), &'static str> {
+    let heard_ms = (state.item_delivered_samples / 24).saturating_sub(transport.queued_ms());
+    transport.clear_playout();
+    if state.assistant_active {
+        if sink.cancel_response().await.is_err() {
+            return Err("push-to-talk barge-in cancel failed");
+        }
+        state.suppress = true;
+    }
+    if let Some(item_id) = state.current_item.take() {
+        let delivered_ms = state.item_delivered_samples / 24;
+        if heard_ms < delivered_ms && sink.truncate_item(&item_id, heard_ms).await.is_err() {
+            return Err("push-to-talk barge-in truncate failed");
+        }
+        state.item_delivered_samples = 0;
+    }
+    Ok(())
 }
 
 /// Issue a voice-approval token for the spoken intent, inject it, and spawn the
@@ -1473,7 +1543,123 @@ mod tests {
         let log = h.sink_log.lock().unwrap();
         assert_eq!(log.commits, 0);
         assert_eq!(log.requests, 0);
+        // One clear from PttOpen (stale-input hygiene) + one from the
+        // under-minimum PttClose.
+        assert_eq!(log.clears, 2);
+    }
+
+    #[tokio::test]
+    async fn push_to_talk_cancel_clears_streamed_audio_without_committing() {
+        let h = harness_input(
+            vec![Script::Ok {
+                events: vec![VoiceEvent::SessionReady],
+                end: End::Pending,
+            }],
+            vec![
+                TransportInput::Control(TransportControl::PttOpen),
+                TransportInput::Audio(vec![1; MIN_PTT_COMMIT_SAMPLES as usize]),
+                TransportInput::Control(TransportControl::PttCancel),
+            ],
+            true,
+        );
+
+        let _ = CallSession::run(h.transport, h.provider, host(), None, ptt_cfg())
+            .await
+            .unwrap();
+
+        let log = h.sink_log.lock().unwrap();
+        // Even a turn ABOVE the commit minimum is dropped on cancel — the
+        // user discarded it; a commit would answer a discarded message.
+        assert_eq!(log.commits, 0);
+        assert_eq!(log.requests, 0);
+        // One clear from PttOpen (hygiene) + one from the cancel.
+        assert_eq!(log.clears, 2);
+    }
+
+    #[tokio::test]
+    async fn push_to_talk_open_clears_stale_provider_input() {
+        let h = harness_input(
+            vec![Script::Ok {
+                events: vec![VoiceEvent::SessionReady],
+                end: End::Pending,
+            }],
+            vec![TransportInput::Control(TransportControl::PttOpen)],
+            true,
+        );
+
+        let _ = CallSession::run(h.transport, h.provider, host(), None, ptt_cfg())
+            .await
+            .unwrap();
+
+        let log = h.sink_log.lock().unwrap();
+        // A press with no in-flight response still clears the provider input
+        // buffer, dropping any stray tail from a prior/discarded turn.
         assert_eq!(log.clears, 1);
+        assert_eq!(log.cancels, 0);
+    }
+
+    #[tokio::test]
+    async fn ptt_barge_in_runs_the_full_cancel_suppress_truncate_unit() {
+        let sink_log = Arc::new(Mutex::new(SinkLog::default()));
+        let mut sink = FakeSink {
+            log: sink_log.clone(),
+        };
+        let cleared = Arc::new(AtomicUsize::new(0));
+        let mut transport = FakeTransport {
+            input: Mutex::new(VecDeque::new()),
+            hangup_when_empty: true,
+            played: Arc::new(Mutex::new(Vec::new())),
+            cleared: cleared.clone(),
+            // 400 ms still queued (unheard) at press time.
+            queued_ms: AtomicU64::new(400),
+        };
+        let mut state = CallState {
+            assistant_active: true,
+            current_item: Some("item-7".to_owned()),
+            item_delivered_samples: 24_000, // 1000 ms delivered
+            ..CallState::default()
+        };
+
+        ptt_barge_in(&mut transport, &mut sink, &mut state)
+            .await
+            .unwrap();
+
+        let log = sink_log.lock().unwrap();
+        assert_eq!(log.cancels, 1);
+        assert!(state.suppress, "cancel and suppress are one block");
+        // Heard = delivered (1000 ms) minus queued (400 ms), captured BEFORE
+        // clear_playout wiped the queue.
+        assert_eq!(log.truncates, vec![("item-7".to_owned(), 600)]);
+        assert_eq!(cleared.load(Ordering::SeqCst), 1);
+        assert_eq!(state.current_item, None);
+        assert_eq!(state.item_delivered_samples, 0);
+    }
+
+    #[tokio::test]
+    async fn ptt_barge_in_without_active_response_only_clears_playout() {
+        let sink_log = Arc::new(Mutex::new(SinkLog::default()));
+        let mut sink = FakeSink {
+            log: sink_log.clone(),
+        };
+        let cleared = Arc::new(AtomicUsize::new(0));
+        let mut transport = FakeTransport {
+            input: Mutex::new(VecDeque::new()),
+            hangup_when_empty: true,
+            played: Arc::new(Mutex::new(Vec::new())),
+            cleared: cleared.clone(),
+            queued_ms: AtomicU64::new(0),
+        };
+        let mut state = CallState::default();
+
+        ptt_barge_in(&mut transport, &mut sink, &mut state)
+            .await
+            .unwrap();
+
+        let log = sink_log.lock().unwrap();
+        assert_eq!(log.cancels, 0);
+        assert!(!state.suppress);
+        assert!(log.truncates.is_empty());
+        assert_eq!(cleared.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

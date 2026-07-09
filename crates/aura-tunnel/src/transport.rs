@@ -37,6 +37,9 @@ impl AudioTransport for TunnelTransport {
             TunnelInput::Control(TunnelControl::PttClose) => {
                 TransportInput::Control(TransportControl::PttClose)
             }
+            TunnelInput::Control(TunnelControl::PttCancel) => {
+                TransportInput::Control(TransportControl::PttCancel)
+            }
         })
     }
 

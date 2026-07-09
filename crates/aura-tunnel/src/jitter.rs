@@ -47,6 +47,12 @@ pub struct JitterBuffer {
 /// the missing packet lost and skipping it.
 const LOSS_SKIP_TICKS: usize = 3;
 
+/// A forward sequence jump larger than this (5 s of frames) is a stream
+/// restart, not loss: the sender was idle (keepalives consume nonces but are
+/// never pushed here — e.g. a push-to-talk client between turns) and resumed.
+/// Resync the release baseline instead of walking the phantom gap.
+const RESYNC_GAP_FRAMES: u16 = 250;
+
 impl Default for JitterBuffer {
     fn default() -> Self {
         Self::new()
@@ -88,11 +94,22 @@ impl JitterBuffer {
     }
 
     /// Insert a packet. Packets older than `next_pop` (already released) are
-    /// dropped as too-late. The first packet establishes the release baseline.
+    /// dropped as too-late. The first packet establishes the release baseline;
+    /// a huge forward jump (sender was idle, e.g. a gated push-to-talk mic)
+    /// re-establishes it instead of walking thousands of phantom losses.
     pub fn push(&mut self, seq: u16, payload: Vec<u8>) {
         match self.next_pop {
             None => self.next_pop = Some(seq),
             Some(np) if seq != np && !seq_after(seq, np) => return, // too late
+            Some(np) if seq.wrapping_sub(np) > RESYNC_GAP_FRAMES => {
+                // Stream restart after idle: drop pre-gap stragglers and
+                // release from the new position.
+                self.entries.clear();
+                self.next_pop = Some(seq);
+                self.highest = None;
+                self.playing = false;
+                self.stuck = 0;
+            }
             _ => {}
         }
         match self.highest {
@@ -108,40 +125,46 @@ impl JitterBuffer {
     /// buffer (span > MAX) it treats the gap as loss, skips it, and bumps the
     /// target up (adaptation).
     pub fn pop(&mut self) -> Option<Vec<u8>> {
-        let np = self.next_pop?;
         if !self.playing {
+            self.next_pop?;
             // Pre-buffer: wait until the initial target depth is reached.
             if self.span() < self.target {
                 return None;
             }
             self.playing = true;
         }
-        if let Some(payload) = self.entries.remove(&np) {
-            self.next_pop = Some(np.wrapping_add(1));
+        // Iterative (a skip re-examines the NEXT slot; a long run of losses
+        // must not grow the stack).
+        loop {
+            let np = self.next_pop?;
+            if let Some(payload) = self.entries.remove(&np) {
+                self.next_pop = Some(np.wrapping_add(1));
+                self.stuck = 0;
+                return Some(payload);
+            }
+            // Missing packet at `np`. Are later frames already buffered behind it?
+            let have_later =
+                self.highest.is_some_and(|h| seq_after(h, np)) && !self.entries.is_empty();
+            // Skip the gap as a confirmed loss when the buffer is overfull, OR when
+            // later frames have sat behind it for `LOSS_SKIP_TICKS` (a tail-of-spurt
+            // loss never grows span past MAX, so the time bound is what frees those
+            // trailing frames instead of stranding them). Skipping adapts target up.
+            if self.span() > MAX_DEPTH_FRAMES || (have_later && self.stuck + 1 >= LOSS_SKIP_TICKS) {
+                self.target = (self.target + 1).min(MAX_DEPTH_FRAMES);
+                self.next_pop = Some(np.wrapping_add(1));
+                self.stuck = 0;
+                continue;
+            }
+            if have_later {
+                // Wait a few ticks for a reordered packet before declaring loss.
+                self.stuck += 1;
+                return None;
+            }
+            // True underrun: nothing buffered ahead; re-buffer to the target.
+            self.playing = false;
             self.stuck = 0;
-            return Some(payload);
-        }
-        // Missing packet at `np`. Are later frames already buffered behind it?
-        let have_later = self.highest.is_some_and(|h| seq_after(h, np)) && !self.entries.is_empty();
-        // Skip the gap as a confirmed loss when the buffer is overfull, OR when
-        // later frames have sat behind it for `LOSS_SKIP_TICKS` (a tail-of-spurt
-        // loss never grows span past MAX, so the time bound is what frees those
-        // trailing frames instead of stranding them). Skipping adapts target up.
-        if self.span() > MAX_DEPTH_FRAMES || (have_later && self.stuck + 1 >= LOSS_SKIP_TICKS) {
-            self.target = (self.target + 1).min(MAX_DEPTH_FRAMES);
-            self.next_pop = Some(np.wrapping_add(1));
-            self.stuck = 0;
-            return self.pop();
-        }
-        if have_later {
-            // Wait a few ticks for a reordered packet before declaring loss.
-            self.stuck += 1;
             return None;
         }
-        // True underrun: nothing buffered ahead; re-buffer to the target.
-        self.playing = false;
-        self.stuck = 0;
-        None
     }
 }
 
@@ -218,6 +241,23 @@ mod tests {
         assert_eq!(jb.pop(), Some(pkt(6)));
         assert_eq!(jb.pop(), Some(pkt(7)));
         assert!(!jb.entries.contains_key(&5));
+    }
+
+    #[test]
+    fn resyncs_after_long_idle_gap_instead_of_walking_it() {
+        let mut jb = JitterBuffer::new();
+        jb.push(0, pkt(0));
+        jb.push(1, pkt(1));
+        assert_eq!(jb.pop(), Some(pkt(0)));
+        assert_eq!(jb.pop(), Some(pkt(1)));
+        // Sender goes idle (keepalives consume seqs 2..=5000 but are never
+        // pushed), then resumes: a fresh spurt far ahead of next_pop.
+        jb.push(5_000, pkt(10));
+        jb.push(5_001, pkt(11));
+        // Re-buffers from the new baseline and releases the spurt in order —
+        // no thousands of phantom-loss skips first.
+        assert_eq!(jb.pop(), Some(pkt(10)));
+        assert_eq!(jb.pop(), Some(pkt(11)));
     }
 
     #[test]
