@@ -6,9 +6,10 @@
 //! are the client's mic; outbound frames are the model's audio, paced at 20 ms
 //! and dropped on barge-in (`clear_playout`).
 
-use aura_engine::{AudioTransport, TransportError};
+use aura_engine::{AudioTransport, TransportControl, TransportError, TransportInput};
 
 use crate::endpoint::TunnelEndpoint;
+use crate::wire::{TunnelControl, TunnelInput};
 
 /// Wraps a [`TunnelEndpoint`] as the engine's audio transport.
 pub struct TunnelTransport {
@@ -25,6 +26,21 @@ impl TunnelTransport {
 impl AudioTransport for TunnelTransport {
     async fn recv_pcm24(&mut self) -> Option<Vec<i16>> {
         self.endpoint.recv_pcm24().await
+    }
+
+    async fn recv_input(&mut self) -> Option<TransportInput> {
+        self.endpoint.recv_input().await.map(|input| match input {
+            TunnelInput::Audio(pcm) => TransportInput::Audio(pcm),
+            TunnelInput::Control(TunnelControl::PttOpen) => {
+                TransportInput::Control(TransportControl::PttOpen)
+            }
+            TunnelInput::Control(TunnelControl::PttClose) => {
+                TransportInput::Control(TransportControl::PttClose)
+            }
+            TunnelInput::Control(TunnelControl::PttCancel) => {
+                TransportInput::Control(TransportControl::PttCancel)
+            }
+        })
     }
 
     async fn send_pcm24(&mut self, pcm: &[i16]) -> Result<(), TransportError> {

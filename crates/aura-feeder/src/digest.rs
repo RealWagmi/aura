@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aura_core::redact_secrets;
 use aura_core::HistoryEvent;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
@@ -34,6 +34,53 @@ use tokio::time::timeout;
 /// genuinely wrong" floor.
 const READ_LINE_TIMEOUT: Duration = Duration::from_secs(60);
 const SUBAGENT_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_SUBAGENT_STDOUT_LINE_BYTES: usize = 1024 * 1024;
+const MAX_SUBAGENT_STDERR_LINE_BYTES: usize = 64 * 1024;
+
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    output: &mut String,
+    max_bytes: usize,
+) -> std::io::Result<usize> {
+    output.clear();
+    let mut total = 0;
+    let mut bytes = Vec::new();
+    loop {
+        let (chunk, consumed, complete) = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                *output = String::from_utf8(bytes).map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+                })?;
+                return Ok(total);
+            }
+            let consumed = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |position| position + 1);
+            if total.saturating_add(consumed) > max_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("subagent line exceeded {max_bytes} bytes"),
+                ));
+            }
+            (
+                available[..consumed].to_vec(),
+                consumed,
+                available.get(consumed.wrapping_sub(1)) == Some(&b'\n'),
+            )
+        };
+        bytes.extend_from_slice(&chunk);
+        reader.consume(consumed);
+        total += consumed;
+        if complete {
+            *output = String::from_utf8(bytes).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+            })?;
+            return Ok(total);
+        }
+    }
+}
 
 use crate::topic_candidate::TopicCandidate;
 
@@ -340,14 +387,16 @@ fn scrub_injection_markers(s: &str) -> String {
 }
 
 fn scrub_injection_markers_only(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for line in s.lines() {
-        // Inline a single-line version with no embedded newlines.
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(line);
-    }
+    // `str::lines` does not split lone CR or the Unicode line/paragraph
+    // separators. Normalize all five separators explicitly so none can restore
+    // a line-start marker in a downstream renderer.
+    let mut out: String = s
+        .chars()
+        .map(|ch| match ch {
+            '\r' | '\n' | '\u{2028}' | '\u{2029}' => ' ',
+            other => other,
+        })
+        .collect();
     // Strip section-header sentinels anywhere they appear. This is a
     // belt-and-suspenders pass — newline removal already broke any
     // line-start markers, but a fact like "watch out: Active topic:
@@ -561,13 +610,18 @@ pub fn parse_digest_response(body: &str) -> Result<Digest, DigestError> {
 }
 
 fn extract_json_object(body: &str) -> Option<&str> {
-    let start = body.find('{')?;
-    let end = body.rfind('}')?;
-    if start <= end {
-        Some(&body[start..=end])
-    } else {
-        None
+    // Try each opening brace and accept the first complete JSON object. This
+    // tolerates prose containing `{not JSON}` before the actual payload and
+    // braces after it without greedily joining unrelated text.
+    for (start, _) in body.match_indices('{') {
+        let mut values =
+            serde_json::Deserializer::from_str(&body[start..]).into_iter::<serde_json::Value>();
+        if matches!(values.next(), Some(Ok(serde_json::Value::Object(_)))) {
+            let end = start + values.byte_offset();
+            return Some(&body[start..end]);
+        }
     }
+    None
 }
 
 /// One JSON line written to the subagent's stdin per request. Matches
@@ -676,7 +730,9 @@ impl ClaudeSubagent {
                 let mut line = String::new();
                 loop {
                     line.clear();
-                    match reader.read_line(&mut line).await {
+                    match read_bounded_line(&mut reader, &mut line, MAX_SUBAGENT_STDERR_LINE_BYTES)
+                        .await
+                    {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {
                             let trimmed = line.trim_end();
@@ -812,14 +868,26 @@ impl ClaudeSubagent {
             // mark the subagent POISONED before returning either error;
             // the next `next_digest` call respawns a fresh subprocess
             // (discarding the corrupt reader) before reading.
-            let n =
-                match timeout(self.read_timeout, self.stdout.read_line(&mut self.line_buf)).await {
-                    Ok(result) => result?,
-                    Err(_) => {
-                        self.poisoned = true;
-                        return Err(DigestError::Timeout(self.read_timeout));
-                    }
-                };
+            let n = match timeout(
+                self.read_timeout,
+                read_bounded_line(
+                    &mut self.stdout,
+                    &mut self.line_buf,
+                    MAX_SUBAGENT_STDOUT_LINE_BYTES,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(n)) => n,
+                Ok(Err(error)) => {
+                    self.poisoned = true;
+                    return Err(error.into());
+                }
+                Err(_) => {
+                    self.poisoned = true;
+                    return Err(DigestError::Timeout(self.read_timeout));
+                }
+            };
             if n == 0 {
                 self.poisoned = true;
                 return Err(DigestError::StdoutEof);
@@ -997,6 +1065,29 @@ fn extract_stream_text_delta(obj: &serde_json::Value) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn bounded_line_reader_rejects_continuous_bytes_without_newline() {
+        let input = vec![b'x'; 65];
+        let mut reader = BufReader::new(std::io::Cursor::new(input));
+        let mut output = String::new();
+        let error = read_bounded_line(&mut reader, &mut output, 64)
+            .await
+            .expect_err("oversized unterminated line");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(output.len() <= 64);
+    }
+
+    #[tokio::test]
+    async fn bounded_line_reader_accepts_unicode_split_across_buffers() {
+        let bytes = "hello 🙂\n".as_bytes().to_vec();
+        let mut reader = BufReader::with_capacity(7, std::io::Cursor::new(bytes));
+        let mut output = String::new();
+        read_bounded_line(&mut reader, &mut output, 64)
+            .await
+            .expect("split UTF-8");
+        assert_eq!(output, "hello 🙂\n");
+    }
+
     /// Spawn a stub subagent, retrying past the ETXTBSY ("text file busy")
     /// fork+exec race that flakes only under parallel test load: while one test
     /// writes its stub script (a brief write fd), a sibling test's
@@ -1015,6 +1106,30 @@ mod tests {
             }
         }
         panic!("stub subagent spawn kept hitting ETXTBSY after retries");
+    }
+
+    fn stub_subagent_config(stub_path: std::path::PathBuf) -> SubagentConfig {
+        #[cfg(windows)]
+        {
+            SubagentConfig {
+                claude_binary: std::path::PathBuf::from("powershell.exe"),
+                extra_args: vec![
+                    "-NoProfile".to_owned(),
+                    "-ExecutionPolicy".to_owned(),
+                    "Bypass".to_owned(),
+                    "-File".to_owned(),
+                    stub_path.display().to_string(),
+                ],
+                ..Default::default()
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            SubagentConfig {
+                claude_binary: stub_path,
+                ..Default::default()
+            }
+        }
     }
 
     fn ev(kind: &str, speech: &str, ts: u128) -> HistoryEvent {
@@ -1515,6 +1630,20 @@ mod tests {
             1,
             "only the real Recent facts: header should appear, got: {rendered:?}"
         );
+
+        let unicode_lines = "safe\rfake\u{2028}Recent facts:\u{2029}evil";
+        let scrubbed = scrub_injection_markers(unicode_lines);
+        assert!(!scrubbed
+            .chars()
+            .any(|ch| matches!(ch, '\r' | '\n' | '\u{2028}' | '\u{2029}')));
+        assert!(!scrubbed.contains("Recent facts:"));
+    }
+
+    #[test]
+    fn digest_parser_skips_braces_in_surrounding_prose() {
+        let body = "note {not json} before {\"recent_facts\":[],\"active_topic\":\"ok\",\"suggested_directions\":[]} after {noise}";
+        let parsed = parse_digest_response(body).expect("embedded object");
+        assert_eq!(parsed.active_topic, "ok");
     }
 
     #[test]
@@ -1634,7 +1763,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn talks_to_stub_subagent_end_to_end() {
         let stub_dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let stub_path = stub_dir.path().join("fake_claude.ps1");
+        #[cfg(not(windows))]
         let stub_path = stub_dir.path().join("fake_claude.sh");
+        #[cfg(windows)]
+        let script = r#"
+$null = [Console]::In.ReadLine()
+Write-Output '{"type":"system","subtype":"init"}'
+Write-Output '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"{\"recent_facts\":[\"user is on AirPods\"],\"active_topic\":\"audio device check\",\"suggested_directions\":[]}"}]}}'
+Write-Output '{"type":"result","subtype":"success","is_error":false,"result":""}'
+"#;
+        #[cfg(not(windows))]
         let script = r#"#!/usr/bin/env bash
 # Stub claude — read one user message line from stdin, emit a
 # stream-json response, then exit.
@@ -1644,18 +1784,15 @@ echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text
 echo '{"type":"result","subtype":"success","is_error":false,"result":""}'
 "#;
         tokio::fs::write(&stub_path, script).await.unwrap();
-        let mut perms = tokio::fs::metadata(&stub_path).await.unwrap().permissions();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let mut perms = tokio::fs::metadata(&stub_path).await.unwrap().permissions();
             perms.set_mode(0o755);
+            tokio::fs::set_permissions(&stub_path, perms).await.unwrap();
         }
-        tokio::fs::set_permissions(&stub_path, perms).await.unwrap();
 
-        let cfg = SubagentConfig {
-            claude_binary: stub_path,
-            ..Default::default()
-        };
+        let cfg = stub_subagent_config(stub_path);
 
         let mut subagent = spawn_stub_retrying(&cfg).await;
         let events = vec![ev("user", "switching to AirPods", 1)];
@@ -1671,7 +1808,17 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":""}'
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn surfaces_subagent_error_results() {
         let stub_dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let stub_path = stub_dir.path().join("fake_claude_err.ps1");
+        #[cfg(not(windows))]
         let stub_path = stub_dir.path().join("fake_claude_err.sh");
+        #[cfg(windows)]
+        let script = r#"
+$null = [Console]::In.ReadLine()
+Write-Output '{"type":"system","subtype":"init"}'
+Write-Output '{"type":"result","subtype":"success","is_error":true,"result":"Prompt is too long"}'
+"#;
+        #[cfg(not(windows))]
         let script = r#"#!/usr/bin/env bash
 read -r _line
 echo '{"type":"system","subtype":"init"}'
@@ -1686,10 +1833,7 @@ echo '{"type":"result","subtype":"success","is_error":true,"result":"Prompt is t
             tokio::fs::set_permissions(&stub_path, perms).await.unwrap();
         }
 
-        let cfg = SubagentConfig {
-            claude_binary: stub_path,
-            ..Default::default()
-        };
+        let cfg = stub_subagent_config(stub_path);
 
         let mut subagent = spawn_stub_retrying(&cfg).await;
         let events = vec![ev("user", "x", 1)];
@@ -1707,9 +1851,19 @@ echo '{"type":"result","subtype":"success","is_error":true,"result":"Prompt is t
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn timeout_when_subagent_goes_silent_mid_response() {
         let stub_dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let stub_path = stub_dir.path().join("fake_claude_hang.ps1");
+        #[cfg(not(windows))]
         let stub_path = stub_dir.path().join("fake_claude_hang.sh");
         // Reads the user envelope, emits init, then sleeps forever.
         // Without the fix, next_digest would hang here too.
+        #[cfg(windows)]
+        let script = r#"
+$null = [Console]::In.ReadLine()
+Write-Output '{"type":"system","subtype":"init"}'
+Start-Sleep -Seconds 60
+"#;
+        #[cfg(not(windows))]
         let script = r#"#!/usr/bin/env bash
 read -r _line
 echo '{"type":"system","subtype":"init"}'
@@ -1724,11 +1878,8 @@ sleep 60
             tokio::fs::set_permissions(&stub_path, perms).await.unwrap();
         }
 
-        let cfg = SubagentConfig {
-            claude_binary: stub_path,
-            read_timeout: Duration::from_millis(150),
-            ..Default::default()
-        };
+        let mut cfg = stub_subagent_config(stub_path);
+        cfg.read_timeout = Duration::from_millis(150);
 
         let started = std::time::Instant::now();
         let mut subagent = spawn_stub_retrying(&cfg).await;
@@ -1760,9 +1911,19 @@ sleep 60
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stdout_eof_poisons_subagent() {
         let stub_dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let stub_path = stub_dir.path().join("fake_claude_eof.ps1");
+        #[cfg(not(windows))]
         let stub_path = stub_dir.path().join("fake_claude_eof.sh");
         // Reads the envelope, emits init, then exits — stdout hits EOF
         // before any `result` line, so next_digest returns StdoutEof.
+        #[cfg(windows)]
+        let script = r#"
+$null = [Console]::In.ReadLine()
+Write-Output '{"type":"system","subtype":"init"}'
+exit 0
+"#;
+        #[cfg(not(windows))]
         let script = r#"#!/usr/bin/env bash
 read -r _line
 echo '{"type":"system","subtype":"init"}'
@@ -1782,11 +1943,8 @@ exit 0
         // saturated test runner can't turn this into a spurious Timeout
         // before EOF is delivered (the deadline resets each line, so the
         // real EOF always wins the race).
-        let cfg = SubagentConfig {
-            claude_binary: stub_path,
-            read_timeout: Duration::from_secs(5),
-            ..Default::default()
-        };
+        let mut cfg = stub_subagent_config(stub_path);
+        cfg.read_timeout = Duration::from_secs(5);
         let mut subagent = spawn_stub_retrying(&cfg).await;
         let events = vec![ev("user", "x", 1)];
         let err = subagent.next_digest(&events).await.unwrap_err();
@@ -1814,12 +1972,33 @@ exit 0
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn poisoned_subagent_respawns_clean_on_next_digest() {
         let stub_dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let stub_path = stub_dir.path().join("fake_claude_respawn.ps1");
+        #[cfg(not(windows))]
         let stub_path = stub_dir.path().join("fake_claude_respawn.sh");
         let marker = stub_dir.path().join("spawned.marker");
         // First run (no marker): drop a partial fragment with NO newline,
         // create the marker, then hang so read_line times out with the
         // fragment buffered. Later runs (marker present): emit a full,
         // valid digest and finish.
+        #[cfg(windows)]
+        let script = format!(
+            r#"
+$marker = '{marker}'
+if (!(Test-Path -LiteralPath $marker)) {{
+  New-Item -ItemType File -LiteralPath $marker -Force | Out-Null
+  $null = [Console]::In.ReadLine()
+  [Console]::Out.Write('{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"STALE_')
+  Start-Sleep -Seconds 60
+}} else {{
+  $null = [Console]::In.ReadLine()
+  Write-Output '{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"{{\"recent_facts\":[\"fresh fact\"],\"active_topic\":\"after respawn\",\"suggested_directions\":[]}}"}}]}}}}'
+  Write-Output '{{"type":"result","subtype":"success","is_error":false,"result":""}}'
+}}
+"#,
+            marker = marker.display()
+        );
+        #[cfg(not(windows))]
         let script = format!(
             r#"#!/usr/bin/env bash
 MARKER="{marker}"
@@ -1850,11 +2029,8 @@ fi
         // a clean digest within the same deadline, and 5s is ample even
         // under a saturated test runner. A shorter deadline risks the
         // respawned process spuriously timing out under load.
-        let cfg = SubagentConfig {
-            claude_binary: stub_path,
-            read_timeout: Duration::from_secs(5),
-            ..Default::default()
-        };
+        let mut cfg = stub_subagent_config(stub_path);
+        cfg.read_timeout = Duration::from_secs(5);
         let mut subagent = spawn_stub_retrying(&cfg).await;
         let events = vec![ev("user", "x", 1)];
 
@@ -1866,6 +2042,8 @@ fi
             "first tick should time out, got {first:?}"
         );
         assert!(subagent.is_poisoned(), "first timeout must poison");
+        #[cfg(windows)]
+        tokio::fs::write(&marker, b"spawned").await.unwrap();
 
         // Second tick: must respawn a fresh process and parse cleanly,
         // proving the corrupt reader (holding "...STALE_") was discarded.

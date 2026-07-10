@@ -4,7 +4,7 @@
 //! the default build is untouched.
 //!
 //! It is a faithful analog of [`crate::endpoint::TunnelEndpoint`]: the SAME
-//! Noise_NNpsk0 session, [`Reframer`], [`JitterBuffer`] and 20 ms pacer. Only
+//! Noise_NNpsk0 session, reframer, [`JitterBuffer`] and 20 ms pacer. Only
 //! the "socket" changes:
 //! - **audio** rides iroh **QUIC datagrams** (unreliable, unordered — exactly
 //!   like our UDP path, so the per-packet-nonce framing + jitter buffer apply
@@ -18,7 +18,7 @@
 //! peer's endpoint key and moves bytes through NAT; the per-call PSK authorises
 //! *this* call. Security model unchanged from the direct transport.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,28 +27,30 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{interval, timeout, MissedTickBehavior};
+use tokio::time::{interval, timeout_at, Instant, MissedTickBehavior};
 
 use crate::endpoint::TunnelConfig;
-use crate::jitter::JitterBuffer;
+use crate::jitter::{JitterBuffer, PushResult};
 use crate::noise::{self, Transport, MAX_HANDSHAKE_MSG};
-use crate::reframe::Reframer;
+use crate::outbound::{bytes_to_pcm, Outbound};
+use crate::replay::{ReplayStatus, ReplayWindow};
 use crate::session::SessionSecret;
-use crate::wire::{decode_transport, encode_transport, TAG_TRANSPORT};
+use crate::wire::{
+    decode_control_ack, decode_reliable_control, decode_transport, decode_tunnel_control,
+    encode_reliable_control, encode_transport, TunnelControl, TunnelInput, TAG_TRANSPORT,
+};
 
 /// ALPN identifying the aura voice tunnel over iroh. Both sides must match, or
 /// iroh aborts the connection in its handshake.
-pub const ALPN: &[u8] = b"aura/voice/0";
+pub const ALPN: &[u8] = b"aura/voice/2";
 
 /// 20 ms @ 24 kHz mono.
 const FRAME_SAMPLES: usize = 480;
 const FRAME_MS: u64 = 20;
-/// Outbound queue cap — a MEMORY backstop only (matches the direct transport).
-/// The model bursts a full answer faster than realtime, so the queue must hold
-/// a whole LONG answer or drop-oldest audibly eats words (live-diagnosed on the
-/// direct transport at the old 30 s cap; see `endpoint.rs`). 5 min @ 50
-/// frames/s = 15 000 frames ≈ 14 MB; overflow is logged loudly.
-const MAX_OUTBOUND_FRAMES: usize = 15_000;
+const CONTROL_RETRY: Duration = Duration::from_millis(100);
+const CONTROL_DEDUP_CAPACITY: usize = 128;
+const IROH_AUTH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_REJECTED_IROH_CONNECTIONS: usize = 32;
 
 /// Which iroh preset (relay + discovery) to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,21 +80,6 @@ fn ierr<E: std::fmt::Display>(e: E) -> IrohError {
     IrohError::Iroh(e.to_string())
 }
 
-fn pcm_to_bytes(pcm: &[i16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(pcm.len() * 2);
-    for s in pcm {
-        out.extend_from_slice(&s.to_le_bytes());
-    }
-    out
-}
-
-fn bytes_to_pcm(bytes: &[u8]) -> Vec<i16> {
-    bytes
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
-        .collect()
-}
-
 /// Generate an ephemeral iroh endpoint identity (one per call — the per-call
 /// `EndpointId` is what the connection string carries; matches the single-use
 /// secret model).
@@ -108,6 +95,7 @@ async fn build_endpoint(
     preset: IrohPreset,
     secret_key: SecretKey,
     accept_alpn: Option<&[u8]>,
+    startup_deadline: Instant,
 ) -> Result<Endpoint, IrohError> {
     let builder = match preset {
         IrohPreset::Production => Endpoint::builder(presets::N0),
@@ -130,12 +118,17 @@ async fn build_endpoint(
             )
             .map_err(ierr)?;
     }
-    let endpoint = builder.bind().await.map_err(ierr)?;
+    let endpoint = timeout_at(startup_deadline, builder.bind())
+        .await
+        .map_err(|_| IrohError::HandshakeTimeout)?
+        .map_err(ierr)?;
     // `online()` waits for a relay home; with relay disabled (LocalDirect) it
     // would never resolve. Only the Production path needs to wait for relay/
     // discovery registration before its address is dialable.
     if preset == IrohPreset::Production {
-        endpoint.online().await;
+        timeout_at(startup_deadline, endpoint.online())
+            .await
+            .map_err(|_| IrohError::HandshakeTimeout)?;
     }
     Ok(endpoint)
 }
@@ -165,14 +158,26 @@ async fn read_framed<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<Vec<u8>, Iroh
     Ok(buf)
 }
 
-/// Outbound state behind one lock (same shape as the UDP path): the pacer queue
-/// and the reframer. `clear_outbound` resets both so a stale partial frame can't
-/// prepend onto the next response (barge-in).
-struct Outbound {
-    queue: VecDeque<Vec<i16>>,
-    reframer: Reframer,
-    /// Total frames dropped on overflow (diagnostic; see `MAX_OUTBOUND_FRAMES`).
-    dropped_frames: u64,
+async fn accept_noise_session(
+    conn: &Connection,
+    secret: &SessionSecret,
+    input_mode: Option<crate::wire::TunnelInputMode>,
+) -> Result<Arc<Transport>, IrohError> {
+    let (mut send, mut recv) = conn.accept_bi().await.map_err(ierr)?;
+    let mut hs = noise::responder(secret.as_bytes())?;
+    let mut scratch = [0u8; MAX_HANDSHAKE_MSG];
+    let msg1 = read_framed(&mut recv).await?;
+    let payload_len = hs
+        .read_message(&msg1, &mut scratch)
+        .map_err(|_| IrohError::Handshake("bad msg1 / wrong session secret".to_owned()))?;
+    noise::verify_protocol_payload(&scratch[..payload_len], input_mode)?;
+    let protocol_payload = noise::protocol_payload(input_mode);
+    let n2 = hs
+        .write_message(&protocol_payload, &mut scratch)
+        .map_err(noise::NoiseError::from)?;
+    write_framed(&mut send, &scratch[..n2]).await?;
+    let _ = send.finish();
+    Ok(Arc::new(noise::finalize(hs)?))
 }
 
 /// Aborts the spawned task when the endpoint is dropped.
@@ -189,13 +194,33 @@ impl Drop for AbortOnDrop {
 pub struct IrohServer {
     endpoint: Endpoint,
     preset: IrohPreset,
+    startup_deadline: Instant,
 }
 
 impl IrohServer {
     /// Bind an iroh endpoint that will accept one aura call.
     pub async fn bind(preset: IrohPreset) -> Result<Self, IrohError> {
-        let endpoint = build_endpoint(preset, ephemeral_secret_key()?, Some(ALPN)).await?;
-        Ok(Self { endpoint, preset })
+        Self::bind_with_config(preset, TunnelConfig::default()).await
+    }
+
+    /// Bind with an explicit deadline for production relay/discovery startup.
+    pub async fn bind_with_config(
+        preset: IrohPreset,
+        cfg: TunnelConfig,
+    ) -> Result<Self, IrohError> {
+        let startup_deadline = Instant::now() + cfg.handshake_timeout;
+        let endpoint = build_endpoint(
+            preset,
+            ephemeral_secret_key()?,
+            Some(ALPN),
+            startup_deadline,
+        )
+        .await?;
+        Ok(Self {
+            endpoint,
+            preset,
+            startup_deadline,
+        })
     }
 
     /// This server's endpoint id — the public key the client dials. Goes into
@@ -232,35 +257,50 @@ impl IrohServer {
     ) -> Result<IrohEndpoint, IrohError> {
         // Bound the WHOLE accept (connection + Noise handshake) so a client that
         // connects but stalls mid-handshake can't strand the server.
-        let (conn, transport) = timeout(cfg.handshake_timeout, async {
-            let incoming =
-                self.endpoint.accept().await.ok_or_else(|| {
-                    IrohError::Iroh("endpoint closed before a connection".to_owned())
-                })?;
-            let conn = incoming.await.map_err(ierr)?;
-            // Responder Noise handshake over the bi-stream the client opens.
-            let (mut send, mut recv) = conn.accept_bi().await.map_err(ierr)?;
-            let mut hs = noise::responder(secret.as_bytes())?;
-            let mut scratch = [0u8; MAX_HANDSHAKE_MSG];
-            let msg1 = read_framed(&mut recv).await?;
-            hs.read_message(&msg1, &mut scratch)
-                .map_err(|_| IrohError::Handshake("bad msg1 / wrong session secret".to_owned()))?;
-            let n2 = hs
-                .write_message(&[], &mut scratch)
-                .map_err(noise::NoiseError::from)?;
-            write_framed(&mut send, &scratch[..n2]).await?;
-            let _ = send.finish();
-            Ok::<_, IrohError>((conn, Arc::new(noise::finalize(hs)?)))
-        })
-        .await
-        .map_err(|_| IrohError::HandshakeTimeout)??;
-
-        Ok(IrohEndpoint::spawn(
-            self.endpoint,
-            Arc::new(conn),
-            transport,
-            cfg,
-        ))
+        // `accept` may shorten the bind-time deadline for callers that use the
+        // convenience `bind()` API with a custom accept config, but it can
+        // never restart or extend the original startup clock.
+        let configured_deadline = Instant::now() + cfg.handshake_timeout;
+        let deadline = self.startup_deadline.min(configured_deadline);
+        let mut rejected = 0usize;
+        loop {
+            if rejected >= MAX_REJECTED_IROH_CONNECTIONS {
+                return Err(IrohError::Handshake(
+                    "too many unauthenticated iroh connections".to_owned(),
+                ));
+            }
+            let incoming = timeout_at(deadline, self.endpoint.accept())
+                .await
+                .map_err(|_| IrohError::HandshakeTimeout)?
+                .ok_or_else(|| IrohError::Iroh("endpoint closed before a connection".to_owned()))?;
+            let attempt_deadline = deadline.min(Instant::now() + IROH_AUTH_ATTEMPT_TIMEOUT);
+            let conn = match timeout_at(attempt_deadline, incoming).await {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(_)) | Err(_) => {
+                    rejected += 1;
+                    continue;
+                }
+            };
+            match timeout_at(
+                attempt_deadline,
+                accept_noise_session(&conn, secret, cfg.input_mode),
+            )
+            .await
+            {
+                Ok(Ok(transport)) => {
+                    return Ok(IrohEndpoint::spawn(
+                        self.endpoint,
+                        Arc::new(conn),
+                        transport,
+                        cfg,
+                    ));
+                }
+                Ok(Err(_)) | Err(_) => {
+                    conn.close(0u32.into(), b"aura authentication failed");
+                    rejected += 1;
+                }
+            }
+        }
     }
 }
 
@@ -270,7 +310,7 @@ pub struct IrohEndpoint {
     // Kept alive so the underlying connection survives; dropping it closes the call.
     _endpoint: Endpoint,
     outbound: Arc<Mutex<Outbound>>,
-    inbound_rx: mpsc::Receiver<Vec<i16>>,
+    inbound_rx: mpsc::Receiver<TunnelInput>,
     _send_task: AbortOnDrop,
     _io_task: AbortOnDrop,
 }
@@ -285,22 +325,27 @@ impl IrohEndpoint {
         preset: IrohPreset,
         cfg: TunnelConfig,
     ) -> Result<Self, IrohError> {
-        let endpoint = build_endpoint(preset, ephemeral_secret_key()?, None).await?;
+        let startup_deadline = Instant::now() + cfg.handshake_timeout;
+        let endpoint =
+            build_endpoint(preset, ephemeral_secret_key()?, None, startup_deadline).await?;
         // Bound the WHOLE connect (QUIC connection + Noise handshake) so a server
         // that accepts but never answers msg2 can't strand the client.
-        let (conn, transport) = timeout(cfg.handshake_timeout, async {
+        let (conn, transport) = timeout_at(startup_deadline, async {
             let conn = endpoint.connect(addr, ALPN).await.map_err(ierr)?;
             // Initiator Noise handshake over a fresh bi-stream.
             let (mut send, mut recv) = conn.open_bi().await.map_err(ierr)?;
             let mut hs = noise::initiator(secret.as_bytes())?;
             let mut scratch = [0u8; MAX_HANDSHAKE_MSG];
+            let protocol_payload = noise::protocol_payload(cfg.input_mode);
             let n1 = hs
-                .write_message(&[], &mut scratch)
+                .write_message(&protocol_payload, &mut scratch)
                 .map_err(noise::NoiseError::from)?;
             write_framed(&mut send, &scratch[..n1]).await?;
             let msg2 = read_framed(&mut recv).await?;
-            hs.read_message(&msg2, &mut scratch)
+            let payload_len = hs
+                .read_message(&msg2, &mut scratch)
                 .map_err(noise::NoiseError::from)?;
+            noise::verify_protocol_payload(&scratch[..payload_len], cfg.input_mode)?;
             let _ = send.finish();
             Ok::<_, IrohError>((conn, Arc::new(noise::finalize(hs)?)))
         })
@@ -333,12 +378,9 @@ impl IrohEndpoint {
         transport: Arc<Transport>,
         cfg: TunnelConfig,
     ) -> Self {
-        let outbound = Arc::new(Mutex::new(Outbound {
-            queue: VecDeque::new(),
-            reframer: Reframer::new(FRAME_SAMPLES),
-            dropped_frames: 0,
-        }));
-        let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<i16>>(cfg.inbound_capacity.max(1));
+        let outbound = Arc::new(Mutex::new(Outbound::new(FRAME_SAMPLES)));
+        let (inbound_tx, inbound_rx) = mpsc::channel::<TunnelInput>(cfg.inbound_capacity.max(1));
+        let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<u64>();
 
         // Outbound pacer: every 20 ms send one queued frame as a QUIC datagram,
         // OR (idle) an encrypted empty keepalive — keeps QUIC + any relay/NAT
@@ -351,21 +393,72 @@ impl IrohEndpoint {
                 let mut tick = interval(Duration::from_millis(FRAME_MS));
                 tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
                 let mut nonce: u64 = 0;
+                let mut control_id: u64 = 0;
+                let mut pending: HashMap<u64, (Vec<u8>, tokio::time::Instant)> = HashMap::new();
                 loop {
                     tick.tick().await;
-                    let bytes = outbound
-                        .lock()
-                        .expect("outbound lock")
-                        .queue
-                        .pop_front()
-                        .map(|pcm| pcm_to_bytes(&pcm))
-                        .unwrap_or_default();
+                    while let Ok(id) = ack_rx.try_recv() {
+                        pending.remove(&id);
+                    }
+                    let now = tokio::time::Instant::now();
+                    for (payload, last_sent) in pending.values_mut() {
+                        if now.duration_since(*last_sent) >= CONTROL_RETRY {
+                            match transport.encrypt(nonce, payload) {
+                                Ok(ct) => {
+                                    let dg = encode_transport(nonce, &ct);
+                                    nonce = nonce.wrapping_add(1);
+                                    if conn.send_datagram(dg.into()).is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(_) => return,
+                            }
+                            *last_sent = now;
+                        }
+                    }
+                    if !pending.is_empty() {
+                        // Preserve wire order across loss: later media waits
+                        // until the control is acknowledged. ACKs may pass to
+                        // avoid a simultaneous-control deadlock.
+                        let bytes = outbound
+                            .lock()
+                            .expect("outbound lock")
+                            .pop_priority_ack()
+                            .unwrap_or_default();
+                        match transport.encrypt(nonce, &bytes) {
+                            Ok(ct) => {
+                                let dg = encode_transport(nonce, &ct);
+                                nonce = nonce.wrapping_add(1);
+                                if conn.send_datagram(dg.into()).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                        continue;
+                    }
+                    let mut bytes = {
+                        let mut outbound = outbound.lock().expect("outbound lock");
+                        outbound
+                            .pop_priority_ack()
+                            .or_else(|| outbound.pop_next())
+                            .unwrap_or_default()
+                    };
+                    let reliable_id = decode_tunnel_control(&bytes).map(|control| {
+                        let id = control_id;
+                        control_id = control_id.wrapping_add(1);
+                        bytes = encode_reliable_control(id, control);
+                        id
+                    });
                     match transport.encrypt(nonce, &bytes) {
                         Ok(ct) => {
                             let dg = encode_transport(nonce, &ct);
                             nonce = nonce.wrapping_add(1);
                             if conn.send_datagram(dg.into()).is_err() {
                                 break; // connection gone
+                            }
+                            if let Some(id) = reliable_id {
+                                pending.insert(id, (bytes, tokio::time::Instant::now()));
                             }
                         }
                         Err(_) => break,
@@ -379,10 +472,17 @@ impl IrohEndpoint {
         // closed connection (peer gone / hang-up) ends the task → `recv` None.
         let io_task = {
             let conn = conn.clone();
+            let outbound = outbound.clone();
+            let idle_timeout = cfg.idle_timeout;
             tokio::spawn(async move {
                 let mut jitter = JitterBuffer::new();
                 let mut tick = interval(Duration::from_millis(FRAME_MS));
                 tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                let mut last_recv = tokio::time::Instant::now();
+                let mut replay = ReplayWindow::new();
+                let mut control_ids = HashSet::new();
+                let mut control_id_order = VecDeque::new();
+                let mut pending_control: Option<TunnelInput> = None;
                 loop {
                     tokio::select! {
                         r = conn.read_datagram() => match r {
@@ -391,9 +491,64 @@ impl IrohEndpoint {
                                 if body.first() == Some(&TAG_TRANSPORT) {
                                     if let Some((nonce, ct)) = decode_transport(&body[1..]) {
                                         if let Ok(pt) = transport.decrypt(nonce, ct) {
-                                            // Empty == keepalive (authenticated); not audio.
-                                            if !pt.is_empty() {
-                                                jitter.push(nonce as u16, pt);
+                                            let replay_status = replay.observe(nonce);
+                                            if let Some(id) = decode_control_ack(&pt) {
+                                                if replay_status == ReplayStatus::Fresh {
+                                                    let _ = ack_tx.send(id);
+                                                    last_recv = tokio::time::Instant::now();
+                                                    if pending_control.is_some() {
+                                                        jitter.discard_through(nonce);
+                                                    } else {
+                                                        jitter.push_marker(nonce);
+                                                    }
+                                                }
+                                                continue;
+                                            }
+                                            if replay_status == ReplayStatus::Duplicate {
+                                                if let Some((id, _)) = decode_reliable_control(&pt) {
+                                                    last_recv = tokio::time::Instant::now();
+                                                    if control_ids.contains(&id) {
+                                                        outbound.lock().expect("outbound lock").queue_ack(id);
+                                                    }
+                                                }
+                                                continue;
+                                            }
+                                            if replay_status == ReplayStatus::TooOld {
+                                                continue;
+                                            }
+                                            last_recv = tokio::time::Instant::now();
+                                            if pending_control.is_some() {
+                                                if let Some((id, _)) = decode_reliable_control(&pt) {
+                                                    if control_ids.contains(&id) {
+                                                        outbound.lock().expect("outbound lock").queue_ack(id);
+                                                    }
+                                                }
+                                                jitter.discard_through(nonce);
+                                                continue;
+                                            }
+                                            // Every fresh nonce enters jitter sequencing. Empty
+                                            // keepalives and internal ACKs are marker positions only.
+                                            if pt.is_empty() {
+                                                jitter.push_marker(nonce);
+                                            } else if let Some((id, control)) = decode_reliable_control(&pt) {
+                                                if control_ids.contains(&id) {
+                                                    outbound.lock().expect("outbound lock").queue_ack(id);
+                                                    jitter.push_marker(nonce);
+                                                    continue;
+                                                }
+                                                let terminal = matches!(control, TunnelControl::PttClose | TunnelControl::PttCancel);
+                                                if jitter.push_control(nonce, pt, terminal) == PushResult::Accepted {
+                                                    if control_id_order.len() == CONTROL_DEDUP_CAPACITY {
+                                                        if let Some(oldest) = control_id_order.pop_front() {
+                                                            control_ids.remove(&oldest);
+                                                        }
+                                                    }
+                                                    control_ids.insert(id);
+                                                    control_id_order.push_back(id);
+                                                    outbound.lock().expect("outbound lock").queue_ack(id);
+                                                }
+                                            } else {
+                                                jitter.push(nonce, pt);
                                             }
                                         }
                                     }
@@ -402,8 +557,40 @@ impl IrohEndpoint {
                             Err(_) => break, // connection closed → drop inbound_tx → recv None
                         },
                         _ = tick.tick() => {
+                            if last_recv.elapsed() > idle_timeout {
+                                break;
+                            }
+                            if let Some(input) = pending_control.take() {
+                                match inbound_tx.try_send(input) {
+                                    Ok(()) => continue,
+                                    Err(mpsc::error::TrySendError::Full(input)) => {
+                                        pending_control = Some(input);
+                                        continue;
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                }
+                            }
                             if let Some(bytes) = jitter.pop() {
-                                if inbound_tx.try_send(bytes_to_pcm(&bytes)).is_err()
+                                if bytes.is_empty() {
+                                    continue;
+                                } else if let Some((_id, control)) = decode_reliable_control(&bytes) {
+                                    let input = TunnelInput::Control(control);
+                                    match inbound_tx.try_send(input) {
+                                        Ok(()) => {}
+                                        Err(mpsc::error::TrySendError::Full(input)) => pending_control = Some(input),
+                                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                    }
+                                } else if let Some(control) = decode_tunnel_control(&bytes) {
+                                    // A control is a state transition, not a
+                                    // droppable sample: await channel space
+                                    // (a lost PttClose strands the turn).
+                                    let input = TunnelInput::Control(control);
+                                    match inbound_tx.try_send(input) {
+                                        Ok(()) => {}
+                                        Err(mpsc::error::TrySendError::Full(input)) => pending_control = Some(input),
+                                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                    }
+                                } else if inbound_tx.try_send(TunnelInput::Audio(bytes_to_pcm(&bytes))).is_err()
                                     && inbound_tx.is_closed()
                                 {
                                     break;
@@ -426,52 +613,48 @@ impl IrohEndpoint {
 
     /// Queue model/mic audio for sending, reframed to exact 20 ms frames.
     pub fn send_pcm24(&self, pcm: &[i16]) {
-        let mut out = self.outbound.lock().expect("outbound lock");
-        let frames = out.reframer.push(pcm);
-        for f in frames {
-            out.queue.push_back(f);
-            while out.queue.len() > MAX_OUTBOUND_FRAMES {
-                out.queue.pop_front();
-                out.dropped_frames += 1;
-                // Loud, rate-limited (first drop, then ~1/s of loss): overflow
-                // eats the audio the listener is ABOUT TO HEAR.
-                if out.dropped_frames == 1 || out.dropped_frames.is_multiple_of(50) {
-                    eprintln!(
-                        "aura-tunnel: outbound pacer queue FULL ({} min cap) — {} ms of audio \
-                         dropped; words are being skipped",
-                        MAX_OUTBOUND_FRAMES as u64 / 50 / 60,
-                        out.dropped_frames * FRAME_MS
-                    );
-                }
-            }
-        }
+        self.outbound.lock().expect("outbound lock").push_pcm(pcm);
     }
 
     /// Flush the `<20 ms` reframer tail (padded with silence) so a phrase ending
     /// isn't held back.
     pub fn flush_output(&self) {
-        let mut out = self.outbound.lock().expect("outbound lock");
-        if let Some(mut tail) = out.reframer.flush() {
-            tail.resize(FRAME_SAMPLES, 0);
-            out.queue.push_back(tail);
-        }
+        self.outbound.lock().expect("outbound lock").flush_tail();
+    }
+
+    /// Queue an authenticated control event for the peer, in-order with the
+    /// audio queued before it.
+    pub fn send_control(&self, control: TunnelControl) {
+        self.outbound
+            .lock()
+            .expect("outbound lock")
+            .push_control(control);
+    }
+
+    /// The next inbound audio/control event, or `None` when the tunnel closes.
+    pub async fn recv_input(&mut self) -> Option<TunnelInput> {
+        self.inbound_rx.recv().await
     }
 
     /// The next inbound 20 ms frame, or `None` when the tunnel closes.
     pub async fn recv_pcm24(&mut self) -> Option<Vec<i16>> {
-        self.inbound_rx.recv().await
+        loop {
+            match self.recv_input().await? {
+                TunnelInput::Audio(pcm) => return Some(pcm),
+                TunnelInput::Control(_) => continue,
+            }
+        }
     }
 
-    /// Drop everything queued for sending AND reset the reframer carry (barge-in).
+    /// Drop the queued AUDIO and reset the reframer carry (barge-in). Queued
+    /// control frames are preserved.
     pub fn clear_outbound(&self) {
-        let mut out = self.outbound.lock().expect("outbound lock");
-        out.queue.clear();
-        out.reframer = Reframer::new(FRAME_SAMPLES);
+        self.outbound.lock().expect("outbound lock").clear_audio();
     }
 
     /// Milliseconds of audio queued for sending.
     pub fn outbound_queued_ms(&self) -> u64 {
-        self.outbound.lock().expect("outbound lock").queue.len() as u64 * FRAME_MS
+        self.outbound.lock().expect("outbound lock").queued_ms()
     }
 }
 
@@ -498,6 +681,21 @@ impl aura_engine::AudioTransport for IrohTransport {
         self.endpoint.recv_pcm24().await
     }
 
+    async fn recv_input(&mut self) -> Option<aura_engine::TransportInput> {
+        self.endpoint.recv_input().await.map(|input| match input {
+            TunnelInput::Audio(pcm) => aura_engine::TransportInput::Audio(pcm),
+            TunnelInput::Control(TunnelControl::PttOpen) => {
+                aura_engine::TransportInput::Control(aura_engine::TransportControl::PttOpen)
+            }
+            TunnelInput::Control(TunnelControl::PttClose) => {
+                aura_engine::TransportInput::Control(aura_engine::TransportControl::PttClose)
+            }
+            TunnelInput::Control(TunnelControl::PttCancel) => {
+                aura_engine::TransportInput::Control(aura_engine::TransportControl::PttCancel)
+            }
+        })
+    }
+
     async fn send_pcm24(&mut self, pcm: &[i16]) -> Result<(), aura_engine::TransportError> {
         // Enqueue for the 20 ms pacer; never blocks. A dead peer surfaces as
         // `recv_pcm24() -> None`, the engine's hang-up signal.
@@ -522,6 +720,7 @@ impl aura_engine::AudioTransport for IrohTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::timeout;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn loopback_iroh_handshakes_and_round_trips_pcm() {
@@ -564,6 +763,122 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lone_terminal_control_after_silence_is_released() {
+        let secret = SessionSecret::generate().unwrap();
+        let cfg = TunnelConfig {
+            handshake_timeout: Duration::from_secs(10),
+            ..Default::default()
+        };
+        let server = IrohServer::bind_with_config(IrohPreset::LocalDirect, cfg)
+            .await
+            .unwrap();
+        let server_addr = server.addr();
+        let server_secret = secret.clone();
+        let server_handle =
+            tokio::spawn(async move { server.accept(&server_secret, cfg).await.unwrap() });
+        let client =
+            IrohEndpoint::connect_client(server_addr, &secret, IrohPreset::LocalDirect, cfg)
+                .await
+                .unwrap();
+        let mut server_ep = server_handle.await.unwrap();
+
+        client.send_pcm24(&[1; FRAME_SAMPLES * 2]);
+        for _ in 0..2 {
+            assert!(matches!(
+                timeout(Duration::from_secs(1), server_ep.recv_input())
+                    .await
+                    .unwrap(),
+                Some(TunnelInput::Audio(_))
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        client.send_control(TunnelControl::PttCancel);
+        assert_eq!(
+            timeout(Duration::from_secs(1), server_ep.recv_input())
+                .await
+                .expect("lone terminal control remained stuck"),
+            Some(TunnelInput::Control(TunnelControl::PttCancel))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn iroh_control_does_not_overtake_audio() {
+        let secret = SessionSecret::generate().unwrap();
+        let cfg = TunnelConfig {
+            handshake_timeout: Duration::from_secs(8),
+            ..Default::default()
+        };
+        let server = IrohServer::bind_with_config(IrohPreset::LocalDirect, cfg)
+            .await
+            .unwrap();
+        let addr = server.addr();
+        let server_secret = secret.clone();
+        let server_task =
+            tokio::spawn(async move { server.accept(&server_secret, cfg).await.unwrap() });
+        let client = IrohEndpoint::connect_client(addr, &secret, IrohPreset::LocalDirect, cfg)
+            .await
+            .unwrap();
+        let mut accepted = server_task.await.unwrap();
+
+        client.send_pcm24(&[1; FRAME_SAMPLES]);
+        client.send_pcm24(&[2; FRAME_SAMPLES]);
+        client.send_control(TunnelControl::PttClose);
+
+        assert!(
+            matches!(accepted.recv_input().await, Some(TunnelInput::Audio(pcm)) if pcm[0] == 1)
+        );
+        assert!(
+            matches!(accepted.recv_input().await, Some(TunnelInput::Audio(pcm)) if pcm[0] == 2)
+        );
+        assert_eq!(
+            accepted.recv_input().await,
+            Some(TunnelInput::Control(TunnelControl::PttClose))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn iroh_control_backpressure_does_not_stall_liveness() {
+        let secret = SessionSecret::generate().unwrap();
+        let cfg = TunnelConfig {
+            handshake_timeout: Duration::from_secs(8),
+            inbound_capacity: 1,
+            idle_timeout: Duration::from_millis(300),
+            ..Default::default()
+        };
+        let server = IrohServer::bind_with_config(IrohPreset::LocalDirect, cfg)
+            .await
+            .unwrap();
+        let addr = server.addr();
+        let server_secret = secret.clone();
+        let server_task =
+            tokio::spawn(async move { server.accept(&server_secret, cfg).await.unwrap() });
+        let client = IrohEndpoint::connect_client(addr, &secret, IrohPreset::LocalDirect, cfg)
+            .await
+            .unwrap();
+        let mut accepted = server_task.await.unwrap();
+
+        client.send_control(TunnelControl::PttClose);
+        client.send_control(TunnelControl::PttOpen);
+        client.send_pcm24(&[22; FRAME_SAMPLES * 200]);
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        client.clear_outbound();
+        assert_eq!(
+            accepted.recv_input().await,
+            Some(TunnelInput::Control(TunnelControl::PttClose))
+        );
+        assert_eq!(
+            accepted.recv_input().await,
+            Some(TunnelInput::Control(TunnelControl::PttOpen))
+        );
+        client.send_pcm24(&[3; FRAME_SAMPLES * 2]);
+        assert!(matches!(
+            timeout(Duration::from_secs(1), accepted.recv_input()).await.unwrap(),
+            Some(TunnelInput::Audio(pcm)) if pcm[0] == 3
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wrong_secret_client_cannot_complete_handshake() {
         let server_secret = SessionSecret::generate().unwrap();
         let server = IrohServer::bind(IrohPreset::LocalDirect).await.unwrap();
@@ -585,5 +900,63 @@ mod tests {
             "server must reject the wrong-secret client"
         );
         assert!(client.is_err(), "wrong-secret client must not connect");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bad_psk_connection_does_not_consume_one_shot_server() {
+        let secret = SessionSecret::generate().unwrap();
+        let cfg = TunnelConfig {
+            handshake_timeout: Duration::from_secs(8),
+            ..Default::default()
+        };
+        let server = IrohServer::bind_with_config(IrohPreset::LocalDirect, cfg)
+            .await
+            .unwrap();
+        let addr = server.addr();
+        let server_secret = secret.clone();
+        let server_task =
+            tokio::spawn(async move { server.accept(&server_secret, cfg).await.unwrap() });
+
+        let wrong = SessionSecret::generate().unwrap();
+        let wrong_addr = addr.clone();
+        let wrong_task = tokio::spawn(async move {
+            IrohEndpoint::connect_client(wrong_addr, &wrong, IrohPreset::LocalDirect, cfg).await
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let mut good = IrohEndpoint::connect_client(addr, &secret, IrohPreset::LocalDirect, cfg)
+            .await
+            .expect("valid client must connect after rejected bad PSK");
+        let accepted = server_task.await.unwrap();
+        accepted.send_pcm24(&[77; FRAME_SAMPLES * 2]);
+        let got = timeout(Duration::from_secs(2), good.recv_pcm24())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got[0], 77);
+        assert!(wrong_task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn server_startup_deadline_includes_time_after_bind() {
+        let cfg = TunnelConfig {
+            handshake_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let mut server = IrohServer::bind_with_config(IrohPreset::LocalDirect, cfg)
+            .await
+            .unwrap();
+        server.startup_deadline = Instant::now() - Duration::from_millis(1);
+
+        let secret = SessionSecret::generate().unwrap();
+        let started = Instant::now();
+        let result = server.accept(&secret, cfg).await;
+        assert!(matches!(result, Err(IrohError::HandshakeTimeout)));
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn alpn_identifies_reliable_control_protocol_version() {
+        assert_eq!(ALPN, b"aura/voice/2");
     }
 }

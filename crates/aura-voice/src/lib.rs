@@ -130,6 +130,41 @@ pub struct VoiceSessionConfig {
     pub transcription_language: Option<String>,
 }
 
+impl VoiceSessionConfig {
+    /// Build a session config with the required provider-facing values and
+    /// stable defaults for optional behavior. Prefer this constructor over a
+    /// full struct literal so adding another optional setting does not require
+    /// every caller to change at once.
+    pub fn new(
+        instructions: impl Into<String>,
+        voice: impl Into<String>,
+        tools: serde_json::Value,
+    ) -> Self {
+        Self {
+            instructions: instructions.into(),
+            voice: voice.into(),
+            tools,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for VoiceSessionConfig {
+    fn default() -> Self {
+        Self {
+            instructions: String::new(),
+            voice: String::new(),
+            tools: serde_json::json!([]),
+            latency_target_ms: 800,
+            temperature: None,
+            end_of_turn_timeout_ms: None,
+            output_speed: None,
+            cold_start_kick: false,
+            transcription_language: None,
+        }
+    }
+}
+
 /// The swappable provider seam. Two DIRECT implementations: xAI Grok voice
 /// and OpenAI `gpt-realtime-2.1`; the server picks one per call (by which
 /// BYOK key the operator provided).
@@ -141,6 +176,12 @@ pub trait VoiceProvider: Send + Sync {
     fn default_voice(&self) -> &str;
     /// Advertised audio capabilities.
     fn audio_caps(&self) -> AudioCaps;
+    /// Whether [`Self::connect_with_manual_turn_detection`] can guarantee
+    /// provider-side VAD is disabled. Existing providers default to false so
+    /// PTT fails closed instead of silently combining manual commits with VAD.
+    fn supports_manual_turn_detection(&self) -> bool {
+        false
+    }
     /// Host-pin the endpoint, open the WS with `Authorization: Bearer`,
     /// send `session.update` (+ optional cold-start) as ONE batched flush,
     /// and return the split sink/stream pair.
@@ -148,11 +189,33 @@ pub trait VoiceProvider: Send + Sync {
         &self,
         cfg: &VoiceSessionConfig,
     ) -> Result<(Box<dyn VoiceSink>, Box<dyn VoiceStream>), VoiceError>;
+    /// Connect with explicit manual turn detection. The default preserves
+    /// source compatibility for third-party providers; built-in realtime
+    /// providers override it to disable server VAD for push-to-talk.
+    async fn connect_with_manual_turn_detection(
+        &self,
+        cfg: &VoiceSessionConfig,
+        manual_turn_detection: bool,
+    ) -> Result<(Box<dyn VoiceSink>, Box<dyn VoiceStream>), VoiceError> {
+        if manual_turn_detection {
+            return Err(VoiceError::Protocol(
+                "provider does not support manual turn detection".to_owned(),
+            ));
+        }
+        self.connect(cfg).await
+    }
 }
 
 /// The write half: owns the mic-pump (LOCAL) / inbound side (REMOTE).
 #[async_trait]
 pub trait VoiceSink: Send {
+    /// Whether this sink supports committing manual-turn audio without also
+    /// requesting a response. Existing third-party sinks default to the
+    /// legacy combined [`Self::commit_user_turn`] contract; built-in realtime
+    /// sinks opt into the split contract.
+    fn supports_split_manual_turn(&self) -> bool {
+        false
+    }
     /// Send a PCM16 mono LE @ 24k frame to the model. base64 framing is
     /// internal to the impl.
     async fn send_audio(&mut self, pcm16: &[i16]) -> Result<(), VoiceError>;
@@ -170,6 +233,11 @@ pub trait VoiceSink: Send {
     ) -> Result<(), VoiceError> {
         Ok(())
     }
+    /// Clear the provider-side input audio buffer. Useful when a manual
+    /// push-to-talk turn is discarded before commit.
+    async fn clear_user_audio(&mut self) -> Result<(), VoiceError> {
+        Ok(())
+    }
     /// Return a tool result to the model.
     async fn send_tool_result(
         &mut self,
@@ -181,6 +249,22 @@ pub trait VoiceSink: Send {
     /// Ask the model to produce a response now (used when `server_vad` is
     /// off, or after a tool result).
     async fn request_response(&mut self) -> Result<(), VoiceError>;
+    /// Commit the current input-audio buffer as one user conversation item
+    /// without starting a response. Manual push-to-talk uses this split form
+    /// so a turn can be preserved while a cancelled response is still waiting
+    /// for its terminal `response.done` event.
+    async fn commit_user_audio(&mut self) -> Result<(), VoiceError> {
+        Err(VoiceError::Protocol(
+            "provider does not support split manual-turn commit".to_owned(),
+        ))
+    }
+    /// Commit the current input-audio buffer as one user turn, then ask the
+    /// model to answer. Used by manual push-to-talk sessions. Server-VAD
+    /// sessions and older provider implementations keep the original default
+    /// response-request behaviour.
+    async fn commit_user_turn(&mut self) -> Result<(), VoiceError> {
+        self.request_response().await
+    }
     /// Close the connection.
     async fn close(&mut self) -> Result<(), VoiceError>;
 }
@@ -190,6 +274,28 @@ pub trait VoiceSink: Send {
 pub trait VoiceStream: Send {
     /// Next decoded event, or `None` when the stream is closed.
     async fn next_event(&mut self) -> Option<Result<VoiceEvent, VoiceError>>;
+
+    /// Runtime-only lifecycle stream used by `aura-engine`. The default wraps
+    /// [`Self::next_event`], so existing third-party providers do not need to
+    /// implement this method.
+    #[doc(hidden)]
+    async fn next_runtime_event(&mut self) -> Option<Result<VoiceRuntimeEvent, VoiceError>> {
+        self.next_event()
+            .await
+            .map(|result| result.map(VoiceRuntimeEvent::Voice))
+    }
+}
+
+/// Internal lifecycle envelope consumed by `aura-engine`.
+///
+/// This type is public only because it appears in the object-safe
+/// [`VoiceStream`] trait. Provider consumers should keep matching on
+/// [`VoiceEvent`].
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub enum VoiceRuntimeEvent {
+    Voice(VoiceEvent),
+    ResponseCreated,
 }
 
 /// Errors from the voice provider seam. [`VoiceError::is_terminal`]
@@ -246,5 +352,96 @@ mod tests {
         assert!(VoiceError::HostNotAllowed("evil.example".into()).is_terminal());
         assert!(!VoiceError::Transport("ws closed".into()).is_terminal());
         assert!(!VoiceError::Protocol("bad json".into()).is_terminal());
+    }
+
+    #[test]
+    fn session_config_constructor_keeps_optional_defaults_stable() {
+        let cfg = VoiceSessionConfig::new("instructions", "voice", serde_json::json!([]));
+        assert_eq!(cfg.instructions, "instructions");
+        assert_eq!(cfg.voice, "voice");
+        assert_eq!(cfg.latency_target_ms, 800);
+        assert!(!cfg.cold_start_kick);
+        assert!(cfg.transcription_language.is_none());
+    }
+
+    struct LegacyCombinedSink {
+        requested: bool,
+    }
+
+    #[async_trait]
+    impl VoiceSink for LegacyCombinedSink {
+        async fn send_audio(&mut self, _pcm16: &[i16]) -> Result<(), VoiceError> {
+            Ok(())
+        }
+        async fn cancel_response(&mut self) -> Result<(), VoiceError> {
+            Ok(())
+        }
+        async fn send_tool_result(
+            &mut self,
+            _call_id: Option<&str>,
+            _output: serde_json::Value,
+        ) -> Result<(), VoiceError> {
+            Ok(())
+        }
+        async fn inject_system_context(&mut self, _text: &str) -> Result<(), VoiceError> {
+            Ok(())
+        }
+        async fn request_response(&mut self) -> Result<(), VoiceError> {
+            self.requested = true;
+            Ok(())
+        }
+        async fn close(&mut self) -> Result<(), VoiceError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_sink_keeps_combined_manual_turn_contract() {
+        let mut sink = LegacyCombinedSink { requested: false };
+        assert!(!sink.supports_split_manual_turn());
+        sink.commit_user_turn()
+            .await
+            .expect("legacy combined commit");
+        assert!(sink.requested);
+        assert!(sink.commit_user_audio().await.is_err());
+    }
+
+    struct LegacyVadProvider;
+
+    #[async_trait]
+    impl VoiceProvider for LegacyVadProvider {
+        fn model_id(&self) -> &str {
+            "legacy"
+        }
+        fn default_voice(&self) -> &str {
+            "legacy"
+        }
+        fn audio_caps(&self) -> AudioCaps {
+            AudioCaps {
+                server_vad: true,
+                input_sample_rate_hz: 24_000,
+                output_sample_rate_hz: 24_000,
+            }
+        }
+        async fn connect(
+            &self,
+            _cfg: &VoiceSessionConfig,
+        ) -> Result<(Box<dyn VoiceSink>, Box<dyn VoiceStream>), VoiceError> {
+            Err(VoiceError::ProviderUnavailable("test".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_provider_fails_closed_for_manual_turn_detection() {
+        let provider = LegacyVadProvider;
+        assert!(!provider.supports_manual_turn_detection());
+        let error = match provider
+            .connect_with_manual_turn_detection(&VoiceSessionConfig::default(), true)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("manual PTT must not silently retain server VAD"),
+        };
+        assert!(error.to_string().contains("manual turn detection"));
     }
 }

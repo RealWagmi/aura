@@ -180,7 +180,9 @@ version = "0.2.6"
 dependencies = [
  "aura-audio",
  "aura-tunnel",
+ "libc",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -11,9 +11,12 @@
 //! - **inbound**: an I/O task reads datagrams, decrypts by the carried nonce,
 //!   and pushes into the jitter buffer; on a 20 ms tick it pops one in-order
 //!   frame to a channel that `recv_pcm24` awaits. A lost packet is a dropped
-//!   20 ms (PLC silence), never a stall.
+//!   20 ms (PLC silence), never a stall. Control frames ride the SAME jitter
+//!   buffer so they cannot overtake the audio sent before them (a `PttClose`
+//!   that outruns the turn's trailing frames clips the user's final word and
+//!   leaks it into the next turn).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,17 +26,24 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 
-use crate::jitter::JitterBuffer;
+use crate::jitter::{JitterBuffer, PushResult};
 use crate::noise::{self, Transport, MAX_HANDSHAKE_MSG};
-use crate::reframe::Reframer;
+use crate::outbound::{bytes_to_pcm, Outbound};
+use crate::replay::{ReplayStatus, ReplayWindow};
 use crate::session::SessionSecret;
-use crate::wire::{decode_transport, encode_transport, TAG_HANDSHAKE, TAG_TRANSPORT};
+use crate::wire::{
+    decode_control_ack, decode_reliable_control, decode_transport, decode_tunnel_control,
+    encode_reliable_control, encode_transport, TunnelControl, TunnelInput, TAG_HANDSHAKE,
+    TAG_TRANSPORT,
+};
 
 /// 20 ms @ 24 kHz mono.
 const FRAME_SAMPLES: usize = 480;
 const FRAME_MS: u64 = 20;
 /// Receive buffer: a transport datagram is ~985 bytes (960 PCM + nonce + tag).
 const RECV_BUF: usize = 2048;
+const CONTROL_RETRY: Duration = Duration::from_millis(100);
+const CONTROL_DEDUP_CAPACITY: usize = 128;
 
 /// Tunnel timing/sizing knobs.
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +60,10 @@ pub struct TunnelConfig {
     /// expiry / partition) as `recv_pcm24() -> None`. The 20 ms keepalives keep
     /// a genuinely idle-but-alive peer well under it.
     pub idle_timeout: Duration,
+    /// Server-selected input mode bound into both authenticated Noise
+    /// handshake messages. `None` is retained for non-CLI embedders, but real
+    /// Aura client/server call sites should set the mode from the connection.
+    pub input_mode: Option<crate::wire::TunnelInputMode>,
 }
 
 impl Default for TunnelConfig {
@@ -59,31 +73,9 @@ impl Default for TunnelConfig {
             handshake_retransmit: Duration::from_millis(250),
             inbound_capacity: 64,
             idle_timeout: Duration::from_secs(8),
+            input_mode: None,
         }
     }
-}
-
-/// Cap on the outbound queue — a MEMORY backstop for a dead/stalled pacer, NOT
-/// an audio limiter. The realtime API streams a full answer's PCM far faster
-/// than the 20 ms realtime pacer drains it, so a LONG answer legitimately backs
-/// up MINUTES here. Live-diagnosed 2026-07-07: a ~90 s fable overflowed the old
-/// 30 s cap about 40 s into playback and the silent drop-oldest audibly ate
-/// words ("stumbles ~40 s into long speech"). The cap must exceed any single
-/// answer: 5 min @ 50 frames/s = 15 000 frames ≈ 14 MB — still a trivial
-/// backstop. Barge-in (`clear_outbound`) drains the whole queue instantly
-/// regardless of size, so a large cap costs zero interruption latency; hitting
-/// the cap is logged loudly (never silent again).
-const MAX_OUTBOUND_FRAMES: usize = 15_000;
-
-/// Outbound state behind one lock: the queue the pacer drains, plus the
-/// reframer that chops engine audio into exact 20 ms frames. Co-locating them
-/// lets `clear_outbound` (barge-in) also reset the reframer carry so a stale
-/// `<20 ms` partial frame can't prepend onto the next response.
-struct Outbound {
-    queue: VecDeque<Vec<i16>>,
-    reframer: Reframer,
-    /// Total frames dropped on overflow (diagnostic; see `MAX_OUTBOUND_FRAMES`).
-    dropped_frames: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -94,21 +86,6 @@ pub enum TunnelError {
     Noise(#[from] noise::NoiseError),
     #[error("handshake timed out")]
     HandshakeTimeout,
-}
-
-fn pcm_to_bytes(pcm: &[i16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(pcm.len() * 2);
-    for s in pcm {
-        out.extend_from_slice(&s.to_le_bytes());
-    }
-    out
-}
-
-fn bytes_to_pcm(bytes: &[u8]) -> Vec<i16> {
-    bytes
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
-        .collect()
 }
 
 /// Aborts the spawned task when the endpoint is dropped (no lingering UDP
@@ -153,9 +130,13 @@ impl TunnelServer {
         let mut buf = [0u8; RECV_BUF];
         let mut scratch = [0u8; MAX_HANDSHAKE_MSG];
         let deadline = tokio::time::Instant::now() + cfg.handshake_timeout;
-        // A genuine msg1 datagram is exactly this size; reject anything else
-        // BEFORE building an RNG-seeded responder (anti-amplification).
-        let expected = 1 + noise::msg1_len();
+        // Admit the current and legacy fixed sizes only. A PSK-authenticated
+        // legacy payload gets a clear version error below; arbitrary sizes are
+        // rejected before building an RNG-seeded responder.
+        let protocol_payload = noise::protocol_payload(cfg.input_mode);
+        let expected = 1 + noise::msg1_len(&protocol_payload);
+        let previous_expected = 1 + 61; // aura/direct/1 marker payload
+        let legacy_expected = 1 + 48;
 
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -166,14 +147,19 @@ impl TunnelServer {
                 Ok(r) => r?,
                 Err(_) => return Err(TunnelError::HandshakeTimeout),
             };
-            if n != expected || buf[0] != TAG_HANDSHAKE {
+            if (n != expected && n != previous_expected && n != legacy_expected)
+                || buf[0] != TAG_HANDSHAKE
+            {
                 continue; // not a plausibly-sized handshake msg1 — cheap reject
             }
             let mut hs = noise::responder(secret.as_bytes())?;
-            if hs.read_message(&buf[1..n], &mut scratch).is_err() {
+            let payload_len = hs.read_message(&buf[1..n], &mut scratch);
+            if payload_len.is_err() {
                 continue; // wrong PSK / malformed — keep waiting for the real client
             }
-            let n2 = match hs.write_message(&[], &mut scratch) {
+            let payload_len = payload_len.map_err(noise::NoiseError::from)?;
+            noise::verify_protocol_payload(&scratch[..payload_len], cfg.input_mode)?;
+            let n2 = match hs.write_message(&protocol_payload, &mut scratch) {
                 Ok(n) => n,
                 Err(_) => continue,
             };
@@ -196,7 +182,7 @@ impl TunnelServer {
 /// A live tunnel endpoint: PCM16@24k in/out over the encrypted UDP session.
 pub struct TunnelEndpoint {
     outbound: Arc<Mutex<Outbound>>,
-    inbound_rx: mpsc::Receiver<Vec<i16>>,
+    inbound_rx: mpsc::Receiver<TunnelInput>,
     _send_task: AbortOnDrop,
     _io_task: AbortOnDrop,
 }
@@ -215,8 +201,9 @@ impl TunnelEndpoint {
 
         let mut hs = noise::initiator(secret.as_bytes())?;
         let mut scratch = [0u8; MAX_HANDSHAKE_MSG];
+        let protocol_payload = noise::protocol_payload(cfg.input_mode);
         let n1 = hs
-            .write_message(&[], &mut scratch)
+            .write_message(&protocol_payload, &mut scratch)
             .map_err(noise::NoiseError::from)?;
         let mut msg1 = Vec::with_capacity(1 + n1);
         msg1.push(TAG_HANDSHAKE);
@@ -231,8 +218,10 @@ impl TunnelEndpoint {
             socket.send(&msg1).await?;
             match timeout(cfg.handshake_retransmit, socket.recv(&mut buf)).await {
                 Ok(Ok(n)) if n >= 1 && buf[0] == TAG_HANDSHAKE => {
-                    hs.read_message(&buf[1..n], &mut scratch)
+                    let payload_len = hs
+                        .read_message(&buf[1..n], &mut scratch)
                         .map_err(noise::NoiseError::from)?;
+                    noise::verify_protocol_payload(&scratch[..payload_len], cfg.input_mode)?;
                     break;
                 }
                 Ok(Ok(_)) => continue, // unexpected datagram — retransmit
@@ -254,12 +243,9 @@ impl TunnelEndpoint {
         cfg: TunnelConfig,
         handshake_retx: Option<Vec<u8>>,
     ) -> Self {
-        let outbound = Arc::new(Mutex::new(Outbound {
-            queue: VecDeque::new(),
-            reframer: Reframer::new(FRAME_SAMPLES),
-            dropped_frames: 0,
-        }));
-        let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<i16>>(cfg.inbound_capacity.max(1));
+        let outbound = Arc::new(Mutex::new(Outbound::new(FRAME_SAMPLES)));
+        let (inbound_tx, inbound_rx) = mpsc::channel::<TunnelInput>(cfg.inbound_capacity.max(1));
+        let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<u64>();
 
         // Outbound pacer: every 20 ms send one queued frame, OR — when the queue
         // is idle — an encrypted empty "keepalive" frame. The steady keepalive
@@ -273,23 +259,78 @@ impl TunnelEndpoint {
                 let mut tick = interval(Duration::from_millis(FRAME_MS));
                 tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
                 let mut nonce: u64 = 0;
+                let mut control_id: u64 = 0;
+                let mut pending: HashMap<u64, (Vec<u8>, tokio::time::Instant)> = HashMap::new();
                 loop {
                     tick.tick().await;
+                    while let Ok(id) = ack_rx.try_recv() {
+                        pending.remove(&id);
+                    }
+                    let now = tokio::time::Instant::now();
+                    for (payload, last_sent) in pending.values_mut() {
+                        if now.duration_since(*last_sent) >= CONTROL_RETRY {
+                            match transport.encrypt(nonce, payload) {
+                                Ok(ct) => {
+                                    let dg = encode_transport(nonce, &ct);
+                                    nonce = nonce.wrapping_add(1);
+                                    if socket.send(&dg).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(_) => return,
+                            }
+                            *last_sent = now;
+                        }
+                    }
+                    if !pending.is_empty() {
+                        // Stop-and-wait: do not let later audio overtake a lost
+                        // control. Internal ACKs may still pass so two peers
+                        // issuing controls simultaneously cannot deadlock.
+                        let bytes = outbound
+                            .lock()
+                            .expect("outbound lock")
+                            .pop_priority_ack()
+                            .unwrap_or_default();
+                        // Keep fresh authenticated sequence positions flowing
+                        // during stop-and-wait. This maintains liveness and a
+                        // following marker releases the accepted control even
+                        // when its first ACK was lost.
+                        match transport.encrypt(nonce, &bytes) {
+                            Ok(ct) => {
+                                let dg = encode_transport(nonce, &ct);
+                                nonce = nonce.wrapping_add(1);
+                                if socket.send(&dg).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                        continue;
+                    }
                     // Empty plaintext == keepalive (still AEAD-authenticated, so
                     // a spoofer without the key can't forge liveness).
-                    let bytes = outbound
-                        .lock()
-                        .expect("outbound lock")
-                        .queue
-                        .pop_front()
-                        .map(|pcm| pcm_to_bytes(&pcm))
-                        .unwrap_or_default();
+                    let mut bytes = {
+                        let mut outbound = outbound.lock().expect("outbound lock");
+                        outbound
+                            .pop_priority_ack()
+                            .or_else(|| outbound.pop_next())
+                            .unwrap_or_default()
+                    };
+                    let reliable_id = decode_tunnel_control(&bytes).map(|control| {
+                        let id = control_id;
+                        control_id = control_id.wrapping_add(1);
+                        bytes = encode_reliable_control(id, control);
+                        id
+                    });
                     match transport.encrypt(nonce, &bytes) {
                         Ok(ct) => {
                             let dg = encode_transport(nonce, &ct);
                             nonce = nonce.wrapping_add(1);
                             if socket.send(&dg).await.is_err() {
                                 break; // peer gone
+                            }
+                            if let Some(id) = reliable_id {
+                                pending.insert(id, (bytes, tokio::time::Instant::now()));
                             }
                         }
                         Err(_) => break,
@@ -304,6 +345,7 @@ impl TunnelEndpoint {
         // (which yields no `recv` error) is torn down here.
         let io_task = {
             let socket = socket.clone();
+            let outbound = outbound.clone();
             let idle_timeout = cfg.idle_timeout;
             tokio::spawn(async move {
                 let mut jitter = JitterBuffer::new();
@@ -311,17 +353,93 @@ impl TunnelEndpoint {
                 let mut tick = interval(Duration::from_millis(FRAME_MS));
                 tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
                 let mut last_recv = tokio::time::Instant::now();
+                let mut replay = ReplayWindow::new();
+                let mut control_ids = HashSet::new();
+                let mut control_id_order = VecDeque::new();
+                let mut pending_control: Option<TunnelInput> = None;
                 loop {
                     tokio::select! {
                         r = socket.recv(&mut buf) => match r {
                             Ok(n) if n >= 1 && buf[0] == TAG_TRANSPORT => {
                                 if let Some((nonce, ct)) = decode_transport(&buf[1..n]) {
                                     if let Ok(pt) = transport.decrypt(nonce, ct) {
-                                        // Any authenticated frame proves liveness;
-                                        // empty == keepalive (not pushed to audio).
+                                        let replay_status = replay.observe(nonce);
+                                        if let Some(id) = decode_control_ack(&pt) {
+                                            if replay_status == ReplayStatus::Fresh {
+                                                let _ = ack_tx.send(id);
+                                                last_recv = tokio::time::Instant::now();
+                                                if pending_control.is_some() {
+                                                    jitter.discard_through(nonce);
+                                                } else {
+                                                    jitter.push_marker(nonce);
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                        if replay_status == ReplayStatus::Duplicate {
+                                            if let Some((id, _)) = decode_reliable_control(&pt) {
+                                                // This nonce was accepted earlier; refresh liveness
+                                                // and coalesce the repeated ACK instead of growing a
+                                                // priority queue under replay flood.
+                                                last_recv = tokio::time::Instant::now();
+                                                if control_ids.contains(&id) {
+                                                    outbound.lock().expect("outbound lock").queue_ack(id);
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                        if replay_status == ReplayStatus::TooOld {
+                                            continue;
+                                        }
+                                        // Only a newly accepted authenticated frame proves liveness.
+                                        // Every fresh nonce enters jitter sequencing, including
+                                        // keepalives and internal ACKs; marker payloads are discarded
+                                        // after they advance ordering and never become audio.
+                                        // Control frames go through the SAME jitter
+                                        // buffer as audio: release order == send
+                                        // order, and the control's sequence number
+                                        // no longer reads as a lost audio packet
+                                        // (which stalled the turn's trailing frames
+                                        // past the commit).
                                         last_recv = tokio::time::Instant::now();
-                                        if !pt.is_empty() {
-                                            jitter.push(nonce as u16, pt);
+                                        if pending_control.is_some() {
+                                            // Keep protocol duties alive without buffering behind an
+                                            // application transition that cannot yet be delivered.
+                                            // Already-accepted control ids may be ACKed again; a new
+                                            // control is deliberately not ACKed and will retry after
+                                            // the barrier clears.
+                                            if let Some((id, _)) = decode_reliable_control(&pt) {
+                                                if control_ids.contains(&id) {
+                                                    outbound.lock().expect("outbound lock").queue_ack(id);
+                                                }
+                                            }
+                                            jitter.discard_through(nonce);
+                                            continue;
+                                        }
+                                        if pt.is_empty() {
+                                            jitter.push_marker(nonce);
+                                        } else if let Some((id, control)) = decode_reliable_control(&pt) {
+                                            if control_ids.contains(&id) {
+                                                outbound.lock().expect("outbound lock").queue_ack(id);
+                                                jitter.push_marker(nonce);
+                                                continue;
+                                            }
+                                            // ACK only after jitter accepts the ordered control. A
+                                            // fresh but already-late control must not let the sender
+                                            // advance past a state transition we discarded.
+                                            let terminal = matches!(control, TunnelControl::PttClose | TunnelControl::PttCancel);
+                                            if jitter.push_control(nonce, pt, terminal) == PushResult::Accepted {
+                                                if control_id_order.len() == CONTROL_DEDUP_CAPACITY {
+                                                    if let Some(oldest) = control_id_order.pop_front() {
+                                                        control_ids.remove(&oldest);
+                                                    }
+                                                }
+                                                control_ids.insert(id);
+                                                control_id_order.push_back(id);
+                                                outbound.lock().expect("outbound lock").queue_ack(id);
+                                            }
+                                        } else {
+                                            jitter.push(nonce, pt);
                                         }
                                     }
                                 }
@@ -338,14 +456,43 @@ impl TunnelEndpoint {
                         },
                         _ = tick.tick() => {
                             if last_recv.elapsed() > idle_timeout {
-                                break; // peer vanished silently → hang up
+                                break; // peer vanished with no close → hang up
+                            }
+                            if let Some(input) = pending_control.take() {
+                                match inbound_tx.try_send(input) {
+                                    Ok(()) => continue,
+                                    Err(mpsc::error::TrySendError::Full(input)) => {
+                                        pending_control = Some(input);
+                                        continue;
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                }
                             }
                             if let Some(bytes) = jitter.pop() {
-                                // Drop this frame if the consumer is far behind
-                                // (channel full); a closed channel ends the task.
-                                if inbound_tx.try_send(bytes_to_pcm(&bytes)).is_err()
+                                if bytes.is_empty() {
+                                    continue; // authenticated sequence marker, never application input
+                                } else if let Some((_id, control)) = decode_reliable_control(&bytes) {
+                                    let input = TunnelInput::Control(control);
+                                    match inbound_tx.try_send(input) {
+                                        Ok(()) => {}
+                                        Err(mpsc::error::TrySendError::Full(input)) => pending_control = Some(input),
+                                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                    }
+                                } else if let Some(control) = decode_tunnel_control(&bytes) {
+                                    // A control is a state transition, not a
+                                    // droppable sample: await channel space
+                                    // (a lost PttClose strands the turn).
+                                    let input = TunnelInput::Control(control);
+                                    match inbound_tx.try_send(input) {
+                                        Ok(()) => {}
+                                        Err(mpsc::error::TrySendError::Full(input)) => pending_control = Some(input),
+                                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                    }
+                                } else if inbound_tx.try_send(TunnelInput::Audio(bytes_to_pcm(&bytes))).is_err()
                                     && inbound_tx.is_closed()
                                 {
+                                    // Drop this frame if the consumer is far behind
+                                    // (channel full); a closed channel ends the task.
                                     break;
                                 }
                             }
@@ -364,55 +511,52 @@ impl TunnelEndpoint {
     }
 
     /// Queue model/mic audio for sending, reframed to exact 20 ms frames. The
-    /// queue is bounded (drop-oldest) so a stalled/dead pacer can't grow memory.
+    /// queue is bounded (drop-oldest audio; controls survive) so a stalled/dead
+    /// pacer can't grow memory.
     pub fn send_pcm24(&self, pcm: &[i16]) {
-        let mut out = self.outbound.lock().expect("outbound lock");
-        let frames = out.reframer.push(pcm);
-        for f in frames {
-            out.queue.push_back(f);
-            while out.queue.len() > MAX_OUTBOUND_FRAMES {
-                out.queue.pop_front();
-                out.dropped_frames += 1;
-                // Loud, rate-limited (first drop, then ~1/s of loss): overflow
-                // eats the audio the listener is ABOUT TO HEAR.
-                if out.dropped_frames == 1 || out.dropped_frames.is_multiple_of(50) {
-                    eprintln!(
-                        "aura-tunnel: outbound pacer queue FULL ({} min cap) — {} ms of audio \
-                         dropped; words are being skipped",
-                        MAX_OUTBOUND_FRAMES as u64 / 50 / 60,
-                        out.dropped_frames * FRAME_MS
-                    );
-                }
-            }
-        }
+        self.outbound.lock().expect("outbound lock").push_pcm(pcm);
     }
 
     /// Flush the `<20 ms` reframer tail (padded with silence) so a phrase
     /// ending isn't held back.
     pub fn flush_output(&self) {
-        let mut out = self.outbound.lock().expect("outbound lock");
-        if let Some(mut tail) = out.reframer.flush() {
-            tail.resize(FRAME_SAMPLES, 0);
-            out.queue.push_back(tail);
-        }
+        self.outbound.lock().expect("outbound lock").flush_tail();
+    }
+
+    /// Queue an authenticated control event for the peer, in-order with the
+    /// audio queued before it.
+    pub fn send_control(&self, control: TunnelControl) {
+        self.outbound
+            .lock()
+            .expect("outbound lock")
+            .push_control(control);
+    }
+
+    /// The next inbound audio/control event, or `None` when the tunnel closes.
+    pub async fn recv_input(&mut self) -> Option<TunnelInput> {
+        self.inbound_rx.recv().await
     }
 
     /// The next inbound 20 ms frame, or `None` when the tunnel closes.
     pub async fn recv_pcm24(&mut self) -> Option<Vec<i16>> {
-        self.inbound_rx.recv().await
+        loop {
+            match self.recv_input().await? {
+                TunnelInput::Audio(pcm) => return Some(pcm),
+                TunnelInput::Control(_) => continue,
+            }
+        }
     }
 
-    /// Drop everything queued for sending AND reset the reframer carry (barge-in
-    /// must not leave a stale partial frame to prepend onto the next response).
+    /// Drop the queued AUDIO and reset the reframer carry (barge-in must not
+    /// leave a stale partial frame to prepend onto the next response). Queued
+    /// control frames are preserved.
     pub fn clear_outbound(&self) {
-        let mut out = self.outbound.lock().expect("outbound lock");
-        out.queue.clear();
-        out.reframer = Reframer::new(FRAME_SAMPLES);
+        self.outbound.lock().expect("outbound lock").clear_audio();
     }
 
     /// Milliseconds of audio queued for sending.
     pub fn outbound_queued_ms(&self) -> u64 {
-        self.outbound.lock().expect("outbound lock").queue.len() as u64 * FRAME_MS
+        self.outbound.lock().expect("outbound lock").queued_ms()
     }
 }
 
@@ -460,6 +604,204 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_frame_does_not_overtake_audio_sent_before_it() {
+        let secret = SessionSecret::generate().unwrap();
+        let server = TunnelServer::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap().to_string();
+
+        let server_secret = secret.clone();
+        let server_handle = tokio::spawn(async move {
+            server
+                .accept(&server_secret, TunnelConfig::default())
+                .await
+                .unwrap()
+        });
+        let client = TunnelEndpoint::connect_client(&addr, &secret, TunnelConfig::default())
+            .await
+            .unwrap();
+        let mut server_ep = server_handle.await.unwrap();
+
+        // A push-to-talk turn: audio frames, then the PttClose that commits
+        // them. The server must observe ALL the audio before the control —
+        // over the old direct-delivery path the control overtook the jitter
+        // buffer and clipped the turn's trailing ~40-80 ms.
+        const TURN_FRAMES: usize = 8;
+        for i in 0..TURN_FRAMES {
+            client.send_pcm24(&[i as i16 + 1; FRAME_SAMPLES]);
+        }
+        client.send_control(TunnelControl::PttClose);
+
+        let mut audio_seen = 0usize;
+        loop {
+            let input = timeout(Duration::from_secs(3), server_ep.recv_input())
+                .await
+                .expect("server recv timed out")
+                .expect("server tunnel closed");
+            match input {
+                TunnelInput::Audio(pcm) => {
+                    audio_seen += 1;
+                    assert_eq!(pcm[0] as usize, audio_seen, "audio released in order");
+                }
+                TunnelInput::Control(c) => {
+                    assert_eq!(c, TunnelControl::PttClose);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            audio_seen, TURN_FRAMES,
+            "every audio frame of the turn must arrive before its PttClose"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lone_terminal_control_after_silence_is_released() {
+        let secret = SessionSecret::generate().unwrap();
+        let server = TunnelServer::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap().to_string();
+        let server_secret = secret.clone();
+        let server_handle = tokio::spawn(async move {
+            server
+                .accept(&server_secret, TunnelConfig::default())
+                .await
+                .unwrap()
+        });
+        let client = TunnelEndpoint::connect_client(&addr, &secret, TunnelConfig::default())
+            .await
+            .unwrap();
+        let mut server_ep = server_handle.await.unwrap();
+
+        // Drain one audio spurt and leave the receiver idle long enough that
+        // the historical implementation returned to prebuffering.
+        client.send_pcm24(&[1; FRAME_SAMPLES * 2]);
+        for _ in 0..2 {
+            assert!(matches!(
+                timeout(Duration::from_secs(1), server_ep.recv_input())
+                    .await
+                    .unwrap(),
+                Some(TunnelInput::Audio(_))
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        client.send_control(TunnelControl::PttClose);
+        assert_eq!(
+            timeout(Duration::from_secs(1), server_ep.recv_input())
+                .await
+                .expect("lone terminal control remained stuck"),
+            Some(TunnelInput::Control(TunnelControl::PttClose))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_inbound_channel_does_not_stall_io_or_liveness() {
+        let secret = SessionSecret::generate().unwrap();
+        let cfg = TunnelConfig {
+            handshake_timeout: Duration::from_secs(3),
+            inbound_capacity: 1,
+            idle_timeout: Duration::from_millis(250),
+            ..Default::default()
+        };
+        let server = TunnelServer::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap().to_string();
+        let server_secret = secret.clone();
+        let server_task =
+            tokio::spawn(async move { server.accept(&server_secret, cfg).await.unwrap() });
+        let client = TunnelEndpoint::connect_client(&addr, &secret, cfg)
+            .await
+            .unwrap();
+        let mut accepted = server_task.await.unwrap();
+
+        client.send_control(TunnelControl::PttOpen);
+        client.send_control(TunnelControl::PttClose);
+        client.send_pcm24(&[22; FRAME_SAMPLES * 200]);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        client.clear_outbound();
+        assert_eq!(
+            accepted.recv_input().await,
+            Some(TunnelInput::Control(TunnelControl::PttOpen))
+        );
+        assert_eq!(
+            accepted.recv_input().await,
+            Some(TunnelInput::Control(TunnelControl::PttClose))
+        );
+        client.send_pcm24(&[33; FRAME_SAMPLES * 2]);
+        assert!(matches!(
+            timeout(Duration::from_secs(1), accepted.recv_input()).await.unwrap(),
+            Some(TunnelInput::Audio(pcm)) if pcm[0] == 33
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lost_control_is_retried_before_later_control_and_audio() {
+        let secret = SessionSecret::generate().unwrap();
+        let server = TunnelServer::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let proxy = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap().to_string();
+
+        // Reliable-control plaintext is 20 bytes, plus the Noise tag and
+        // transport header = 45. Drop only the first control; later traffic
+        // passes normally and must remain behind the recovery barrier.
+        let proxy_task = tokio::spawn(async move {
+            let mut buf = [0_u8; RECV_BUF];
+            let mut client_addr = None;
+            let mut dropped_control = false;
+            loop {
+                let (n, from) = proxy.recv_from(&mut buf).await.unwrap();
+                if from == server_addr {
+                    if let Some(client) = client_addr {
+                        proxy.send_to(&buf[..n], client).await.unwrap();
+                    }
+                } else {
+                    client_addr = Some(from);
+                    if !dropped_control && buf[0] == TAG_TRANSPORT && n == 45 {
+                        dropped_control = true;
+                        continue;
+                    }
+                    proxy.send_to(&buf[..n], server_addr).await.unwrap();
+                }
+            }
+        });
+
+        let server_secret = secret.clone();
+        let server_handle = tokio::spawn(async move {
+            server
+                .accept(&server_secret, TunnelConfig::default())
+                .await
+                .unwrap()
+        });
+        let client = TunnelEndpoint::connect_client(
+            &proxy_addr,
+            &secret,
+            TunnelConfig {
+                handshake_timeout: Duration::from_secs(3),
+                ..TunnelConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut server_ep = server_handle.await.unwrap();
+
+        client.send_control(TunnelControl::PttClose);
+        client.send_control(TunnelControl::PttOpen);
+        client.send_pcm24(&[7; FRAME_SAMPLES * 2]);
+        let first = timeout(Duration::from_secs(3), server_ep.recv_input())
+            .await
+            .unwrap();
+        let second = timeout(Duration::from_secs(3), server_ep.recv_input())
+            .await
+            .unwrap();
+        let third = timeout(Duration::from_secs(3), server_ep.recv_input())
+            .await
+            .unwrap();
+        assert_eq!(first, Some(TunnelInput::Control(TunnelControl::PttClose)));
+        assert_eq!(second, Some(TunnelInput::Control(TunnelControl::PttOpen)));
+        assert!(matches!(third, Some(TunnelInput::Audio(pcm)) if pcm[0] == 7));
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wrong_secret_client_cannot_complete_handshake() {
         let server_secret = SessionSecret::generate().unwrap();
         let server = TunnelServer::bind("127.0.0.1:0").await.unwrap();
@@ -492,5 +834,36 @@ mod tests {
             server_handle.await.unwrap().is_err(),
             "server must time out"
         );
+    }
+
+    #[tokio::test]
+    async fn authenticated_legacy_protocol_is_rejected_explicitly() {
+        let secret = SessionSecret::generate().unwrap();
+        let server = TunnelServer::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let server_secret = secret.clone();
+        let cfg = TunnelConfig {
+            handshake_timeout: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let server_task = tokio::spawn(async move { server.accept(&server_secret, cfg).await });
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut legacy = noise::initiator(secret.as_bytes()).unwrap();
+        let mut scratch = [0u8; MAX_HANDSHAKE_MSG];
+        let n = legacy.write_message(&[], &mut scratch).unwrap();
+        let mut datagram = Vec::with_capacity(1 + n);
+        datagram.push(TAG_HANDSHAKE);
+        datagram.extend_from_slice(&scratch[..n]);
+        socket.send_to(&datagram, addr).await.unwrap();
+
+        let error = match server_task.await.unwrap() {
+            Ok(_) => panic!("legacy protocol unexpectedly connected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            TunnelError::Noise(noise::NoiseError::ProtocolVersion)
+        ));
     }
 }

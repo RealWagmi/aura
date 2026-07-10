@@ -89,9 +89,25 @@ impl VoiceProvider for OpenAiRealtimeProvider {
         &self,
         cfg: &VoiceSessionConfig,
     ) -> Result<(Box<dyn VoiceSink>, Box<dyn VoiceStream>), VoiceError> {
+        self.connect_with_manual_turn_detection(cfg, false).await
+    }
+
+    fn supports_manual_turn_detection(&self) -> bool {
+        true
+    }
+
+    async fn connect_with_manual_turn_detection(
+        &self,
+        cfg: &VoiceSessionConfig,
+        manual_turn_detection: bool,
+    ) -> Result<(Box<dyn VoiceSink>, Box<dyn VoiceStream>), VoiceError> {
         let key = resolve_openai_key()?;
         let url = wire::openai_realtime_url(&self.model);
-        let mut frames = vec![wire::openai_session_update_event(cfg, &self.model)];
+        let mut frames = vec![wire::openai_session_update_event_with_mode(
+            cfg,
+            &self.model,
+            manual_turn_detection,
+        )];
         if cfg.cold_start_kick {
             let (user_msg, response_create) = wire::cold_start_kick_events();
             frames.push(user_msg);
@@ -100,7 +116,15 @@ impl VoiceProvider for OpenAiRealtimeProvider {
         // truncate_enabled: GA documents (and on WS effectively requires)
         // `conversation.item.truncate` on barge-in — without it the model's
         // conversation state keeps the unheard tail of a cancelled response.
-        connect_realtime(&url, wire::DIRECT_OPENAI_ALLOWED_HOST, key, frames, true).await
+        connect_realtime(
+            &url,
+            wire::DIRECT_OPENAI_ALLOWED_HOST,
+            key,
+            frames,
+            true,
+            manual_turn_detection,
+        )
+        .await
     }
 }
 
@@ -117,6 +141,7 @@ mod tests {
         assert!(caps.server_vad);
         assert_eq!(caps.input_sample_rate_hz, 24_000);
         assert_eq!(caps.output_sample_rate_hz, 24_000);
+        assert!(p.supports_manual_turn_detection());
     }
 
     #[test]

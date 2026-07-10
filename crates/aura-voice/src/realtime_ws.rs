@@ -13,12 +13,13 @@ use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
 use zeroize::Zeroizing;
 
 use crate::wire::{self, ServerEvent, WireError};
-use crate::{VoiceError, VoiceEvent, VoiceSink, VoiceStream, VoiceToolCall};
+use crate::{VoiceError, VoiceEvent, VoiceRuntimeEvent, VoiceSink, VoiceStream, VoiceToolCall};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsWrite = SplitSink<WsStream, Message>;
@@ -44,6 +45,7 @@ pub(crate) async fn connect_realtime(
     key: Zeroizing<String>,
     handshake_frames: Vec<Value>,
     truncate_enabled: bool,
+    manual_turn_detection: bool,
 ) -> Result<(Box<dyn VoiceSink>, Box<dyn VoiceStream>), VoiceError> {
     ensure_crypto_provider();
     wire::validate_realtime_url_for(url, allowed_host).map_err(|e| match e {
@@ -59,7 +61,14 @@ pub(crate) async fn connect_realtime(
         HeaderValue::from_str(bearer.as_str()).map_err(|e| VoiceError::Handshake(e.to_string()))?;
     request.headers_mut().insert("Authorization", header);
 
-    let (ws, _resp) = connect_async(request).await.map_err(classify_ws_error)?;
+    // Provider events are small JSON envelopes. Bound a malicious or broken
+    // peer before tungstenite allocates an unbounded application message.
+    let websocket_config = WebSocketConfig::default()
+        .max_message_size(Some(2 * 1024 * 1024))
+        .max_frame_size(Some(512 * 1024));
+    let (ws, _resp) = connect_async_with_config(request, Some(websocket_config), false)
+        .await
+        .map_err(classify_ws_error)?;
     let (mut write, read) = ws.split();
 
     // One batched flush: session.update first, then any cold-start frames in
@@ -79,6 +88,7 @@ pub(crate) async fn connect_realtime(
         Box::new(RealtimeSink {
             write,
             truncate_enabled,
+            manual_turn_detection,
         }),
         Box::new(RealtimeStream { read }),
     ))
@@ -118,6 +128,7 @@ struct RealtimeSink {
     /// Whether this provider supports `conversation.item.truncate` (see
     /// [`connect_realtime`]).
     truncate_enabled: bool,
+    manual_turn_detection: bool,
 }
 
 impl RealtimeSink {
@@ -131,6 +142,10 @@ impl RealtimeSink {
 
 #[async_trait::async_trait]
 impl VoiceSink for RealtimeSink {
+    fn supports_split_manual_turn(&self) -> bool {
+        true
+    }
+
     async fn send_audio(&mut self, pcm16: &[i16]) -> Result<(), VoiceError> {
         let frame = wire::input_audio_buffer_append_event(&wire::pcm16_to_base64(pcm16));
         self.send(frame).await
@@ -159,6 +174,13 @@ impl VoiceSink for RealtimeSink {
         Ok(())
     }
 
+    async fn clear_user_audio(&mut self) -> Result<(), VoiceError> {
+        if !self.manual_turn_detection {
+            return Ok(());
+        }
+        self.send(wire::input_audio_buffer_clear_event()).await
+    }
+
     async fn send_tool_result(
         &mut self,
         call_id: Option<&str>,
@@ -174,6 +196,13 @@ impl VoiceSink for RealtimeSink {
 
     async fn request_response(&mut self) -> Result<(), VoiceError> {
         self.send(wire::response_create_event()).await
+    }
+
+    async fn commit_user_audio(&mut self) -> Result<(), VoiceError> {
+        if !self.manual_turn_detection {
+            return Ok(());
+        }
+        self.send(wire::input_audio_buffer_commit_event()).await
     }
 
     async fn close(&mut self) -> Result<(), VoiceError> {
@@ -194,12 +223,22 @@ struct RealtimeStream {
 impl VoiceStream for RealtimeStream {
     async fn next_event(&mut self) -> Option<Result<VoiceEvent, VoiceError>> {
         loop {
+            match self.next_runtime_event().await? {
+                Ok(VoiceRuntimeEvent::Voice(event)) => return Some(Ok(event)),
+                Ok(VoiceRuntimeEvent::ResponseCreated) => continue,
+                Err(error) => return Some(Err(error)),
+            }
+        }
+    }
+
+    async fn next_runtime_event(&mut self) -> Option<Result<VoiceRuntimeEvent, VoiceError>> {
+        loop {
             match self.read.next().await {
                 None => return None,
                 Some(Err(e)) => return Some(Err(VoiceError::Transport(e.to_string()))),
                 Some(Ok(Message::Text(text))) => match wire::parse_server_event(text.as_str()) {
                     Ok(event) => {
-                        if let Some(mapped) = map_event(event) {
+                        if let Some(mapped) = map_runtime_event(event) {
                             return Some(mapped);
                         }
                         // Unmappable (Unknown) — keep reading.
@@ -214,6 +253,13 @@ impl VoiceStream for RealtimeStream {
             }
         }
     }
+}
+
+fn map_runtime_event(event: ServerEvent) -> Option<Result<VoiceRuntimeEvent, VoiceError>> {
+    if matches!(event, ServerEvent::ResponseCreated { .. }) {
+        return Some(Ok(VoiceRuntimeEvent::ResponseCreated));
+    }
+    map_event(event).map(|result| result.map(VoiceRuntimeEvent::Voice))
 }
 
 /// Ground-truth probe: on the VERY FIRST output-audio delta of the process,
@@ -239,6 +285,7 @@ fn debug_first_item_id(item_id: Option<&str>) {
 fn map_event(event: ServerEvent) -> Option<Result<VoiceEvent, VoiceError>> {
     let mapped = match event {
         ServerEvent::SessionCreated { .. } => VoiceEvent::SessionReady,
+        ServerEvent::ResponseCreated { .. } => return None,
         ServerEvent::OutputAudioDelta { delta, item_id } => {
             debug_first_item_id(item_id.as_deref());
             match wire::base64_to_pcm16(&delta) {
@@ -350,6 +397,14 @@ mod tests {
 
     #[test]
     fn maps_speech_and_tool_and_done() {
+        assert!(matches!(
+            map_runtime_event(ServerEvent::ResponseCreated {
+                response: Some(json!({"id": "resp_1"})),
+            })
+            .expect("runtime event")
+            .expect("valid event"),
+            VoiceRuntimeEvent::ResponseCreated
+        ));
         assert!(matches!(
             map_event(ServerEvent::SpeechStarted).unwrap().unwrap(),
             VoiceEvent::UserSpeechStarted

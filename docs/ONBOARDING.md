@@ -579,11 +579,57 @@ machine (remote)."_
 The server is env-driven (no config file is loaded); the skill launches it and
 `aura-call` passes the environment through. All optional:
 
+- `AURA_DISPATCH_MODEL=<model>` — pin the in-call dispatch model for delegated
+  work. By default **Claude** auto-matches the dispatched sub-agent to the live
+  chat session's model (read from the transcript); **Codex** does NOT auto-match —
+  without a pin it runs on the app-server's default model. Set this to force a
+  specific model on either, e.g. `AURA_DISPATCH_MODEL=claude-opus-4-8`. Only Claude
+  and Codex have a per-call model knob; OpenClaw/Hermes ignore it.
 - `AURA_PORT` / `AURA_PUBLIC_HOST` / `AURA_TRANSPORT` — UDP port, the public host
   clients dial, and the REMOTE transport. The server auto-selects the transport
   from `AURA_PUBLIC_HOST`: a reachable value → `direct`, none on a REMOTE call →
   `iroh`. `AURA_TRANSPORT=iroh|direct` forces it; you rarely set it by hand (all
   covered above).
+- `.aura/` — Aura writes runtime state under `AURA_STATE_DIR` or the server
+  working directory. If that directory is inside a git worktree, Aura
+  best-effort adds `.aura/` to `.git/info/exclude`, never to tracked `.gitignore`.
+- `AURA_END_OF_TURN_TIMEOUT_MS=<ms>` — how much silence to wait before Aura
+  treats the user's turn as complete and starts answering in `voice` mode. Use a
+  larger value when Aura interrupts pauses too quickly; practical values are
+  `1500`, `2000`, or `2500`. The provider clamps this to `300..3000` ms. In
+  `push_to_talk` mode, Aura uses manual turn commit instead and ignores this
+  value.
+- `AURA_INPUT_MODE=push_to_talk` — **server setting** that selects explicit
+  push-to-talk instead of normal voice activation. The server writes `m=ptt`
+  into the connection string, and the client follows it automatically.
+  Press/toggle once to start sending mic audio, then press/toggle again to
+  commit the turn and ask Aura to answer. Default mode is `voice`.
+- `AURA_PUSH_TO_TALK_HOTKEY=ctrl+space` — Windows client global toggle hotkey
+  for `push_to_talk` mode. It works even when another app has focus. Set it in
+  the client's real process environment or trusted user-global Aura `.env`;
+  project `.env` files cannot control it. Letter and number keys require a
+  modifier.
+- On Linux, bind your desktop shortcut to `aura-cli ptt-toggle`. Each active
+  call gets a separate `0600` socket under a private `0700` per-user runtime
+  directory (`$XDG_RUNTIME_DIR/aura`, or `$HOME/.cache/aura/runtime` when
+  `XDG_RUNTIME_DIR` is unset). The command removes only stale owned sockets and
+  refuses to pick a call when multiple PTT calls are active. Local PTT controls
+  are validated before the client dials, so an invalid setting does not consume
+  the single-use connection string.
+- `AURA_PUSH_TO_TALK_MAX_RECORDING_MS=300000` — client safety cap for an
+  accidentally open push-to-talk mic. Set it in the client's real process
+  environment or trusted user-global Aura `.env`; project `.env` files cannot
+  control it. It is parsed only for PTT calls. Three seconds before the cap,
+  Aura warns the user that the voice message limit is near. Very short
+  push-to-talk taps are discarded instead of sent.
+- `AURA_CONNECT` — per-call connection string for `aura-cli`. Do not put this in
+  `.env`: the client intentionally ignores `.env` values for `AURA_CONNECT` so a
+  target repository cannot redirect the user's microphone. Pass it as a real
+  process env var or paste it on stdin.
+- Client project `.env` files may configure only `AURA_AEC`. Security-sensitive
+  PTT controls are accepted only from the real process environment or the
+  trusted user-global Aura `.env`.
+- `AURA_FEEDER=1` — opt in to the live ambient-context feeder (needs `claude` on `PATH`).
 
 ---
 

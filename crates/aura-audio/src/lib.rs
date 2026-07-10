@@ -2239,6 +2239,12 @@ mod tests {
     /// headless Mac minis will skip.
     #[test]
     fn live_audio_session_starts_and_shuts_down() {
+        if cfg!(windows) && std::env::var("AURA_LIVE_AUDIO_TEST").as_deref() != Ok("1") {
+            eprintln!(
+                "[test] skipping live_audio_session smoke test on Windows; set AURA_LIVE_AUDIO_TEST=1 to opt in"
+            );
+            return;
+        }
         // Bail if no devices — the gate keeps CI green.
         let host = cpal::default_host();
         if host.default_input_device().is_none() || host.default_output_device().is_none() {

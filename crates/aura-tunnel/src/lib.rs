@@ -16,7 +16,9 @@
 pub mod endpoint;
 pub mod jitter;
 pub mod noise;
+pub(crate) mod outbound;
 pub mod reframe;
+pub(crate) mod replay;
 pub mod session;
 pub mod wire;
 
@@ -37,4 +39,4 @@ pub use reframe::Reframer;
 pub use session::SessionSecret;
 #[cfg(feature = "server")]
 pub use transport::TunnelTransport;
-pub use wire::{ConnectionString, TransportKind};
+pub use wire::{ConnectionString, TransportKind, TunnelControl, TunnelInput, TunnelInputMode};

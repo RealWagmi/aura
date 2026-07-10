@@ -1,14 +1,44 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Codex and other agentic coding tools when working
+with code in this repository.
 
 > **Language policy:** all code, comments, and docs are written in **English**.
 
-## Windows Push-To-Talk Notes
+## Codex operating rules
 
-Set `AURA_INPUT_MODE` on the server. Set the client controls in the real client
-process environment or trusted user-global Aura config; project `.env` files
-cannot control them:
+Keep this file updated when architecture, invariants, setup, or project status
+changes.
+
+- Use PowerShell on Windows.
+- Do not print secrets. Never echo `XAI_API_KEY`, `OPENAI_API_KEY`, `.env`
+  contents, or `AURA_CONNECT`.
+- Do not pass the Aura connection string as a command-line argument. Use
+  `AURA_CONNECT` or stdin.
+- Do not run `git push` unless the user explicitly asks for it.
+- Prefer small, focused changes that preserve Linux/macOS behavior when adding
+  Windows support.
+- Aura writes runtime state under `AURA_STATE_DIR` or the server working
+  directory as `.aura`; when inside a git worktree, Aura best-effort adds
+  `.aura/` to `.git/info/exclude`, never to tracked `.gitignore`.
+- For Windows install/run details, read `skills/SKILL_WINDOWS.md`.
+
+## Codex and Windows quick notes
+
+For local Windows calls with Codex:
+
+```powershell
+$env:AURA_HOST = 'codex'
+$env:AURA_AGENT = 'codex'
+```
+
+Start `aura-server.exe` in the target repository working directory, then pass
+the single-use connection URL to `aura-cli.exe` through `AURA_CONNECT`, never
+argv.
+
+Push-to-talk mode (set `AURA_INPUT_MODE` on the server; set the remaining
+client controls in the real client process environment or trusted user-global
+Aura config):
 
 ```env
 AURA_INPUT_MODE=push_to_talk
@@ -16,14 +46,13 @@ AURA_PUSH_TO_TALK_HOTKEY=ctrl+space
 AURA_PUSH_TO_TALK_MAX_RECORDING_MS=300000
 ```
 
-The user presses the hotkey once to start streaming mic audio, speaks, then
-presses the same hotkey again to commit the turn and ask Aura to answer. The
-server uses manual turn detection for PTT and ignores
+In `push_to_talk`, the user presses the hotkey once to start streaming mic audio,
+speaks, then presses the same hotkey again to commit the turn and ask Aura to
+answer. The server uses manual turn detection for PTT and ignores
 `AURA_END_OF_TURN_TIMEOUT_MS`; `AURA_PUSH_TO_TALK_MAX_RECORDING_MS` is only a
 client safety cap for an accidentally open mic. Set `AURA_INPUT_MODE` on the
 server; the connection string carries the mode to `aura-cli` as `m=voice` or
-`m=ptt`, and the client follows it automatically. Letter and number hotkeys
-require a modifier.
+`m=ptt`, and the client follows it automatically.
 
 ## What this is
 
@@ -39,7 +68,7 @@ require a modifier.
 - **Two binaries:** `aura-server` (the host launches it; holds key/engine/context/tools; the engine's only transport is an `AudioTransport`) and `aura-cli` (always a thin client: cpal mic/speaker ↔ tunnel; no engine/key/host). `aura-audio` provides cpal for the client.
 - **Context loop closes both ways:** Brief (chat→call) at start; a **post-call summary** (call→chat) at the end — the in-call inline transcript (the realtime model's own transcript events, NOT STT) is posted into the chat via `HostAdapter::deliver_call_summary` for the host to summarize.
 - **Hosts:** Claude Code, Codex, Hermes, OpenClaw; priority is Codex + Claude.
-- **Two REMOTE transports; the SERVER auto-selects, preferring direct for a reachable host.** Transport resolution lives in `aura-server` (`resolve_transport`), not the launcher, so the server's robust `.env` loader is the single source of truth. Rule: an explicit `AURA_TRANSPORT=iroh|direct` wins (a typo is a hard error, never a silent fallback); otherwise a REMOTE call (flagged `AURA_REMOTE=1` by `aura-call`) uses **direct** Noise/UDP when a reachable `AURA_PUBLIC_HOST` is configured (env or `.env`), else falls back to **iroh** QUIC P2P (hole-punch + blind relay fallback; NAT/CGNAT-safe). Onboarding persists `AURA_PUBLIC_HOST` to the aura `.env` for a VPS, so a reachable server gets the low-latency, broker-free direct path automatically with no per-call argument; a NAT'd server persists nothing and gets iroh. `aura-call remote <PUBLIC_HOST>` forces direct to that host for the current call. Noise_NNpsk0 still runs INSIDE the iroh stream — the relay only ever sees ciphertext and is fallback-only. The connection string is self-describing (`&t=direct|iroh`).
+- **Optional 2nd REMOTE transport (iroh).** For a server behind NAT/CGNAT with no openable port, `AURA_TRANSPORT=iroh` selects an iroh QUIC P2P transport (hole-punching + blind relay fallback) instead of direct Noise/UDP. Noise_NNpsk0 still runs INSIDE the iroh stream — the relay only ever sees ciphertext and is used for fallback only. Fixed at onboarding; the connection string is self-describing (`&t=direct|iroh`).
 
 **Explicitly rejected (and why):**
 - **Any broker (e.g. Cloudflare)** — a third party between user and AI; the goal is to remove it. (Relaxed only to a *blind encrypted relay* for the optional iroh NAT fallback.)
@@ -74,6 +103,7 @@ The single seam between LOCAL and REMOTE is the **`AudioTransport`** trait (PCM1
 - **BYOK only, key host-pinned PER PROVIDER.** `XAI_API_KEY`/`OPENAI_API_KEY` from the environment (then OS keychain), wrapped in `Zeroizing`. Before building `Authorization: Bearer`, a validator refuses to send each key to any host other than its own pin (`XAI_API_KEY` → `api.x.ai`, `OPENAI_API_KEY` → `api.openai.com`). Secrets live only in env/keychain, NEVER in config/logs/URL/argv. This is the core anti-exfiltration guard.
 - **No intermediary broker.** In REMOTE the AI server is itself the call endpoint; the connection string points to the server itself. xAI is the model endpoint (the brain), not a relay. (The optional iroh relay is blind — ciphertext only — and fallback-only.)
 - **The session secret never hits argv.** The client reads the connection string from `AURA_CONNECT` or stdin only — never the command line (it would be visible in `ps`).
+- **Tunnel upgrades require both endpoints.** Current direct peers authenticate a protocol marker and iroh uses a versioned ALPN. A new server can explicitly reject an authenticated legacy direct client, but a new client talking to an already-installed legacy server can only time out: the old binary has no negotiation response to send. Never claim this direction can produce a clear mismatch; tell users to update both binaries together.
 - **Direct audio, no STT/TTS.** The user transcript arrives as inline realtime-WS events, not a separate STT.
 - **`VoiceConnection` is split into `VoiceSink` + `VoiceStream`.** Two tasks (mic-pump and event-loop) can't hold `&mut self` to one WS; `connect()` returns a pair over `SplitSink`/`SplitStream`.
 - **A `Reframer{carry}` is mandatory before the audio pipeline.** The pipeline is lossy on arbitrary-length frames (truncates / silence-pads); only exact 480/960-sample frames are safe.
@@ -87,7 +117,7 @@ The single seam between LOCAL and REMOTE is the **`AudioTransport`** trait (PCM1
 
 All code is complete and gates are green (`cargo build`/`test --workspace`/`clippy --workspace --all-targets -- -D warnings`/`fmt`, zero Cyrillic, no stubs). The pieces:
 
-- **`aura-tunnel`** — REMOTE transport. `noise` (NNpsk0 via `snow`, stateless per-packet nonce), `session` (32-byte `SessionSecret`, Zeroizing, base64url), `wire` (`aura://host:port#k=…&c=…&t=…` + datagram framing), `endpoint` (`TunnelServer::bind/accept` responder + `TunnelEndpoint::connect_client` initiator over UDP with handshake retransmit; jitter + 20 ms pacer; tasks aborted on drop), `transport` (`TunnelTransport: AudioTransport`, `server` feature), `jitter`/`reframe`. Optional `iroh` feature: `iroh_transport` (`IrohServer`/`IrohEndpoint`/`IrohTransport` + `connect_by_id`) — iroh QUIC P2P (Noise handshake over a bi-stream, audio over QUIC datagrams), selected by the server's `resolve_transport` (explicit `AURA_TRANSPORT=iroh`, or auto when a REMOTE call has no reachable `AURA_PUBLIC_HOST`). Loopback tests: handshake + PCM round-trip both ways; wrong-secret / tamper / wrong-nonce rejected.
+- **`aura-tunnel`** — REMOTE transport. `noise` (NNpsk0 via `snow`, stateless per-packet nonce), `session` (32-byte `SessionSecret`, Zeroizing, base64url), `wire` (`aura://host:port#k=…&c=…&t=…` + datagram framing), `endpoint` (`TunnelServer::bind/accept` responder + `TunnelEndpoint::connect_client` initiator over UDP with handshake retransmit; jitter + 20 ms pacer; tasks aborted on drop), `transport` (`TunnelTransport: AudioTransport`, `server` feature), `jitter`/`reframe`. Optional `iroh` feature: `iroh_transport` (`IrohServer`/`IrohEndpoint`/`IrohTransport` + `connect_by_id`) — iroh QUIC P2P (Noise handshake over a bi-stream, audio over QUIC datagrams), selected by `AURA_TRANSPORT=iroh`. Loopback tests: handshake + PCM round-trip both ways; wrong-secret / tamper / wrong-nonce rejected.
 - **`aura-voice`** — `wire` (GA-style protocol shared by BOTH providers: one `parse_server_event`, per-provider `session.update` builders + host-pins, balance classify), `compose` (priority packer + `Brief`→instructions), `realtime_ws` (shared host-pinned connect + split sink/stream + event mapping), `byok` (shared env→keychain key resolution), `XaiRealtimeProvider` + `OpenAiRealtimeProvider` (GA protocol; PCM16@24k both ways; transcription sidecar whisper-1 always on + optional `AURA_TRANSCRIBE_LANG` hint; `reasoning.effort` low, mini→medium; voice `marin`; rustls `ring` provider installed before connect). The server picks the provider by key (xAI first when both), `AURA_VOICE_PROVIDER` pins, `AURA_VOICE_MODEL` overrides (e.g. `gpt-realtime-2.1-mini`).
 - **`aura-engine`** — `AudioTransport` seam + `CallSession::run`: single-task event loop, barge-in, reconnect with bounded backoff, pause/resume. The universal chat-callback seam delivers a completed `start_agent_task` dispatch into the host chat via `HostAdapter::deliver_callback` on a detached task (a slow host sink never stalls the audio loop); the `AmbientFeeder` seam injects feeder digests. `InCallTranscript` records both sides (developer input transcript + Aura output transcript) and on call-end the engine posts the recap via `HostAdapter::deliver_call_summary` (best-effort, redacted).
 - **`aura-hosts`** — `HostAdapter` + 4 adapters: `ClaudeAdapter` (transcript→`Brief`, slash trigger, `.aura` file callback; `deliver_call_summary` writes the full redacted transcript for the host to summarize), `CodexAdapter` (app-server JSON-RPC, rollout JSONL→`Brief`), `HermesAdapter` (rusqlite read-only state.db, burst-clone ranking, worker `PROGRESS:`/`SUMMARY:` from `AURA_HERMES_WORKER`, recap file `.aura/aura-last-call-recap.md`), `OpenClawAdapter` (host-brief / workspace-fetcher→`Brief`, single `openclaw_agent_consult` dispatch behind the 18-field `reject_direct_overrides` gate, AES-256-GCM runtime-inbox callback). `registry::resolve_host(cwd)` picks the adapter by explicit launch signal (`AURA_HOST` → `AURA_AGENT=codex` → OpenClaw identity env → Claude default). All callback text passes `redact_secrets` + `speech_safe_summary`.

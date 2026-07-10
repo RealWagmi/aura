@@ -207,7 +207,7 @@ impl ProviderConfig {
                     let legacy = self.voice.as_str();
                     is_openai_realtime_voice(legacy).then_some(legacy)
                 })
-                .unwrap_or("alloy"),
+                .unwrap_or("marin"),
         }
     }
 }
@@ -215,7 +215,16 @@ impl ProviderConfig {
 fn is_openai_realtime_voice(voice: &str) -> bool {
     matches!(
         voice,
-        "alloy" | "ash" | "ballad" | "coral" | "echo" | "sage" | "shimmer" | "verse"
+        "alloy"
+            | "ash"
+            | "ballad"
+            | "cedar"
+            | "coral"
+            | "echo"
+            | "marin"
+            | "sage"
+            | "shimmer"
+            | "verse"
     )
 }
 
@@ -1325,20 +1334,16 @@ mod tests {
         let aura_dir = dir.join(".aura");
         fs::create_dir_all(&aura_dir).unwrap();
         let config_path = aura_dir.join("config.json");
-        fs::write(
-            &config_path,
-            format!(
-                r#"{{
-                  "history": {{"path": "{}/outside-history.jsonl", "max_events": 50}},
-                  "codex": {{"session_path": "../session.json"}},
-                  "checkpoints": {{"log_path": "{}"}},
-                  "sessions": {{"dir": ".aura/../sessions"}}
-                }}"#,
-                std::env::temp_dir().display(),
-                dir.join("not-aura").join("checkpoints.jsonl").display()
-            ),
-        )
-        .unwrap();
+        let raw = serde_json::json!({
+            "history": {
+                "path": std::env::temp_dir().join("outside-history.jsonl"),
+                "max_events": 50
+            },
+            "codex": {"session_path": "../session.json"},
+            "checkpoints": {"log_path": dir.join("not-aura").join("checkpoints.jsonl")},
+            "sessions": {"dir": ".aura/../sessions"}
+        });
+        fs::write(&config_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
 
         let config = load_or_default(Some(&config_path)).unwrap();
 
@@ -1835,7 +1840,7 @@ mod tests {
             openai_voice: None,
             ..ProviderConfig::default()
         };
-        assert_eq!(p.effective_voice(), "alloy");
+        assert_eq!(p.effective_voice(), "marin");
 
         p.engine = VoiceEngine::Grok;
         p.grok_voice = None;
@@ -1846,7 +1851,7 @@ mod tests {
     fn effective_voice_ignores_grok_default_when_engine_is_openai() {
         let p: ProviderConfig = serde_json::from_str(r#"{"engine":"openai_realtime"}"#).unwrap();
         assert_eq!(p.voice, "eve");
-        assert_eq!(p.effective_voice(), "alloy");
+        assert_eq!(p.effective_voice(), "marin");
     }
 
     #[test]

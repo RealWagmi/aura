@@ -145,13 +145,13 @@ Run via the `curl | bash` one-liner, `install.sh` first clones the source into `
 You ask the AI for a call ("call me", a slash command, etc.). The AI launches `aura-server`, which mints a single-use per-call secret (valid for about 120 seconds) and produces a **connection string** of the form:
 
 ```
-aura://HOST:PORT#k=<secret>&c=<call_id>
+aura://HOST:PORT#k=<secret>&c=<call_id>&t=direct&m=voice
 ```
 
 The secret lives in the URL fragment. You connect by handing that string to the client through the `AURA_CONNECT` environment variable — never on the command line, so the secret never appears in `ps`:
 
 ```bash
-AURA_CONNECT='aura://HOST:PORT#k=...&c=...' aura-cli
+AURA_CONNECT='aura://HOST:PORT#k=...&c=...&t=direct&m=voice' aura-cli
 ```
 
 Or run `aura-cli` with no arguments and paste the string on its first line of standard input.
@@ -159,7 +159,16 @@ Or run `aura-cli` with no arguments and paste the string on its first line of st
 - **LOCAL call** — the AI runs the server on `127.0.0.1` on your machine and runs the `aura-cli` command for you; your mic opens and you talk.
 - **REMOTE call** — the AI runs the server on its VPS and sends you the connection string over the chat; you run `AURA_CONNECT='aura://...' aura-cli` on your own machine.
 
+The client and server must use the same Aura tunnel protocol version. A current
+direct server gives an authenticated version-mismatch error to an older client.
+A current client connecting to an older server can only report a handshake
+timeout because that already-installed server predates version negotiation and
+cannot produce the newer authenticated error. For iroh, an ALPN mismatch fails
+during connection setup. In every case, update both binaries together.
+
 **Open speakers / echo.** The client runs echo cancellation (WebRTC AEC3) on the mic by default, so you can talk — and interrupt the model mid-sentence — on open speakers without the model hearing itself. Headphones remain the zero-processing option. Tunables via the `AURA_AEC` environment variable: `on` (default), `gate` (no AEC — the mic is muted while the model speaks, so no barge-in), `off` (raw mic, headset users only).
+
+**Push-to-talk.** Set `AURA_INPUT_MODE=push_to_talk` on the server before it creates the call. The connection string carries `m=ptt`, and the client follows that mode automatically. On Windows, set `AURA_PUSH_TO_TALK_HOTKEY` in the client's real process environment or trusted user-global Aura config; letter and number keys require a modifier. On Linux, bind your desktop shortcut to `aura-cli ptt-toggle`. Each call uses its own `0600` socket inside a private per-user runtime directory (`$XDG_RUNTIME_DIR/aura`, or `$HOME/.cache/aura/runtime` when no runtime directory is set); the command refuses to choose when multiple PTT calls are active. Aura validates these local PTT controls before dialing, so bad client configuration does not consume the single-use call.
 
 When the call ends, the server posts a short recap of the in-call transcript back into the chat, so the AI can pick the conversation back up where the voice call left off.
 

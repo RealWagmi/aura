@@ -19,6 +19,34 @@ pub const TAG_HANDSHAKE: u8 = 0x01;
 pub const TAG_TRANSPORT: u8 = 0x02;
 /// `aura://` scheme prefix.
 const SCHEME: &str = "aura://";
+const CONTROL_PREFIX: &[u8] = b"AURA_CTRL_1";
+const RELIABLE_CONTROL_PREFIX: &[u8] = b"AURA_CTRL_2";
+const CONTROL_ACK_PREFIX: &[u8] = b"AURA_ACK_1";
+const CONTROL_PTT_OPEN: u8 = 1;
+const CONTROL_PTT_CLOSE: u8 = 2;
+const CONTROL_PTT_CANCEL: u8 = 3;
+
+/// Authenticated in-band control events carried over the same encrypted tunnel
+/// as audio. They ride the SAME jitter buffer as audio on the receive side so
+/// delivery order matches send order (a control that overtakes the audio sent
+/// before it would commit a turn missing its trailing frames).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelControl {
+    PttOpen,
+    PttClose,
+    /// Abandon the open turn WITHOUT committing it: the client discarded a
+    /// too-short recording, so the server must drop the already-streamed
+    /// frames from the provider input buffer (a plain `PttClose` would commit
+    /// them and answer a message the user explicitly discarded).
+    PttCancel,
+}
+
+/// What the server can receive from the client side of the tunnel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TunnelInput {
+    Audio(Vec<i16>),
+    Control(TunnelControl),
+}
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ConnError {
@@ -32,6 +60,10 @@ pub enum ConnError {
     MissingSecret,
     #[error("connection string is missing the `c=` call id")]
     MissingCallId,
+    #[error("unsupported transport tag in connection string: {0:?}")]
+    UnknownTransport(String),
+    #[error("unsupported input mode tag in connection string: {0:?}")]
+    UnknownInputMode(String),
     #[error("session secret: {0}")]
     Secret(#[from] SecretError),
 }
@@ -46,6 +78,13 @@ pub enum TransportKind {
     Iroh,
 }
 
+/// Input mode selected by the server and carried in the connection string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelInputMode {
+    Voice,
+    PushToTalk,
+}
+
 /// A parsed connection string. For [`TransportKind::Direct`] `authority` is the
 /// `host:port` to dial; for [`TransportKind::Iroh`] it is the server's
 /// `EndpointId`.
@@ -55,25 +94,38 @@ pub struct ConnectionString {
     pub call_id: String,
     pub secret: SessionSecret,
     pub transport: TransportKind,
+    pub input_mode: Option<TunnelInputMode>,
 }
 
 impl ConnectionString {
     /// Build a DIRECT (Noise/UDP) connection string for `host:port`.
-    pub fn format_direct(authority: &str, call_id: &str, secret: &SessionSecret) -> String {
+    pub fn format_direct(
+        authority: &str,
+        call_id: &str,
+        secret: &SessionSecret,
+        input_mode: TunnelInputMode,
+    ) -> String {
         format!(
-            "{SCHEME}{authority}#k={}&c={}&t=direct",
+            "{SCHEME}{authority}#k={}&c={}&t=direct&m={}",
             secret.to_base64url(),
-            call_id
+            call_id,
+            encode_input_mode(input_mode)
         )
     }
 
     /// Build an IROH connection string for a server `EndpointId`. The client
     /// resolves the server's addresses via iroh discovery (no host:port needed).
-    pub fn format_iroh(endpoint_id: &str, call_id: &str, secret: &SessionSecret) -> String {
+    pub fn format_iroh(
+        endpoint_id: &str,
+        call_id: &str,
+        secret: &SessionSecret,
+        input_mode: TunnelInputMode,
+    ) -> String {
         format!(
-            "{SCHEME}{endpoint_id}#k={}&c={}&t=iroh",
+            "{SCHEME}{endpoint_id}#k={}&c={}&t=iroh&m={}",
             secret.to_base64url(),
-            call_id
+            call_id,
+            encode_input_mode(input_mode)
         )
     }
 
@@ -88,6 +140,7 @@ impl ConnectionString {
         let mut secret_b64: Option<&str> = None;
         let mut call_id: Option<&str> = None;
         let mut transport = TransportKind::Direct; // legacy strings (no `t=`) are direct
+        let mut input_mode = None; // legacy strings fall back to local env.
         for pair in fragment.split('&') {
             if let Some(v) = pair.strip_prefix("k=") {
                 secret_b64 = Some(v);
@@ -96,8 +149,14 @@ impl ConnectionString {
             } else if let Some(v) = pair.strip_prefix("t=") {
                 transport = match v {
                     "iroh" => TransportKind::Iroh,
-                    _ => TransportKind::Direct,
+                    "direct" => TransportKind::Direct,
+                    _ => return Err(ConnError::UnknownTransport(v.to_owned())),
                 };
+            } else if let Some(v) = pair.strip_prefix("m=") {
+                input_mode = Some(
+                    parse_input_mode_tag(v)
+                        .ok_or_else(|| ConnError::UnknownInputMode(v.to_owned()))?,
+                );
             }
         }
         let secret = SessionSecret::from_base64url(secret_b64.ok_or(ConnError::MissingSecret)?)?;
@@ -110,7 +169,23 @@ impl ConnectionString {
             call_id: call_id.to_owned(),
             secret,
             transport,
+            input_mode,
         })
+    }
+}
+
+pub fn encode_input_mode(mode: TunnelInputMode) -> &'static str {
+    match mode {
+        TunnelInputMode::Voice => "voice",
+        TunnelInputMode::PushToTalk => "ptt",
+    }
+}
+
+fn parse_input_mode_tag(raw: &str) -> Option<TunnelInputMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "voice" | "vad" => Some(TunnelInputMode::Voice),
+        "push_to_talk" | "push-to-talk" | "ptt" => Some(TunnelInputMode::PushToTalk),
+        _ => None,
     }
 }
 
@@ -134,6 +209,84 @@ pub fn decode_transport(body: &[u8]) -> Option<(u64, &[u8])> {
     Some((u64::from_be_bytes(n), &body[8..]))
 }
 
+pub fn encode_tunnel_control(control: TunnelControl) -> Vec<u8> {
+    let code = match control {
+        TunnelControl::PttOpen => CONTROL_PTT_OPEN,
+        TunnelControl::PttClose => CONTROL_PTT_CLOSE,
+        TunnelControl::PttCancel => CONTROL_PTT_CANCEL,
+    };
+    let mut out = Vec::with_capacity(CONTROL_PREFIX.len() + 1);
+    out.extend_from_slice(CONTROL_PREFIX);
+    out.push(code);
+    out
+}
+
+pub fn decode_tunnel_control(body: &[u8]) -> Option<TunnelControl> {
+    let suffix = body.strip_prefix(CONTROL_PREFIX)?;
+    if suffix.len() != 1 {
+        return None;
+    }
+    decode_control_code(suffix[0])
+}
+
+fn decode_control_code(code: u8) -> Option<TunnelControl> {
+    match code {
+        CONTROL_PTT_OPEN => Some(TunnelControl::PttOpen),
+        CONTROL_PTT_CLOSE => Some(TunnelControl::PttClose),
+        CONTROL_PTT_CANCEL => Some(TunnelControl::PttCancel),
+        _ => None,
+    }
+}
+
+/// Encode a control with an id used for acknowledgement, retry, and receiver
+/// deduplication. This is an encrypted plaintext payload, not a public header.
+pub(crate) fn encode_reliable_control(id: u64, control: TunnelControl) -> Vec<u8> {
+    let code = match control {
+        TunnelControl::PttOpen => CONTROL_PTT_OPEN,
+        TunnelControl::PttClose => CONTROL_PTT_CLOSE,
+        TunnelControl::PttCancel => CONTROL_PTT_CANCEL,
+    };
+    let mut out = Vec::with_capacity(RELIABLE_CONTROL_PREFIX.len() + 9);
+    out.extend_from_slice(RELIABLE_CONTROL_PREFIX);
+    out.extend_from_slice(&id.to_be_bytes());
+    out.push(code);
+    out
+}
+
+pub(crate) fn decode_reliable_control(body: &[u8]) -> Option<(u64, TunnelControl)> {
+    let suffix = body.strip_prefix(RELIABLE_CONTROL_PREFIX)?;
+    if suffix.len() != 9 {
+        return None;
+    }
+    let mut id = [0_u8; 8];
+    id.copy_from_slice(&suffix[..8]);
+    Some((u64::from_be_bytes(id), decode_control_code(suffix[8])?))
+}
+
+pub(crate) fn encode_control_ack(id: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(CONTROL_ACK_PREFIX.len() + 8);
+    out.extend_from_slice(CONTROL_ACK_PREFIX);
+    out.extend_from_slice(&id.to_be_bytes());
+    out
+}
+
+pub(crate) fn decode_control_ack(body: &[u8]) -> Option<u64> {
+    let suffix = body.strip_prefix(CONTROL_ACK_PREFIX)?;
+    if suffix.len() != 8 {
+        return None;
+    }
+    let mut id = [0_u8; 8];
+    id.copy_from_slice(suffix);
+    Some(u64::from_be_bytes(id))
+}
+
+/// Is this decrypted frame payload a control frame? Used by the outbound queue
+/// to never evict a control on overflow (dropping audio degrades quality;
+/// dropping a `PttClose` strands the whole turn).
+pub(crate) fn is_tunnel_control(body: &[u8]) -> bool {
+    decode_tunnel_control(body).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,7 +294,12 @@ mod tests {
     #[test]
     fn direct_connection_string_round_trips() {
         let secret = SessionSecret::generate().unwrap();
-        let s = ConnectionString::format_direct("203.0.113.7:9443", "call-abc12345", &secret);
+        let s = ConnectionString::format_direct(
+            "203.0.113.7:9443",
+            "call-abc12345",
+            &secret,
+            TunnelInputMode::Voice,
+        );
         assert!(s.starts_with("aura://203.0.113.7:9443#k="));
         assert!(s.contains("&t=direct"));
         let parsed = ConnectionString::parse(&s).unwrap();
@@ -149,6 +307,7 @@ mod tests {
         assert_eq!(parsed.call_id, "call-abc12345");
         assert_eq!(parsed.secret.as_bytes(), secret.as_bytes());
         assert_eq!(parsed.transport, TransportKind::Direct);
+        assert_eq!(parsed.input_mode, Some(TunnelInputMode::Voice));
     }
 
     #[test]
@@ -156,13 +315,19 @@ mod tests {
         let secret = SessionSecret::generate().unwrap();
         // An opaque EndpointId-like authority (base32; no host:port).
         let id = "ci6ej5hsqs4u4xx7m4t4i7s2yqd3kq4gqf6h2c4xk7h6w7a";
-        let s = ConnectionString::format_iroh(id, "call-iroh0001", &secret);
+        let s = ConnectionString::format_iroh(
+            id,
+            "call-iroh0001",
+            &secret,
+            TunnelInputMode::PushToTalk,
+        );
         assert!(s.contains("&t=iroh"));
         let parsed = ConnectionString::parse(&s).unwrap();
         assert_eq!(parsed.authority, id);
         assert_eq!(parsed.call_id, "call-iroh0001");
         assert_eq!(parsed.secret.as_bytes(), secret.as_bytes());
         assert_eq!(parsed.transport, TransportKind::Iroh);
+        assert_eq!(parsed.input_mode, Some(TunnelInputMode::PushToTalk));
     }
 
     #[test]
@@ -173,6 +338,7 @@ mod tests {
             ConnectionString::parse(&s).unwrap().transport,
             TransportKind::Direct
         );
+        assert_eq!(ConnectionString::parse(&s).unwrap().input_mode, None);
     }
 
     #[test]
@@ -198,6 +364,18 @@ mod tests {
             ConnectionString::parse(&format!("aura://h:1#k={good_secret}")),
             Err(ConnError::MissingCallId)
         ));
+        assert!(matches!(
+            ConnectionString::parse(&format!(
+                "aura://h:1#k={good_secret}&c=call-x&t=warp&m=voice"
+            )),
+            Err(ConnError::UnknownTransport(t)) if t == "warp"
+        ));
+        assert!(matches!(
+            ConnectionString::parse(&format!(
+                "aura://h:1#k={good_secret}&c=call-x&t=direct&m=manual"
+            )),
+            Err(ConnError::UnknownInputMode(m)) if m == "manual"
+        ));
     }
 
     #[test]
@@ -209,5 +387,32 @@ mod tests {
         assert_eq!(nonce, 0x0102_0304_0506_0708);
         assert_eq!(body, ct);
         assert!(decode_transport(&[0, 1, 2]).is_none(), "too short → None");
+    }
+
+    #[test]
+    fn tunnel_control_round_trips() {
+        assert_eq!(
+            decode_tunnel_control(&encode_tunnel_control(TunnelControl::PttOpen)),
+            Some(TunnelControl::PttOpen)
+        );
+        assert_eq!(
+            decode_tunnel_control(&encode_tunnel_control(TunnelControl::PttClose)),
+            Some(TunnelControl::PttClose)
+        );
+        assert_eq!(
+            decode_tunnel_control(&encode_tunnel_control(TunnelControl::PttCancel)),
+            Some(TunnelControl::PttCancel)
+        );
+        assert_eq!(decode_tunnel_control(b"not-control"), None);
+        let mut trailing = encode_tunnel_control(TunnelControl::PttOpen);
+        trailing.push(0);
+        assert_eq!(decode_tunnel_control(&trailing), None);
+
+        let reliable = encode_reliable_control(42, TunnelControl::PttClose);
+        assert_eq!(
+            decode_reliable_control(&reliable),
+            Some((42, TunnelControl::PttClose))
+        );
+        assert_eq!(decode_control_ack(&encode_control_ack(42)), Some(42));
     }
 }

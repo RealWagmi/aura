@@ -99,6 +99,77 @@ unchanged. The user-global aura `.env` on Windows resolves to
 file); the OS keychain equivalent is **Windows Credential Manager**. Paste the key
 only into `.env`, the process environment, or Credential Manager — never echo it.
 
+Useful Windows-visible env values:
+
+```env
+AURA_PORT=47821
+AURA_PUBLIC_HOST=127.0.0.1
+AURA_TRANSPORT=direct
+AURA_AEC=on
+AURA_STATE_DIR=.
+AURA_FEEDER=false
+AURA_END_OF_TURN_TIMEOUT_MS=2000
+AURA_INPUT_MODE=voice
+AURA_PUSH_TO_TALK_HOTKEY=ctrl+space
+AURA_PUSH_TO_TALK_MAX_RECORDING_MS=300000
+```
+
+Do not add an empty `AURA_BIND=` line. If `AURA_BIND` exists, the server treats
+it as an explicit bind override.
+
+`AURA_END_OF_TURN_TIMEOUT_MS` controls how much silence Aura waits before it
+decides the user's turn is finished and starts answering in `voice` mode. Use
+`1500`, `2000`, or `2500` when Aura interrupts too quickly. The provider clamps
+the value to `300..3000` ms in `voice` mode. In `push_to_talk` mode, Aura uses
+manual hotkey turn commit and ignores this value.
+
+`AURA_INPUT_MODE` is set on the server. The connection string carries the mode
+to `aura-cli.exe` as `m=voice` or `m=ptt`, and the client follows it
+automatically:
+
+```env
+AURA_INPUT_MODE=voice
+AURA_INPUT_MODE=push_to_talk
+```
+
+In Windows `push_to_talk` mode, the user presses the global hotkey once to start
+sending mic audio, speaks, then presses the hotkey again to commit the turn and
+ask Aura to answer. The default hotkey is:
+
+```env
+AURA_PUSH_TO_TALK_HOTKEY=ctrl+space
+```
+
+Set `AURA_PUSH_TO_TALK_HOTKEY` in the real client process environment or the
+trusted user-global Aura `.env` before starting `aura-cli.exe`; a project
+`.env` cannot control it. Letter and number hotkeys require a modifier.
+`AURA_PUSH_TO_TALK_MAX_RECORDING_MS` follows the same trust rule and is a client
+safety cap for an accidentally open mic. The default is `300000` ms, about five
+minutes. Three seconds before the cap, Aura warns that the voice message limit
+is near. Very short push-to-talk taps are discarded instead of sent; the client
+prints that the message was too short.
+
+`aura-cli.exe` deliberately ignores `AURA_CONNECT` from every `.env`. It also
+ignores `AURA_INPUT_MODE`, `AURA_PUSH_TO_TALK_HOTKEY`, and
+`AURA_PUSH_TO_TALK_MAX_RECORDING_MS` from a project `.env`. The connection
+string must come from the real process environment or stdin; PTT controls must
+come from that environment or the trusted user-global Aura `.env`. A target
+repository therefore cannot redirect or silently reconfigure the user's
+microphone by planting a local `.env`.
+
+For a local call on the same Windows machine:
+
+- `AURA_PUBLIC_HOST=127.0.0.1`
+- `AURA_PORT=47821`
+- `AURA_TRANSPORT=direct`
+- Windows Firewall usually does not need a public inbound rule for loopback.
+- Aura creates a local `.aura/` runtime folder in `AURA_STATE_DIR` or the server
+  working directory. If that folder is inside a git worktree, Aura best-effort
+  adds `.aura/` to `.git/info/exclude`, never to tracked `.gitignore`.
+- In default `voice` mode, the user does not press a button. When `aura-cli.exe`
+  logs `speak when you hear Aura`, the mic is open and the user can speak
+  normally.
+
 ## Common Windows problems
 
 - `cargo` / `rustup` not found → install Rust with rustup, then open a new terminal.
@@ -107,3 +178,7 @@ only into `.env`, the process environment, or Credential Manager — never echo 
 - `aura-call` won't run in PowerShell → it is a POSIX script; use Git Bash / WSL / MSYS.
 - `XAI_API_KEY` not found → check `.env` in the server's launch dir, or set the
   user-global `%USERPROFILE%\.config\aura\.env`.
+- Aura interrupts too quickly → set `AURA_END_OF_TURN_TIMEOUT_MS` to a larger
+  value, usually `2000` or `2500`, then restart Aura.
+- User thinks they need Voice Recorder → no. Aura uses `aura-cli.exe`; the
+  important Windows setting is "Allow desktop apps to access your microphone".
