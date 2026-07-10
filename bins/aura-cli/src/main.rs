@@ -30,13 +30,15 @@ enum InputMode {
 struct PushToTalkGate {
     state: Arc<std::sync::atomic::AtomicU64>,
     label: String,
+    #[cfg(target_os = "linux")]
+    _control_socket: Arc<LinuxControlSocket>,
 }
 
 impl InputMode {
-    fn from_mode(mode: TunnelInputMode) -> Result<Self, Box<dyn std::error::Error>> {
+    fn from_mode(mode: TunnelInputMode, call_id: &str) -> Result<Self, Box<dyn std::error::Error>> {
         match mode {
             TunnelInputMode::Voice => Ok(Self::Voice),
-            TunnelInputMode::PushToTalk => start_push_to_talk(),
+            TunnelInputMode::PushToTalk => start_push_to_talk(call_id),
         }
     }
 
@@ -60,7 +62,7 @@ impl PushToTalkGate {
 }
 
 #[cfg(windows)]
-fn start_push_to_talk() -> Result<InputMode, Box<dyn std::error::Error>> {
+fn start_push_to_talk(_call_id: &str) -> Result<InputMode, Box<dyn std::error::Error>> {
     let raw = std::env::var("AURA_PUSH_TO_TALK_HOTKEY").unwrap_or_else(|_| "ctrl+space".to_owned());
     let watcher = hotkey::start_push_to_talk_watcher(&raw)?;
     Ok(InputMode::TogglePushToTalk(PushToTalkGate {
@@ -70,15 +72,24 @@ fn start_push_to_talk() -> Result<InputMode, Box<dyn std::error::Error>> {
 }
 
 #[cfg(target_os = "linux")]
-fn start_push_to_talk() -> Result<InputMode, Box<dyn std::error::Error>> {
-    let path = push_to_talk_control_path();
-    let _ = std::fs::remove_file(&path);
+fn start_push_to_talk(call_id: &str) -> Result<InputMode, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = push_to_talk_control_dir()?;
+    let path = dir.join(format!(
+        "aura-ptt-{}-{:016x}.sock",
+        std::process::id(),
+        stable_call_id_hash(call_id)
+    ));
+    remove_stale_control_socket(&path)?;
     let listener = std::os::unix::net::UnixListener::bind(&path).map_err(|err| {
         format!(
             "failed to bind Linux push-to-talk control socket {}: {err}",
             path.display()
         )
     })?;
+    let control_socket = Arc::new(LinuxControlSocket { path: path.clone() });
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
     let listener = tokio::net::UnixListener::from_std(listener)?;
     let presses = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -87,8 +98,21 @@ fn start_push_to_talk() -> Result<InputMode, Box<dyn std::error::Error>> {
     let _listener_task = tokio::spawn(async move {
         loop {
             match listener.accept().await {
-                Ok((_stream, _addr)) => {
-                    task_presses.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                Ok((stream, _addr)) => {
+                    let connection_presses = Arc::clone(&task_presses);
+                    tokio::spawn(async move {
+                        use tokio::io::AsyncReadExt;
+
+                        let mut command = Vec::with_capacity(8);
+                        let read = tokio::time::timeout(
+                            std::time::Duration::from_millis(500),
+                            stream.take(8).read_to_end(&mut command),
+                        )
+                        .await;
+                        if matches!(read, Ok(Ok(_))) && is_push_to_talk_toggle_command(&command) {
+                            connection_presses.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        }
+                    });
                 }
                 Err(err) => {
                     eprintln!(
@@ -103,11 +127,12 @@ fn start_push_to_talk() -> Result<InputMode, Box<dyn std::error::Error>> {
     Ok(InputMode::TogglePushToTalk(PushToTalkGate {
         state: presses,
         label: format!("aura-cli ptt-toggle ({})", path.display()),
+        _control_socket: control_socket,
     }))
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-fn start_push_to_talk() -> Result<InputMode, Box<dyn std::error::Error>> {
+fn start_push_to_talk(_call_id: &str) -> Result<InputMode, Box<dyn std::error::Error>> {
     Err(
         "AURA_INPUT_MODE=push_to_talk currently supports Windows global hotkeys and Linux ptt-toggle only"
             .into(),
@@ -162,12 +187,10 @@ fn handle_cli_flags() -> Option<i32> {
                  AURA_AEC        echo handling on the mic: on (default, AEC3 echo\n                  \
                  cancellation — speakers + barge-in work), gate (mute mic while\n                  \
                  the model speaks; no barge-in), off (raw mic; headsets only)\n  \
-                 AURA_INPUT_MODE voice (default) or push_to_talk\n  \
+                 AURA_INPUT_MODE legacy strings only; new connection strings carry\n                  \
+                 the server-selected m=voice or m=ptt mode\n  \
                  AURA_PUSH_TO_TALK_HOTKEY Windows global toggle hotkey\n                  \
-                 for push_to_talk mode (default ctrl+space)\n  \
-                 AURA_PUSH_TO_TALK_CONTROL_PATH Linux socket path used by\n                  \
-                 `aura-cli ptt-toggle` (default: $XDG_RUNTIME_DIR/aura-ptt.sock,\n                  \
-                 then the OS temp dir)\n  \
+                 for push_to_talk mode (default ctrl+space; letters/numbers need a modifier)\n  \
                  AURA_PUSH_TO_TALK_MAX_RECORDING_MS max push_to_talk open-mic time\n                  \
                  in milliseconds (default 300000, about 5 minutes)",
                 env!("CARGO_PKG_VERSION")
@@ -208,6 +231,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let raw = read_connection_string()?;
     let conn = ConnectionString::parse(&raw)?;
     let input_mode = resolve_input_mode(conn.input_mode)?;
+    #[cfg(any(windows, target_os = "linux"))]
+    let ptt_max_frames = if input_mode == TunnelInputMode::PushToTalk {
+        Some(push_to_talk_max_recording_frames()?)
+    } else {
+        None
+    };
     eprintln!(
         "aura: opening a secure tunnel to {} (call {})…",
         conn.authority, conn.call_id
@@ -219,7 +248,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match conn.transport {
         TransportKind::Direct => {
             let tunnel = TunnelEndpoint::connect_client(&conn.authority, &conn.secret, cfg).await?;
-            pump(tunnel, input_mode).await?;
+            pump(
+                tunnel,
+                input_mode,
+                &conn.call_id,
+                #[cfg(any(windows, target_os = "linux"))]
+                ptt_max_frames,
+            )
+            .await?;
         }
         TransportKind::Iroh => {
             let tunnel = IrohEndpoint::connect_by_id(
@@ -229,7 +265,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 cfg,
             )
             .await?;
-            pump(tunnel, input_mode).await?;
+            pump(
+                tunnel,
+                input_mode,
+                &conn.call_id,
+                #[cfg(any(windows, target_os = "linux"))]
+                ptt_max_frames,
+            )
+            .await?;
         }
     }
 
@@ -240,16 +283,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn resolve_input_mode(
     connection_mode: Option<TunnelInputMode>,
 ) -> Result<TunnelInputMode, Box<dyn std::error::Error>> {
-    let local_mode = InputMode::local_mode_from_env()?;
+    resolve_input_mode_with(connection_mode, InputMode::local_mode_from_env)
+}
+
+fn resolve_input_mode_with<F>(
+    connection_mode: Option<TunnelInputMode>,
+    local_mode: F,
+) -> Result<TunnelInputMode, Box<dyn std::error::Error>>
+where
+    F: FnOnce() -> Result<TunnelInputMode, Box<dyn std::error::Error>>,
+{
     if let Some(mode) = connection_mode {
         reject_unsupported_input_mode(mode)?;
-        if mode != local_mode {
-            eprintln!("aura: connection string input mode wins over local AURA_INPUT_MODE.");
-        }
-        Ok(mode)
-    } else {
-        Ok(local_mode)
+        return Ok(mode);
     }
+    let local_mode = local_mode()?;
+    reject_unsupported_input_mode(local_mode)?;
+    Ok(local_mode)
 }
 
 fn reject_unsupported_input_mode(mode: TunnelInputMode) -> Result<(), Box<dyn std::error::Error>> {
@@ -305,10 +355,12 @@ impl VoiceTunnel for IrohEndpoint {
 async fn pump<T: VoiceTunnel>(
     mut tunnel: T,
     tunnel_input_mode: TunnelInputMode,
+    call_id: &str,
+    #[cfg(any(windows, target_os = "linux"))] ptt_max_frames: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("aura: tunnel up. Acquiring microphone and speaker…");
     let mut audio = CpalTransport::start(AudioSettings::default())?;
-    let input_mode = InputMode::from_mode(tunnel_input_mode)?;
+    let input_mode = InputMode::from_mode(tunnel_input_mode, call_id)?;
     #[cfg(any(windows, target_os = "linux"))]
     let mut ptt_recording = false;
     #[cfg(any(windows, target_os = "linux"))]
@@ -319,7 +371,7 @@ async fn pump<T: VoiceTunnel>(
     #[cfg(any(windows, target_os = "linux"))]
     let mut ptt_frames_open = 0usize;
     #[cfg(any(windows, target_os = "linux"))]
-    let ptt_max_frames = push_to_talk_max_recording_frames()?;
+    let ptt_max_frames = ptt_max_frames.unwrap_or(usize::MAX);
     #[cfg(any(windows, target_os = "linux"))]
     let mut ptt_warned_near_limit = false;
     #[cfg(any(windows, target_os = "linux"))]
@@ -527,29 +579,154 @@ fn signal_push_to_talk_limit_warning() {
 }
 
 #[cfg(target_os = "linux")]
-fn push_to_talk_control_path() -> std::path::PathBuf {
-    if let Some(path) = std::env::var_os("AURA_PUSH_TO_TALK_CONTROL_PATH").filter(|s| !s.is_empty())
+#[derive(Debug)]
+struct LinuxControlSocket {
+    path: std::path::PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxControlSocket {
+    fn drop(&mut self) {
+        let _ = remove_owned_control_socket(&self.path);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn stable_call_id_hash(call_id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    call_id.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[cfg(target_os = "linux")]
+fn is_push_to_talk_toggle_command(command: &[u8]) -> bool {
+    command == b"toggle\n"
+}
+
+#[cfg(target_os = "linux")]
+fn push_to_talk_control_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let uid = unsafe { libc::geteuid() };
+    let dir = if let Some(runtime_dir) =
+        std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty())
     {
-        return std::path::PathBuf::from(path);
+        std::path::PathBuf::from(runtime_dir).join("aura")
+    } else {
+        std::env::temp_dir().join(format!("aura-{uid}"))
+    };
+
+    match std::fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => {
+            return Err(format!(
+                "failed to create Linux push-to-talk runtime directory {}: {err}",
+                dir.display()
+            )
+            .into());
+        }
     }
-    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|s| !s.is_empty()) {
-        return std::path::PathBuf::from(runtime_dir).join("aura-ptt.sock");
+    let metadata = std::fs::symlink_metadata(&dir)?;
+    if !metadata.file_type().is_dir() || metadata.uid() != uid {
+        return Err(format!(
+            "refusing unsafe Linux push-to-talk runtime directory {} (must be an owned directory)",
+            dir.display()
+        )
+        .into());
     }
-    std::env::temp_dir().join("aura-ptt.sock")
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(dir)
+}
+
+#[cfg(target_os = "linux")]
+fn owned_control_socket(path: &std::path::Path) -> Result<bool, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    Ok(metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::geteuid() })
+}
+
+#[cfg(target_os = "linux")]
+fn remove_owned_control_socket(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    if owned_control_socket(path)? {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn remove_stale_control_socket(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if !owned_control_socket(path)? {
+        return Err(format!(
+            "refusing to replace Linux push-to-talk path {} because it is not an owned Unix socket",
+            path.display()
+        )
+        .into());
+    }
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        return Err(format!(
+            "refusing to replace live Linux push-to-talk socket {}",
+            path.display()
+        )
+        .into());
+    }
+    remove_owned_control_socket(path)
 }
 
 #[cfg(target_os = "linux")]
 fn send_push_to_talk_toggle() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
 
-    let path = push_to_talk_control_path();
+    let dir = push_to_talk_control_dir()?;
+    let mut active = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let is_candidate = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("aura-ptt-") && name.ends_with(".sock"));
+        if !is_candidate || !owned_control_socket(&path)? {
+            continue;
+        }
+        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+            active.push(path);
+        } else {
+            remove_owned_control_socket(&path)?;
+        }
+    }
+    let path = match active.as_slice() {
+        [path] => path,
+        [] => {
+            return Err(
+                "no active Linux push-to-talk call found; start a push_to_talk call first".into(),
+            );
+        }
+        _ => {
+            return Err(
+                "multiple Linux push-to-talk calls are active; close all but the call you want to control"
+                    .into(),
+            );
+        }
+    };
     let mut stream = std::os::unix::net::UnixStream::connect(&path).map_err(|err| {
         format!(
-            "failed to reach Linux push-to-talk control socket {}: {err}. Start an Aura call with AURA_INPUT_MODE=push_to_talk first.",
+            "failed to reach Linux push-to-talk control socket {}: {err}",
             path.display()
         )
     })?;
     stream.write_all(b"toggle\n")?;
+    stream.shutdown(std::net::Shutdown::Write)?;
     Ok(())
 }
 
@@ -595,12 +772,13 @@ fn ensure_mic_permission() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Do not load `AURA_CONNECT` from cwd/global `.env`: the connection string is a
 /// live microphone routing secret and must come only from the real process env
-/// or stdin. A target repository must not be able to redirect `aura-cli` by
-/// planting `.env`.
+/// or stdin. A target repository must not be able to redirect `aura-cli` or
+/// change microphone/PTT controls by planting `.env`. PTT settings are accepted
+/// only from the real process environment or the trusted user-global config.
 fn load_dotenv() {
-    load_dotenv_file(std::path::Path::new(".env"));
+    load_dotenv_file(std::path::Path::new(".env"), false);
     if let Some(dir) = global_config_dir() {
-        load_dotenv_file(&dir.join(".env"));
+        load_dotenv_file(&dir.join(".env"), true);
     }
 }
 
@@ -627,7 +805,7 @@ fn global_config_dir_from(
         .map(|h| std::path::PathBuf::from(h).join(".config").join("aura"))
 }
 
-fn load_dotenv_file(path: &std::path::Path) {
+fn load_dotenv_file(path: &std::path::Path, trusted_user_config: bool) {
     let Ok(content) = std::fs::read_to_string(path) else {
         return;
     };
@@ -640,7 +818,7 @@ fn load_dotenv_file(path: &std::path::Path) {
             continue;
         };
         let key = key.trim();
-        if !is_cli_dotenv_key_allowed(key) {
+        if !is_cli_dotenv_key_allowed(key, trusted_user_config) {
             continue;
         }
         let mut value = value.trim();
@@ -659,15 +837,15 @@ fn load_dotenv_file(path: &std::path::Path) {
     }
 }
 
-fn is_cli_dotenv_key_allowed(key: &str) -> bool {
-    matches!(
-        key,
-        "AURA_AEC"
-            | "AURA_INPUT_MODE"
-            | "AURA_PUSH_TO_TALK_HOTKEY"
-            | "AURA_PUSH_TO_TALK_CONTROL_PATH"
-            | "AURA_PUSH_TO_TALK_MAX_RECORDING_MS"
-    )
+fn is_cli_dotenv_key_allowed(key: &str, trusted_user_config: bool) -> bool {
+    key == "AURA_AEC"
+        || (trusted_user_config
+            && matches!(
+                key,
+                "AURA_INPUT_MODE"
+                    | "AURA_PUSH_TO_TALK_HOTKEY"
+                    | "AURA_PUSH_TO_TALK_MAX_RECORDING_MS"
+            ))
 }
 
 fn expand_home(value: &str) -> String {
@@ -686,7 +864,7 @@ fn expand_home(value: &str) -> String {
 
 #[cfg(test)]
 mod cross_platform_tests {
-    use super::reject_unsupported_input_mode;
+    use super::{reject_unsupported_input_mode, resolve_input_mode_with};
     use aura_tunnel::TunnelInputMode;
 
     #[test]
@@ -696,6 +874,15 @@ mod cross_platform_tests {
         #[cfg(not(any(windows, target_os = "linux")))]
         assert!(reject_unsupported_input_mode(TunnelInputMode::PushToTalk).is_err());
         assert!(reject_unsupported_input_mode(TunnelInputMode::Voice).is_ok());
+    }
+
+    #[test]
+    fn authoritative_connection_mode_does_not_parse_local_config() {
+        let mode = resolve_input_mode_with(Some(TunnelInputMode::Voice), || {
+            panic!("local AURA_INPUT_MODE must not be parsed")
+        })
+        .expect("connection mode");
+        assert_eq!(mode, TunnelInputMode::Voice);
     }
 }
 
@@ -735,16 +922,26 @@ mod tests {
 
     #[test]
     fn cli_dotenv_allowlist_blocks_connection_string() {
-        assert!(is_cli_dotenv_key_allowed("AURA_INPUT_MODE"));
-        assert!(is_cli_dotenv_key_allowed("AURA_PUSH_TO_TALK_HOTKEY"));
-        assert!(is_cli_dotenv_key_allowed(
-            "AURA_PUSH_TO_TALK_MAX_RECORDING_MS"
+        assert!(!is_cli_dotenv_key_allowed("AURA_INPUT_MODE", false));
+        assert!(!is_cli_dotenv_key_allowed(
+            "AURA_PUSH_TO_TALK_HOTKEY",
+            false
         ));
-        assert!(is_cli_dotenv_key_allowed("AURA_AEC"));
-        assert!(!is_cli_dotenv_key_allowed("AURA_CONNECT"));
-        assert!(!is_cli_dotenv_key_allowed("XAI_API_KEY"));
-        assert!(!is_cli_dotenv_key_allowed("OPENAI_API_KEY"));
-        assert!(!is_cli_dotenv_key_allowed("AURA_REALTIME_URL"));
+        assert!(!is_cli_dotenv_key_allowed(
+            "AURA_PUSH_TO_TALK_MAX_RECORDING_MS",
+            false
+        ));
+        assert!(!is_cli_dotenv_key_allowed(
+            "AURA_PUSH_TO_TALK_CONTROL_PATH",
+            true
+        ));
+        assert!(is_cli_dotenv_key_allowed("AURA_INPUT_MODE", true));
+        assert!(is_cli_dotenv_key_allowed("AURA_PUSH_TO_TALK_HOTKEY", true));
+        assert!(is_cli_dotenv_key_allowed("AURA_AEC", false));
+        assert!(!is_cli_dotenv_key_allowed("AURA_CONNECT", true));
+        assert!(!is_cli_dotenv_key_allowed("XAI_API_KEY", true));
+        assert!(!is_cli_dotenv_key_allowed("OPENAI_API_KEY", true));
+        assert!(!is_cli_dotenv_key_allowed("AURA_REALTIME_URL", true));
     }
 
     #[test]
@@ -752,6 +949,9 @@ mod tests {
         unsafe {
             std::env::remove_var("AURA_CONNECT");
             std::env::remove_var("AURA_INPUT_MODE");
+            std::env::remove_var("AURA_PUSH_TO_TALK_HOTKEY");
+            std::env::remove_var("AURA_PUSH_TO_TALK_CONTROL_PATH");
+            std::env::remove_var("AURA_PUSH_TO_TALK_MAX_RECORDING_MS");
         }
         let tmp = std::env::temp_dir().join(format!("aura-cli-dotenv-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -759,17 +959,17 @@ mod tests {
         let env_file = tmp.join(".env");
         std::fs::write(
             &env_file,
-            "AURA_CONNECT=aura://attacker.invalid#k=bad&c=call-bad\nAURA_INPUT_MODE=push_to_talk\n",
+            "AURA_CONNECT=aura://attacker.invalid#k=bad&c=call-bad\nAURA_INPUT_MODE=push_to_talk\nAURA_PUSH_TO_TALK_HOTKEY=a\nAURA_PUSH_TO_TALK_CONTROL_PATH=$HOME/.ssh/config\nAURA_PUSH_TO_TALK_MAX_RECORDING_MS=1\n",
         )
         .unwrap();
 
-        load_dotenv_file(&env_file);
+        load_dotenv_file(&env_file, false);
 
         assert!(std::env::var_os("AURA_CONNECT").is_none());
-        assert_eq!(std::env::var("AURA_INPUT_MODE").unwrap(), "push_to_talk");
-        unsafe {
-            std::env::remove_var("AURA_INPUT_MODE");
-        }
+        assert!(std::env::var_os("AURA_INPUT_MODE").is_none());
+        assert!(std::env::var_os("AURA_PUSH_TO_TALK_HOTKEY").is_none());
+        assert!(std::env::var_os("AURA_PUSH_TO_TALK_CONTROL_PATH").is_none());
+        assert!(std::env::var_os("AURA_PUSH_TO_TALK_MAX_RECORDING_MS").is_none());
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 
@@ -837,5 +1037,34 @@ mod tests {
             PttBatchAction::DiscardThenRestart
         );
         assert_eq!(resolve_ptt_toggles(true, 3, 20, 10), PttBatchAction::Send);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::{is_push_to_talk_toggle_command, remove_stale_control_socket};
+
+    #[test]
+    fn control_socket_requires_exact_toggle_command() {
+        assert!(is_push_to_talk_toggle_command(b"toggle\n"));
+        assert!(!is_push_to_talk_toggle_command(b""));
+        assert!(!is_push_to_talk_toggle_command(b"toggle"));
+        assert!(!is_push_to_talk_toggle_command(b"toggle\nextra"));
+    }
+
+    #[test]
+    fn stale_cleanup_never_removes_a_regular_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "aura-cli-socket-safety-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("test directory");
+        let path = dir.join("aura-ptt-test.sock");
+        std::fs::write(&path, b"keep me").expect("test file");
+
+        assert!(remove_stale_control_socket(&path).is_err());
+        assert_eq!(std::fs::read(&path).expect("file preserved"), b"keep me");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 }

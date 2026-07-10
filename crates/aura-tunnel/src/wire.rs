@@ -20,6 +20,8 @@ pub const TAG_TRANSPORT: u8 = 0x02;
 /// `aura://` scheme prefix.
 const SCHEME: &str = "aura://";
 const CONTROL_PREFIX: &[u8] = b"AURA_CTRL_1";
+const RELIABLE_CONTROL_PREFIX: &[u8] = b"AURA_CTRL_2";
+const CONTROL_ACK_PREFIX: &[u8] = b"AURA_ACK_1";
 const CONTROL_PTT_OPEN: u8 = 1;
 const CONTROL_PTT_CLOSE: u8 = 2;
 const CONTROL_PTT_CANCEL: u8 = 3;
@@ -220,13 +222,62 @@ pub fn encode_tunnel_control(control: TunnelControl) -> Vec<u8> {
 }
 
 pub fn decode_tunnel_control(body: &[u8]) -> Option<TunnelControl> {
-    let code = *body.strip_prefix(CONTROL_PREFIX)?.first()?;
+    let suffix = body.strip_prefix(CONTROL_PREFIX)?;
+    if suffix.len() != 1 {
+        return None;
+    }
+    decode_control_code(suffix[0])
+}
+
+fn decode_control_code(code: u8) -> Option<TunnelControl> {
     match code {
         CONTROL_PTT_OPEN => Some(TunnelControl::PttOpen),
         CONTROL_PTT_CLOSE => Some(TunnelControl::PttClose),
         CONTROL_PTT_CANCEL => Some(TunnelControl::PttCancel),
         _ => None,
     }
+}
+
+/// Encode a control with an id used for acknowledgement, retry, and receiver
+/// deduplication. This is an encrypted plaintext payload, not a public header.
+pub(crate) fn encode_reliable_control(id: u64, control: TunnelControl) -> Vec<u8> {
+    let code = match control {
+        TunnelControl::PttOpen => CONTROL_PTT_OPEN,
+        TunnelControl::PttClose => CONTROL_PTT_CLOSE,
+        TunnelControl::PttCancel => CONTROL_PTT_CANCEL,
+    };
+    let mut out = Vec::with_capacity(RELIABLE_CONTROL_PREFIX.len() + 9);
+    out.extend_from_slice(RELIABLE_CONTROL_PREFIX);
+    out.extend_from_slice(&id.to_be_bytes());
+    out.push(code);
+    out
+}
+
+pub(crate) fn decode_reliable_control(body: &[u8]) -> Option<(u64, TunnelControl)> {
+    let suffix = body.strip_prefix(RELIABLE_CONTROL_PREFIX)?;
+    if suffix.len() != 9 {
+        return None;
+    }
+    let mut id = [0_u8; 8];
+    id.copy_from_slice(&suffix[..8]);
+    Some((u64::from_be_bytes(id), decode_control_code(suffix[8])?))
+}
+
+pub(crate) fn encode_control_ack(id: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(CONTROL_ACK_PREFIX.len() + 8);
+    out.extend_from_slice(CONTROL_ACK_PREFIX);
+    out.extend_from_slice(&id.to_be_bytes());
+    out
+}
+
+pub(crate) fn decode_control_ack(body: &[u8]) -> Option<u64> {
+    let suffix = body.strip_prefix(CONTROL_ACK_PREFIX)?;
+    if suffix.len() != 8 {
+        return None;
+    }
+    let mut id = [0_u8; 8];
+    id.copy_from_slice(suffix);
+    Some(u64::from_be_bytes(id))
 }
 
 /// Is this decrypted frame payload a control frame? Used by the outbound queue
@@ -353,5 +404,15 @@ mod tests {
             Some(TunnelControl::PttCancel)
         );
         assert_eq!(decode_tunnel_control(b"not-control"), None);
+        let mut trailing = encode_tunnel_control(TunnelControl::PttOpen);
+        trailing.push(0);
+        assert_eq!(decode_tunnel_control(&trailing), None);
+
+        let reliable = encode_reliable_control(42, TunnelControl::PttClose);
+        assert_eq!(
+            decode_reliable_control(&reliable),
+            Some((42, TunnelControl::PttClose))
+        );
+        assert_eq!(decode_control_ack(&encode_control_ack(42)), Some(42));
     }
 }

@@ -18,6 +18,7 @@ pub mod jitter;
 pub mod noise;
 pub(crate) mod outbound;
 pub mod reframe;
+pub(crate) mod replay;
 pub mod session;
 pub mod wire;
 

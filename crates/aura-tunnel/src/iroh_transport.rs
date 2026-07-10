@@ -18,6 +18,7 @@
 //! peer's endpoint key and moves bytes through NAT; the per-call PSK authorises
 //! *this* call. Security model unchanged from the direct transport.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,9 +33,11 @@ use crate::endpoint::TunnelConfig;
 use crate::jitter::JitterBuffer;
 use crate::noise::{self, Transport, MAX_HANDSHAKE_MSG};
 use crate::outbound::{bytes_to_pcm, Outbound};
+use crate::replay::{ReplayStatus, ReplayWindow};
 use crate::session::SessionSecret;
 use crate::wire::{
-    decode_transport, decode_tunnel_control, encode_transport, TunnelControl, TunnelInput,
+    decode_control_ack, decode_reliable_control, decode_transport, decode_tunnel_control,
+    encode_control_ack, encode_reliable_control, encode_transport, TunnelControl, TunnelInput,
     TAG_TRANSPORT,
 };
 
@@ -45,6 +48,7 @@ pub const ALPN: &[u8] = b"aura/voice/0";
 /// 20 ms @ 24 kHz mono.
 const FRAME_SAMPLES: usize = 480;
 const FRAME_MS: u64 = 20;
+const CONTROL_RETRY: Duration = Duration::from_millis(100);
 
 /// Which iroh preset (relay + discovery) to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +93,7 @@ async fn build_endpoint(
     preset: IrohPreset,
     secret_key: SecretKey,
     accept_alpn: Option<&[u8]>,
+    online_timeout: Duration,
 ) -> Result<Endpoint, IrohError> {
     let builder = match preset {
         IrohPreset::Production => Endpoint::builder(presets::N0),
@@ -116,7 +121,9 @@ async fn build_endpoint(
     // would never resolve. Only the Production path needs to wait for relay/
     // discovery registration before its address is dialable.
     if preset == IrohPreset::Production {
-        endpoint.online().await;
+        timeout(online_timeout, endpoint.online())
+            .await
+            .map_err(|_| IrohError::HandshakeTimeout)?;
     }
     Ok(endpoint)
 }
@@ -165,7 +172,21 @@ pub struct IrohServer {
 impl IrohServer {
     /// Bind an iroh endpoint that will accept one aura call.
     pub async fn bind(preset: IrohPreset) -> Result<Self, IrohError> {
-        let endpoint = build_endpoint(preset, ephemeral_secret_key()?, Some(ALPN)).await?;
+        Self::bind_with_config(preset, TunnelConfig::default()).await
+    }
+
+    /// Bind with an explicit deadline for production relay/discovery startup.
+    pub async fn bind_with_config(
+        preset: IrohPreset,
+        cfg: TunnelConfig,
+    ) -> Result<Self, IrohError> {
+        let endpoint = build_endpoint(
+            preset,
+            ephemeral_secret_key()?,
+            Some(ALPN),
+            cfg.handshake_timeout,
+        )
+        .await?;
         Ok(Self { endpoint, preset })
     }
 
@@ -256,7 +277,8 @@ impl IrohEndpoint {
         preset: IrohPreset,
         cfg: TunnelConfig,
     ) -> Result<Self, IrohError> {
-        let endpoint = build_endpoint(preset, ephemeral_secret_key()?, None).await?;
+        let endpoint =
+            build_endpoint(preset, ephemeral_secret_key()?, None, cfg.handshake_timeout).await?;
         // Bound the WHOLE connect (QUIC connection + Noise handshake) so a server
         // that accepts but never answers msg2 can't strand the client.
         let (conn, transport) = timeout(cfg.handshake_timeout, async {
@@ -306,6 +328,7 @@ impl IrohEndpoint {
     ) -> Self {
         let outbound = Arc::new(Mutex::new(Outbound::new(FRAME_SAMPLES)));
         let (inbound_tx, inbound_rx) = mpsc::channel::<TunnelInput>(cfg.inbound_capacity.max(1));
+        let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<u64>();
 
         // Outbound pacer: every 20 ms send one queued frame as a QUIC datagram,
         // OR (idle) an encrypted empty keepalive — keeps QUIC + any relay/NAT
@@ -318,19 +341,67 @@ impl IrohEndpoint {
                 let mut tick = interval(Duration::from_millis(FRAME_MS));
                 tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
                 let mut nonce: u64 = 0;
+                let mut control_id: u64 = 0;
+                let mut pending: HashMap<u64, (Vec<u8>, tokio::time::Instant)> = HashMap::new();
                 loop {
                     tick.tick().await;
-                    let bytes = outbound
+                    while let Ok(id) = ack_rx.try_recv() {
+                        pending.remove(&id);
+                    }
+                    let now = tokio::time::Instant::now();
+                    for (dg, last_sent) in pending.values_mut() {
+                        if now.duration_since(*last_sent) >= CONTROL_RETRY {
+                            if conn.send_datagram(dg.clone().into()).is_err() {
+                                return;
+                            }
+                            *last_sent = now;
+                        }
+                    }
+                    if !pending.is_empty() {
+                        // Preserve wire order across loss: later media waits
+                        // until the control is acknowledged. ACKs may pass to
+                        // avoid a simultaneous-control deadlock.
+                        let ack = { outbound.lock().expect("outbound lock").pop_priority_ack() };
+                        if let Some(ack) = ack {
+                            match transport.encrypt(nonce, &ack) {
+                                Ok(ct) => {
+                                    let dg = encode_transport(nonce, &ct);
+                                    nonce = nonce.wrapping_add(1);
+                                    if conn.send_datagram(dg.into()).is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(_) => return,
+                            }
+                        }
+                        continue;
+                    }
+                    let mut bytes = outbound
                         .lock()
                         .expect("outbound lock")
                         .pop_next()
                         .unwrap_or_default();
+                    let reliable_id = decode_tunnel_control(&bytes).map(|control| {
+                        let id = control_id;
+                        control_id = control_id.wrapping_add(1);
+                        bytes = encode_reliable_control(id, control);
+                        id
+                    });
                     match transport.encrypt(nonce, &bytes) {
                         Ok(ct) => {
                             let dg = encode_transport(nonce, &ct);
                             nonce = nonce.wrapping_add(1);
                             if conn.send_datagram(dg.into()).is_err() {
                                 break; // connection gone
+                            }
+                            if let Some(id) = reliable_id {
+                                pending.insert(
+                                    id,
+                                    (
+                                        encode_transport(nonce.wrapping_sub(1), &ct),
+                                        tokio::time::Instant::now(),
+                                    ),
+                                );
                             }
                         }
                         Err(_) => break,
@@ -344,10 +415,14 @@ impl IrohEndpoint {
         // closed connection (peer gone / hang-up) ends the task → `recv` None.
         let io_task = {
             let conn = conn.clone();
+            let outbound = outbound.clone();
+            let idle_timeout = cfg.idle_timeout;
             tokio::spawn(async move {
                 let mut jitter = JitterBuffer::new();
                 let mut tick = interval(Duration::from_millis(FRAME_MS));
                 tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                let mut last_recv = tokio::time::Instant::now();
+                let mut replay = ReplayWindow::new();
                 loop {
                     tokio::select! {
                         r = conn.read_datagram() => match r {
@@ -356,12 +431,33 @@ impl IrohEndpoint {
                                 if body.first() == Some(&TAG_TRANSPORT) {
                                     if let Some((nonce, ct)) = decode_transport(&body[1..]) {
                                         if let Ok(pt) = transport.decrypt(nonce, ct) {
+                                            let replay_status = replay.observe(nonce);
+                                            if let Some(id) = decode_control_ack(&pt) {
+                                                if replay_status == ReplayStatus::Fresh {
+                                                    let _ = ack_tx.send(id);
+                                                    last_recv = tokio::time::Instant::now();
+                                                }
+                                                continue;
+                                            }
+                                            if replay_status == ReplayStatus::Duplicate {
+                                                if let Some((id, _)) = decode_reliable_control(&pt) {
+                                                    outbound.lock().expect("outbound lock").push_priority(encode_control_ack(id));
+                                                }
+                                                continue;
+                                            }
+                                            if replay_status == ReplayStatus::TooOld {
+                                                continue;
+                                            }
+                                            last_recv = tokio::time::Instant::now();
                                             // Empty == keepalive (authenticated); not audio.
                                             // Control frames go through the SAME jitter
                                             // buffer as audio so they cannot overtake
                                             // the turn's trailing frames (see endpoint.rs).
                                             if !pt.is_empty() {
-                                                jitter.push(nonce as u16, pt);
+                                                if let Some((id, _)) = decode_reliable_control(&pt) {
+                                                    outbound.lock().expect("outbound lock").push_priority(encode_control_ack(id));
+                                                }
+                                                jitter.push(nonce, pt);
                                             }
                                         }
                                     }
@@ -370,8 +466,15 @@ impl IrohEndpoint {
                             Err(_) => break, // connection closed → drop inbound_tx → recv None
                         },
                         _ = tick.tick() => {
+                            if last_recv.elapsed() > idle_timeout {
+                                break;
+                            }
                             if let Some(bytes) = jitter.pop() {
-                                if let Some(control) = decode_tunnel_control(&bytes) {
+                                if let Some((_id, control)) = decode_reliable_control(&bytes) {
+                                    if inbound_tx.send(TunnelInput::Control(control)).await.is_err() {
+                                        break;
+                                    }
+                                } else if let Some(control) = decode_tunnel_control(&bytes) {
                                     // A control is a state transition, not a
                                     // droppable sample: await channel space
                                     // (a lost PttClose strands the turn).

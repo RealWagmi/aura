@@ -18,19 +18,19 @@ pub const MIN_DEPTH_FRAMES: usize = 2;
 /// Maximum buffered depth: 80 ms.
 pub const MAX_DEPTH_FRAMES: usize = 4;
 
-/// RFC 1982 serial comparison for `u16` RTP sequence numbers: is `a` strictly
+/// RFC 1982 serial comparison for full-width transport sequence numbers: is `a` strictly
 /// after `b` (accounting for wraparound)?
-fn seq_after(a: u16, b: u16) -> bool {
-    a != b && a.wrapping_sub(b) < 0x8000
+fn seq_after(a: u64, b: u64) -> bool {
+    a != b && a.wrapping_sub(b) < (1_u64 << 63)
 }
 
 /// Reordering, depth-gating jitter buffer over Opus packets keyed by RTP seq.
 pub struct JitterBuffer {
-    entries: HashMap<u16, Vec<u8>>,
+    entries: HashMap<u64, Vec<u8>>,
     /// Next sequence number to release (set from the first pushed packet).
-    next_pop: Option<u16>,
+    next_pop: Option<u64>,
     /// Highest sequence number seen so far.
-    highest: Option<u16>,
+    highest: Option<u64>,
     /// Current adaptive target depth, in frames, within [MIN, MAX].
     target: usize,
     /// `false` until the initial target depth is reached (pre-buffering); once
@@ -51,7 +51,7 @@ const LOSS_SKIP_TICKS: usize = 3;
 /// restart, not loss: the sender was idle (keepalives consume nonces but are
 /// never pushed here — e.g. a push-to-talk client between turns) and resumed.
 /// Resync the release baseline instead of walking the phantom gap.
-const RESYNC_GAP_FRAMES: u16 = 250;
+const RESYNC_GAP_FRAMES: u64 = 250;
 
 impl Default for JitterBuffer {
     fn default() -> Self {
@@ -97,19 +97,30 @@ impl JitterBuffer {
     /// dropped as too-late. The first packet establishes the release baseline;
     /// a huge forward jump (sender was idle, e.g. a gated push-to-talk mic)
     /// re-establishes it instead of walking thousands of phantom losses.
-    pub fn push(&mut self, seq: u16, payload: Vec<u8>) {
+    pub fn push(&mut self, seq: u64, payload: Vec<u8>) {
         match self.next_pop {
             None => self.next_pop = Some(seq),
-            Some(np) if seq != np && !seq_after(seq, np) => return, // too late
-            Some(np) if seq.wrapping_sub(np) > RESYNC_GAP_FRAMES => {
-                // Stream restart after idle: drop pre-gap stragglers and
-                // release from the new position.
+            Some(np)
+                if !self.playing
+                    && seq_after(np, seq)
+                    && np.wrapping_sub(seq) <= MAX_DEPTH_FRAMES as u64 =>
+            {
+                // The first arrival is not necessarily the first packet. Move
+                // the baseline back while pre-buffering so an initially
+                // reordered PttOpen is not classified as already played.
+                self.next_pop = Some(seq);
+            }
+            Some(np) if seq_after(seq, np) && seq.wrapping_sub(np) > RESYNC_GAP_FRAMES => {
+                // Keepalives consume transport nonces but are not buffered.
+                // Resync on the full u64 distance before classifying a packet
+                // as late (the old u16 truncation failed after 0x8000 idles).
                 self.entries.clear();
                 self.next_pop = Some(seq);
                 self.highest = None;
                 self.playing = false;
                 self.stuck = 0;
             }
+            Some(np) if seq != np && !seq_after(seq, np) => return, // too late
             _ => {}
         }
         match self.highest {
@@ -181,8 +192,8 @@ mod tests {
     fn seq_after_handles_wraparound() {
         assert!(seq_after(5, 4));
         assert!(!seq_after(4, 5));
-        assert!(seq_after(0, 65_535)); // wrap forward
-        assert!(!seq_after(65_535, 0));
+        assert!(seq_after(0, u64::MAX)); // wrap forward
+        assert!(!seq_after(u64::MAX, 0));
         assert!(!seq_after(3, 3));
     }
 
@@ -264,7 +275,7 @@ mod tests {
     fn skips_persistent_gap_and_adapts_target_up() {
         let mut jb = JitterBuffer::new();
         // 1,2 present, 3 missing, 4,5,6 present → span grows past MAX (4).
-        for s in [1u16, 2, 4, 5, 6] {
+        for s in [1u64, 2, 4, 5, 6] {
             jb.push(s, pkt(s as u8));
         }
         assert_eq!(jb.pop(), Some(pkt(1)));
@@ -274,5 +285,27 @@ mod tests {
         jb.push(7, pkt(7));
         assert_eq!(jb.pop(), Some(pkt(4))); // 3 skipped as loss
         assert!(jb.target_frames() > MIN_DEPTH_FRAMES); // adapted up
+    }
+
+    #[test]
+    fn resyncs_across_old_u16_half_range_boundary() {
+        let mut jb = JitterBuffer::new();
+        jb.push(10, pkt(1));
+        jb.push(11, pkt(2));
+        assert_eq!(jb.pop(), Some(pkt(1)));
+        assert_eq!(jb.pop(), Some(pkt(2)));
+        jb.push(10 + 0x8000, pkt(3));
+        jb.push(11 + 0x8000, pkt(4));
+        assert_eq!(jb.pop(), Some(pkt(3)));
+        assert_eq!(jb.pop(), Some(pkt(4)));
+    }
+
+    #[test]
+    fn initial_reordering_moves_prebuffer_baseline_back() {
+        let mut jb = JitterBuffer::new();
+        jb.push(101, pkt(2));
+        jb.push(100, pkt(1));
+        assert_eq!(jb.pop(), Some(pkt(1)));
+        assert_eq!(jb.pop(), Some(pkt(2)));
     }
 }

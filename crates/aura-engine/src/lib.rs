@@ -220,8 +220,13 @@ struct CallState {
     /// audio/text/tool deltas until the next `ResponseDone`. Carried as a UNIT
     /// with the `cancel` send ("no cancel without guard" rule).
     suppress: bool,
-    /// Whether a model response is currently in flight.
-    assistant_active: bool,
+    /// The provider emitted `response.created` (or output, for compatibility)
+    /// and the response has not reached `response.done` yet.
+    response_created: bool,
+    /// A `response.create` was sent but the provider has not yet emitted
+    /// `response.created` or output. This closes the pre-audio cancellation
+    /// window for cold starts, manual commits, and tool-result responses.
+    response_requested: bool,
     /// Whether the user is currently speaking (server-VAD).
     user_speaking: bool,
     /// The model called `end_voice_session`; hang up once its farewell turn
@@ -243,11 +248,29 @@ struct CallState {
 }
 
 impl CallState {
+    fn response_in_flight(&self) -> bool {
+        self.response_requested || self.response_created
+    }
+
+    fn mark_response_requested(&mut self) {
+        self.response_requested = true;
+    }
+
+    fn mark_response_created(&mut self) {
+        self.response_requested = false;
+        self.response_created = true;
+    }
+
+    fn mark_response_done(&mut self) {
+        self.response_requested = false;
+        self.response_created = false;
+    }
+
     /// Reset after a reconnect: the new session has no in-flight response and
     /// no pending cancel to suppress.
     fn on_reconnect(&mut self) {
         self.suppress = false;
-        self.assistant_active = false;
+        self.mark_response_done();
         self.user_speaking = false;
         self.current_item = None;
         self.item_delivered_samples = 0;
@@ -295,7 +318,13 @@ impl CallSession {
         // Call-duration metric: wall-clock from a connected session
         // to hang-up. Logged at the end; no content, safe to emit.
         let call_started = std::time::Instant::now();
-        let mut state = CallState::default();
+        let mut state = CallState {
+            // Both providers batch this `response.create` into the successful
+            // connect flush, so it is already cancellable before any server
+            // event or output-audio delta arrives.
+            response_requested: cfg.cold_start_kick,
+            ..CallState::default()
+        };
 
         // In-call dispatch: the model's tool calls route through the
         // `ToolRouter` voice-approval boundary to the host, which executes with
@@ -420,6 +449,8 @@ impl CallSession {
                                     Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
                                     None => break Transition::Ended(EndReason::ReconnectExhausted),
                                 }
+                            } else {
+                                state.mark_response_requested();
                             }
                         }
                         Some(TransportInput::Control(TransportControl::PttCancel)) => {
@@ -478,7 +509,9 @@ impl CallSession {
                                     None => serde_json::json!({ "error": "unknown pause condition" }),
                                 };
                                 let _ = sink.send_tool_result(call.call_id.as_deref(), content).await;
-                                let _ = sink.request_response().await;
+                                if sink.request_response().await.is_ok() {
+                                    state.mark_response_requested();
+                                }
                             } else {
                                 spawn_dispatch(&router, &mut dispatch, call);
                             }
@@ -510,7 +543,9 @@ impl CallSession {
                                 Err(e) => serde_json::json!({ "error": e.to_string() }),
                             };
                             let _ = sink.send_tool_result(call_id.as_deref(), content).await;
-                            let _ = sink.request_response().await;
+                            if sink.request_response().await.is_ok() {
+                                state.mark_response_requested();
+                            }
                             // Universal callback seam: a completed
                             // worker dispatch is also delivered back into the
                             // host chat, not only spoken. Best-effort/fail-open.
@@ -538,7 +573,9 @@ impl CallSession {
                             sink = s;
                             stream = st;
                             state.on_reconnect();
-                            let _ = sink.request_response().await;
+                            if sink.request_response().await.is_ok() {
+                                state.mark_response_requested();
+                            }
                         }
                         None => {
                             break 'call CallOutcome {
@@ -598,12 +635,18 @@ async fn handle_event(
 ) -> Flow {
     match event {
         VoiceEvent::SessionReady => Flow::Continue,
+        VoiceEvent::ResponseCreated => {
+            state.mark_response_created();
+            Flow::Continue
+        }
         VoiceEvent::OutputAudio { pcm, item_id } => {
             // Drop the cancelled response's late audio while suppressing.
             if state.suppress {
                 return Flow::Continue;
             }
-            state.assistant_active = true;
+            // Be tolerant of providers that omit `response.created`: output is
+            // definitive proof that the requested response is now active.
+            state.mark_response_created();
             // Track the playing item for barge-in truncate: a new item id
             // starts a fresh delivered-samples count.
             if item_id != state.current_item {
@@ -628,8 +671,11 @@ async fn handle_event(
             // rate, so "left the queue" ≈ "was played").
             let heard_ms =
                 (state.item_delivered_samples / 24).saturating_sub(transport.queued_ms());
-            let decision =
-                speech_started_decision(transport.queued_ms(), state.assistant_active, echo_risk);
+            let decision = speech_started_decision(
+                transport.queued_ms(),
+                state.response_in_flight(),
+                echo_risk,
+            );
             if decision.clear_local_playback {
                 transport.clear_playout();
             }
@@ -644,7 +690,7 @@ async fn handle_event(
                 // never lingering to eat the NEXT response's audio/tool calls
                 // (that stale-suppress bug refused to hang up on a spoken "end
                 // the call").
-                if state.assistant_active {
+                if state.response_in_flight() {
                     if let Err(e) = sink.cancel_response().await {
                         eprintln!("aura-engine: barge-in cancel send failed: {e}");
                         return Flow::Reconnect;
@@ -685,7 +731,7 @@ async fn handle_event(
             // Play the response's trailing partial frame so phrase endings
             // aren't swallowed (REMOTE reframer tail; no-op for LOCAL).
             let _ = transport.flush_output().await;
-            state.assistant_active = false;
+            state.mark_response_done();
             state.suppress = false;
             // Do NOT clear `current_item`/`item_delivered_samples` here: the
             // response is done GENERATING but its audio is still draining from
@@ -743,7 +789,7 @@ async fn ptt_barge_in(
 ) -> Result<(), &'static str> {
     let heard_ms = (state.item_delivered_samples / 24).saturating_sub(transport.queued_ms());
     transport.clear_playout();
-    if state.assistant_active {
+    if state.response_in_flight() {
         if sink.cancel_response().await.is_err() {
             return Err("push-to-talk barge-in cancel failed");
         }
@@ -1499,6 +1545,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn next_ptt_open_cancels_committed_response_before_audio() {
+        let h = harness_input(
+            vec![Script::Ok {
+                events: vec![VoiceEvent::SessionReady],
+                end: End::Pending,
+            }],
+            vec![
+                TransportInput::Control(TransportControl::PttOpen),
+                TransportInput::Audio(vec![1; MIN_PTT_COMMIT_SAMPLES as usize]),
+                TransportInput::Control(TransportControl::PttClose),
+                // The commit sent response.create, but no response.created or
+                // audio delta has arrived yet. This press must still cancel it.
+                TransportInput::Control(TransportControl::PttOpen),
+            ],
+            true,
+        );
+
+        let _ = CallSession::run(h.transport, h.provider, host(), None, ptt_cfg())
+            .await
+            .unwrap();
+
+        let log = h.sink_log.lock().unwrap();
+        assert_eq!(log.commits, 1);
+        assert_eq!(log.requests, 1);
+        assert_eq!(log.cancels, 1);
+        assert!(log.truncates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn first_ptt_open_cancels_cold_start_before_audio() {
+        let h = harness_input(
+            vec![Script::Ok {
+                events: vec![VoiceEvent::SessionReady],
+                end: End::Pending,
+            }],
+            vec![TransportInput::Control(TransportControl::PttOpen)],
+            true,
+        );
+        let mut config = ptt_cfg();
+        config.cold_start_kick = true;
+
+        let _ = CallSession::run(h.transport, h.provider, host(), None, config)
+            .await
+            .unwrap();
+
+        let log = h.sink_log.lock().unwrap();
+        assert_eq!(log.cancels, 1);
+        assert!(log.truncates.is_empty());
+    }
+
+    #[tokio::test]
     async fn ptt_controls_are_ignored_in_a_vad_session() {
         let h = harness_input(
             vec![Script::Ok {
@@ -1614,7 +1711,7 @@ mod tests {
             queued_ms: AtomicU64::new(400),
         };
         let mut state = CallState {
-            assistant_active: true,
+            response_created: true,
             current_item: Some("item-7".to_owned()),
             item_delivered_samples: 24_000, // 1000 ms delivered
             ..CallState::default()
@@ -1633,6 +1730,79 @@ mod tests {
         assert_eq!(cleared.load(Ordering::SeqCst), 1);
         assert_eq!(state.current_item, None);
         assert_eq!(state.item_delivered_samples, 0);
+    }
+
+    #[tokio::test]
+    async fn ptt_barge_in_cancels_requested_response_before_first_audio() {
+        let sink_log = Arc::new(Mutex::new(SinkLog::default()));
+        let mut sink = FakeSink {
+            log: sink_log.clone(),
+        };
+        let cleared = Arc::new(AtomicUsize::new(0));
+        let mut transport = FakeTransport {
+            input: Mutex::new(VecDeque::new()),
+            hangup_when_empty: true,
+            played: Arc::new(Mutex::new(Vec::new())),
+            cleared: cleared.clone(),
+            queued_ms: AtomicU64::new(0),
+        };
+        let mut state = CallState {
+            response_requested: true,
+            ..CallState::default()
+        };
+
+        ptt_barge_in(&mut transport, &mut sink, &mut state)
+            .await
+            .unwrap();
+
+        let log = sink_log.lock().unwrap();
+        assert_eq!(log.cancels, 1);
+        assert!(state.suppress, "cancel and suppress remain one block");
+        assert!(
+            log.truncates.is_empty(),
+            "no audio means no truncate target"
+        );
+        assert_eq!(cleared.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn response_created_is_active_before_first_audio() {
+        let sink_log = Arc::new(Mutex::new(SinkLog::default()));
+        let mut sink = FakeSink {
+            log: sink_log.clone(),
+        };
+        let cleared = Arc::new(AtomicUsize::new(0));
+        let mut transport = FakeTransport {
+            input: Mutex::new(VecDeque::new()),
+            hangup_when_empty: true,
+            played: Arc::new(Mutex::new(Vec::new())),
+            cleared,
+            queued_ms: AtomicU64::new(0),
+        };
+        let mut state = CallState {
+            response_requested: true,
+            ..CallState::default()
+        };
+
+        assert!(matches!(
+            handle_event(
+                VoiceEvent::ResponseCreated,
+                &mut transport,
+                &mut sink,
+                &mut state,
+                false,
+            )
+            .await,
+            Flow::Continue
+        ));
+        assert!(!state.response_requested);
+        assert!(state.response_created);
+
+        ptt_barge_in(&mut transport, &mut sink, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(sink_log.lock().unwrap().cancels, 1);
+        assert!(state.suppress);
     }
 
     #[tokio::test]

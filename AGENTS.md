@@ -36,7 +36,9 @@ Start `aura-server.exe` in the target repository working directory, then pass
 the single-use connection URL to `aura-cli.exe` through `AURA_CONNECT`, never
 argv.
 
-Push-to-talk mode:
+Push-to-talk mode (set `AURA_INPUT_MODE` on the server; set the remaining
+client controls in the real client process environment or trusted user-global
+Aura config):
 
 ```env
 AURA_INPUT_MODE=push_to_talk

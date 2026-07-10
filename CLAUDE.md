@@ -6,7 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Windows Push-To-Talk Notes
 
-For Windows push-to-talk calls:
+Set `AURA_INPUT_MODE` on the server. Set the client controls in the real client
+process environment or trusted user-global Aura config; project `.env` files
+cannot control them:
 
 ```env
 AURA_INPUT_MODE=push_to_talk
@@ -20,7 +22,8 @@ server uses manual turn detection for PTT and ignores
 `AURA_END_OF_TURN_TIMEOUT_MS`; `AURA_PUSH_TO_TALK_MAX_RECORDING_MS` is only a
 client safety cap for an accidentally open mic. Set `AURA_INPUT_MODE` on the
 server; the connection string carries the mode to `aura-cli` as `m=voice` or
-`m=ptt`, and the client follows it automatically.
+`m=ptt`, and the client follows it automatically. Letter and number hotkeys
+require a modifier.
 
 ## What this is
 

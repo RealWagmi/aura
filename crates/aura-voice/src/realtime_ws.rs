@@ -257,6 +257,7 @@ fn debug_first_item_id(item_id: Option<&str>) {
 fn map_event(event: ServerEvent) -> Option<Result<VoiceEvent, VoiceError>> {
     let mapped = match event {
         ServerEvent::SessionCreated { .. } => VoiceEvent::SessionReady,
+        ServerEvent::ResponseCreated { .. } => VoiceEvent::ResponseCreated,
         ServerEvent::OutputAudioDelta { delta, item_id } => {
             debug_first_item_id(item_id.as_deref());
             match wire::base64_to_pcm16(&delta) {
@@ -368,6 +369,14 @@ mod tests {
 
     #[test]
     fn maps_speech_and_tool_and_done() {
+        assert!(matches!(
+            map_event(ServerEvent::ResponseCreated {
+                response: Some(json!({"id": "resp_1"})),
+            })
+            .unwrap()
+            .unwrap(),
+            VoiceEvent::ResponseCreated
+        ));
         assert!(matches!(
             map_event(ServerEvent::SpeechStarted).unwrap().unwrap(),
             VoiceEvent::UserSpeechStarted

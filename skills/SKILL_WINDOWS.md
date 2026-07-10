@@ -140,17 +140,22 @@ ask Aura to answer. The default hotkey is:
 AURA_PUSH_TO_TALK_HOTKEY=ctrl+space
 ```
 
-Set `AURA_PUSH_TO_TALK_HOTKEY` before starting `aura-cli.exe`; changing `.env`
-does not affect an already-running client. `AURA_PUSH_TO_TALK_MAX_RECORDING_MS`
-is a client safety cap for an accidentally open mic. The default is `300000`
-ms, about five minutes. Three seconds before the cap, Aura warns that the voice
-message limit is near. Very short push-to-talk taps are discarded instead of
-sent; the client prints that the message was too short.
+Set `AURA_PUSH_TO_TALK_HOTKEY` in the real client process environment or the
+trusted user-global Aura `.env` before starting `aura-cli.exe`; a project
+`.env` cannot control it. Letter and number hotkeys require a modifier.
+`AURA_PUSH_TO_TALK_MAX_RECORDING_MS` follows the same trust rule and is a client
+safety cap for an accidentally open mic. The default is `300000` ms, about five
+minutes. Three seconds before the cap, Aura warns that the voice message limit
+is near. Very short push-to-talk taps are discarded instead of sent; the client
+prints that the message was too short.
 
-`aura-cli.exe` deliberately ignores `AURA_CONNECT` from `.env` files. The
-connection string must come from the real process environment or stdin, so a
-target repository cannot redirect the user's microphone by planting a local
-`.env`.
+`aura-cli.exe` deliberately ignores `AURA_CONNECT` from every `.env`. It also
+ignores `AURA_INPUT_MODE`, `AURA_PUSH_TO_TALK_HOTKEY`, and
+`AURA_PUSH_TO_TALK_MAX_RECORDING_MS` from a project `.env`. The connection
+string must come from the real process environment or stdin; PTT controls must
+come from that environment or the trusted user-global Aura `.env`. A target
+repository therefore cannot redirect or silently reconfigure the user's
+microphone by planting a local `.env`.
 
 For a local call on the same Windows machine:
 

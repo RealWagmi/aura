@@ -89,6 +89,17 @@ fn parse_hotkey(raw: &str) -> Result<Hotkey, String> {
         }
     }
 
+    if modifiers == 0
+        && labels
+            .iter()
+            .any(|label| label.len() == 1 && label.as_bytes()[0].is_ascii_alphanumeric())
+    {
+        return Err(
+            "AURA_PUSH_TO_TALK_HOTKEY must use a modifier with letter or number keys (for example ctrl+space or alt+a)"
+                .to_owned(),
+        );
+    }
+
     Ok(Hotkey {
         keys,
         modifiers,
@@ -240,5 +251,12 @@ mod tests {
     #[test]
     fn rejects_unknown_key() {
         assert!(parse_hotkey("ctrl+nope").is_err());
+    }
+
+    #[test]
+    fn rejects_modifier_free_letters_and_numbers() {
+        assert!(parse_hotkey("a").is_err());
+        assert!(parse_hotkey("7").is_err());
+        assert!(parse_hotkey("a+a").is_err());
     }
 }

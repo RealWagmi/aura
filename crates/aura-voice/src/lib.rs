@@ -97,6 +97,10 @@ pub enum VoiceEvent {
     UserSpeechStopped,
     /// The model requested a tool call.
     ToolCall(VoiceToolCall),
+    /// The provider accepted a `response.create` request and started a model
+    /// response. This can arrive before the first audio delta, which lets the
+    /// engine cancel a cold-start or manually committed response immediately.
+    ResponseCreated,
     /// A model response finished; carries usage if the provider reports it.
     ResponseDone { input_tokens: Option<u32> },
     /// A protocol/transport error. Carries [`VoiceError::is_terminal`].
@@ -130,6 +134,42 @@ pub struct VoiceSessionConfig {
     /// transcription sidecar; `None` = auto-detect. Ignored by xAI (its inline
     /// transcription takes no config).
     pub transcription_language: Option<String>,
+}
+
+impl VoiceSessionConfig {
+    /// Build a session config with the required provider-facing values and
+    /// stable defaults for optional behavior. Prefer this constructor over a
+    /// full struct literal so adding another optional setting does not require
+    /// every caller to change at once.
+    pub fn new(
+        instructions: impl Into<String>,
+        voice: impl Into<String>,
+        tools: serde_json::Value,
+    ) -> Self {
+        Self {
+            instructions: instructions.into(),
+            voice: voice.into(),
+            tools,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for VoiceSessionConfig {
+    fn default() -> Self {
+        Self {
+            instructions: String::new(),
+            voice: String::new(),
+            tools: serde_json::json!([]),
+            latency_target_ms: 800,
+            temperature: None,
+            end_of_turn_timeout_ms: None,
+            manual_turn_detection: false,
+            output_speed: None,
+            cold_start_kick: false,
+            transcription_language: None,
+        }
+    }
 }
 
 /// The swappable provider seam. Two DIRECT implementations: xAI Grok voice
@@ -259,5 +299,16 @@ mod tests {
         assert!(VoiceError::HostNotAllowed("evil.example".into()).is_terminal());
         assert!(!VoiceError::Transport("ws closed".into()).is_terminal());
         assert!(!VoiceError::Protocol("bad json".into()).is_terminal());
+    }
+
+    #[test]
+    fn session_config_constructor_keeps_optional_defaults_stable() {
+        let cfg = VoiceSessionConfig::new("instructions", "voice", serde_json::json!([]));
+        assert_eq!(cfg.instructions, "instructions");
+        assert_eq!(cfg.voice, "voice");
+        assert_eq!(cfg.latency_target_ms, 800);
+        assert!(!cfg.manual_turn_detection);
+        assert!(!cfg.cold_start_kick);
+        assert!(cfg.transcription_language.is_none());
     }
 }

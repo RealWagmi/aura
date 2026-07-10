@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 
 use crate::reframe::Reframer;
-use crate::wire::{encode_tunnel_control, is_tunnel_control, TunnelControl};
+use crate::wire::{decode_control_ack, encode_tunnel_control, is_tunnel_control, TunnelControl};
 
 /// One audio frame is 20 ms.
 const FRAME_MS: u64 = 20;
@@ -103,6 +103,22 @@ impl Outbound {
     /// audio already queued.
     pub(crate) fn push_control(&mut self, control: TunnelControl) {
         self.queue.push_back(encode_tunnel_control(control));
+    }
+
+    /// Queue a transport-internal acknowledgement ahead of media. ACKs are
+    /// tiny and time-sensitive; they never escape as application input.
+    pub(crate) fn push_priority(&mut self, payload: Vec<u8>) {
+        self.queue.push_front(payload);
+    }
+
+    /// Remove an internal ACK even while application output is held behind an
+    /// unacknowledged control (prevents simultaneous controls deadlocking).
+    pub(crate) fn pop_priority_ack(&mut self) -> Option<Vec<u8>> {
+        let pos = self
+            .queue
+            .iter()
+            .position(|f| decode_control_ack(f).is_some())?;
+        self.queue.remove(pos)
     }
 
     /// The next frame for the pacer, or `None` (send a keepalive instead).

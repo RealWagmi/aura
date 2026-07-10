@@ -87,6 +87,8 @@ pub enum ServerEvent {
         delta: String,
         item_id: Option<String>,
     },
+    #[serde(rename = "response.created")]
+    ResponseCreated { response: Option<Value> },
     /// The provider's confirmation of our `conversation.item.truncate` — the
     /// heard-position sync worked (the unheard tail left the model's context).
     /// Carried for observability only; the engine takes no action on it.
