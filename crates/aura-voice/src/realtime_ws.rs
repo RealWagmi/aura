@@ -18,7 +18,7 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use zeroize::Zeroizing;
 
 use crate::wire::{self, ServerEvent, WireError};
-use crate::{VoiceError, VoiceEvent, VoiceSink, VoiceStream, VoiceToolCall};
+use crate::{VoiceError, VoiceEvent, VoiceRuntimeEvent, VoiceSink, VoiceStream, VoiceToolCall};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsWrite = SplitSink<WsStream, Message>;
@@ -211,12 +211,22 @@ struct RealtimeStream {
 impl VoiceStream for RealtimeStream {
     async fn next_event(&mut self) -> Option<Result<VoiceEvent, VoiceError>> {
         loop {
+            match self.next_runtime_event().await? {
+                Ok(VoiceRuntimeEvent::Voice(event)) => return Some(Ok(event)),
+                Ok(VoiceRuntimeEvent::ResponseCreated) => continue,
+                Err(error) => return Some(Err(error)),
+            }
+        }
+    }
+
+    async fn next_runtime_event(&mut self) -> Option<Result<VoiceRuntimeEvent, VoiceError>> {
+        loop {
             match self.read.next().await {
                 None => return None,
                 Some(Err(e)) => return Some(Err(VoiceError::Transport(e.to_string()))),
                 Some(Ok(Message::Text(text))) => match wire::parse_server_event(text.as_str()) {
                     Ok(event) => {
-                        if let Some(mapped) = map_event(event) {
+                        if let Some(mapped) = map_runtime_event(event) {
                             return Some(mapped);
                         }
                         // Unmappable (Unknown) — keep reading.
@@ -231,6 +241,13 @@ impl VoiceStream for RealtimeStream {
             }
         }
     }
+}
+
+fn map_runtime_event(event: ServerEvent) -> Option<Result<VoiceRuntimeEvent, VoiceError>> {
+    if matches!(event, ServerEvent::ResponseCreated { .. }) {
+        return Some(Ok(VoiceRuntimeEvent::ResponseCreated));
+    }
+    map_event(event).map(|result| result.map(VoiceRuntimeEvent::Voice))
 }
 
 /// Ground-truth probe: on the VERY FIRST output-audio delta of the process,
@@ -256,7 +273,7 @@ fn debug_first_item_id(item_id: Option<&str>) {
 fn map_event(event: ServerEvent) -> Option<Result<VoiceEvent, VoiceError>> {
     let mapped = match event {
         ServerEvent::SessionCreated { .. } => VoiceEvent::SessionReady,
-        ServerEvent::ResponseCreated { .. } => VoiceEvent::ResponseCreated,
+        ServerEvent::ResponseCreated { .. } => return None,
         ServerEvent::OutputAudioDelta { delta, item_id } => {
             debug_first_item_id(item_id.as_deref());
             match wire::base64_to_pcm16(&delta) {
@@ -369,12 +386,12 @@ mod tests {
     #[test]
     fn maps_speech_and_tool_and_done() {
         assert!(matches!(
-            map_event(ServerEvent::ResponseCreated {
+            map_runtime_event(ServerEvent::ResponseCreated {
                 response: Some(json!({"id": "resp_1"})),
             })
-            .unwrap()
-            .unwrap(),
-            VoiceEvent::ResponseCreated
+            .expect("runtime event")
+            .expect("valid event"),
+            VoiceRuntimeEvent::ResponseCreated
         ));
         assert!(matches!(
             map_event(ServerEvent::SpeechStarted).unwrap().unwrap(),

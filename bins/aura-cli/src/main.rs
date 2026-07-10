@@ -491,7 +491,9 @@ const PUSH_TO_TALK_FRAME_MS: u64 = 20;
 #[cfg(any(windows, target_os = "linux"))]
 const PUSH_TO_TALK_LIMIT_WARNING_MS: u64 = 3_000;
 #[cfg(any(windows, target_os = "linux"))]
-const PUSH_TO_TALK_MIN_RECORDING_FRAMES: usize = 10;
+// Keep this aligned with the engine's 2,400-sample manual-turn minimum:
+// five 20 ms client frames are 100 ms at 24 kHz.
+const PUSH_TO_TALK_MIN_RECORDING_FRAMES: usize = 5;
 
 #[cfg(any(windows, target_os = "linux"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -608,47 +610,150 @@ fn is_push_to_talk_toggle_command(command: &[u8]) -> bool {
 
 #[cfg(target_os = "linux")]
 fn push_to_talk_control_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    let uid = unsafe { libc::geteuid() };
     let (private_base, dir) = select_push_to_talk_control_dir(
         std::env::var_os("XDG_RUNTIME_DIR"),
         std::env::var_os("HOME"),
     )?;
-
-    let base_metadata = std::fs::symlink_metadata(&private_base).map_err(|err| {
+    let relative = dir.strip_prefix(&private_base).map_err(|_| {
         format!(
-            "failed to inspect Linux push-to-talk base directory {}: {err}",
+            "Linux push-to-talk runtime directory {} is outside its private base {}",
+            dir.display(),
             private_base.display()
         )
     })?;
-    if !base_metadata.file_type().is_dir()
-        || base_metadata.uid() != uid
-        || base_metadata.permissions().mode() & 0o022 != 0
-    {
-        return Err(format!(
-            "refusing unsafe Linux push-to-talk base directory {} (must be an owned directory not writable by group or others)",
-            private_base.display()
-        )
-        .into());
-    }
-
-    std::fs::create_dir_all(&dir).map_err(|err| {
-        format!(
-            "failed to create Linux push-to-talk runtime directory {}: {err}",
-            dir.display()
-        )
-    })?;
-    let metadata = std::fs::symlink_metadata(&dir)?;
-    if !metadata.file_type().is_dir() || metadata.uid() != uid {
-        return Err(format!(
-            "refusing unsafe Linux push-to-talk runtime directory {} (must be an owned directory)",
-            dir.display()
-        )
-        .into());
-    }
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    create_private_directory_tree(&private_base, relative)?;
     Ok(dir)
+}
+
+#[cfg(target_os = "linux")]
+fn create_private_directory_tree(
+    base: &std::path::Path,
+    relative: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::ffi::{CString, OsStr};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    fn component_name(component: &OsStr) -> Result<CString, Box<dyn std::error::Error>> {
+        CString::new(component.as_bytes())
+            .map_err(|_| "Linux push-to-talk directory contains a NUL byte".into())
+    }
+
+    fn open_at(parent: i32, name: &CString) -> std::io::Result<OwnedFd> {
+        // SAFETY: `name` is NUL-terminated, `parent` is a live directory fd,
+        // and a successful return transfers ownership of the new fd.
+        let fd = unsafe {
+            libc::openat(
+                parent,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            // SAFETY: `openat` returned a fresh owned file descriptor.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+    }
+
+    fn inspect_private_dir(
+        fd: i32,
+        label: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `stat` points to writable storage and `fd` remains live.
+        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: a successful `fstat` initialized the structure.
+        let stat = unsafe { stat.assume_init() };
+        let uid = unsafe { libc::geteuid() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+            || stat.st_uid != uid
+            || stat.st_mode & 0o022 != 0
+        {
+            return Err(format!(
+                "refusing unsafe Linux push-to-talk directory {} (must be owned by the current user and not writable by group or others)",
+                label.display()
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    let root = CString::new("/").expect("static path");
+    let dot = CString::new(".").expect("static path");
+    let mut current = if base.is_absolute() {
+        open_at(libc::AT_FDCWD, &root)?
+    } else {
+        open_at(libc::AT_FDCWD, &dot)?
+    };
+    let mut traversed = std::path::PathBuf::new();
+    for component in base.components() {
+        use std::path::Component;
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "refusing unsafe Linux push-to-talk base path {}",
+                    base.display()
+                )
+                .into())
+            }
+        };
+        traversed.push(name);
+        current = open_at(current.as_raw_fd(), &component_name(name)?).map_err(|err| {
+            format!(
+                "failed no-symlink traversal of Linux push-to-talk base {}: {err}",
+                base.display()
+            )
+        })?;
+    }
+    inspect_private_dir(current.as_raw_fd(), base)?;
+
+    let mut final_fd = None;
+    for component in relative.components() {
+        use std::path::Component;
+        let name = match component {
+            Component::Normal(name) => name,
+            _ => {
+                return Err(format!(
+                    "refusing unsafe Linux push-to-talk relative path {}",
+                    relative.display()
+                )
+                .into())
+            }
+        };
+        let name_c = component_name(name)?;
+        let next = match open_at(current.as_raw_fd(), &name_c) {
+            Ok(fd) => fd,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // SAFETY: both arguments are valid and the parent fd is live.
+                let result = unsafe { libc::mkdirat(current.as_raw_fd(), name_c.as_ptr(), 0o700) };
+                if result != 0 {
+                    let mkdir_err = std::io::Error::last_os_error();
+                    if mkdir_err.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(mkdir_err.into());
+                    }
+                }
+                open_at(current.as_raw_fd(), &name_c)?
+            }
+            Err(err) => return Err(err.into()),
+        };
+        traversed.push(name);
+        inspect_private_dir(next.as_raw_fd(), &traversed)?;
+        current = next;
+        final_fd = Some(current.as_raw_fd());
+    }
+    if let Some(fd) = final_fd {
+        // SAFETY: `fd` is the live final directory descriptor.
+        if unsafe { libc::fchmod(fd, 0o700) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -754,7 +859,7 @@ fn send_push_to_talk_toggle() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     };
-    let mut stream = std::os::unix::net::UnixStream::connect(&path).map_err(|err| {
+    let mut stream = std::os::unix::net::UnixStream::connect(path).map_err(|err| {
         format!(
             "failed to reach Linux push-to-talk control socket {}: {err}",
             path.display()
@@ -926,7 +1031,7 @@ mod tests {
     use super::{
         global_config_dir_from, is_cli_dotenv_key_allowed, load_dotenv_file,
         parse_push_to_talk_max_recording_ms, push_to_talk_limit_warning_frame, resolve_ptt_toggles,
-        PttBatchAction, DEFAULT_PUSH_TO_TALK_MAX_RECORDING_MS,
+        PttBatchAction, DEFAULT_PUSH_TO_TALK_MAX_RECORDING_MS, PUSH_TO_TALK_MIN_RECORDING_FRAMES,
     };
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -1043,19 +1148,21 @@ mod tests {
 
     #[test]
     fn ptt_toggle_batch_resolves_to_one_action() {
-        assert_eq!(resolve_ptt_toggles(false, 1, 0, 10), PttBatchAction::Start);
-        assert_eq!(resolve_ptt_toggles(true, 1, 10, 10), PttBatchAction::Send);
+        let min = PUSH_TO_TALK_MIN_RECORDING_FRAMES;
+        assert_eq!(min, 5, "client minimum must remain 100 ms");
+        assert_eq!(resolve_ptt_toggles(false, 1, 0, min), PttBatchAction::Start);
+        assert_eq!(resolve_ptt_toggles(true, 1, min, min), PttBatchAction::Send);
         assert_eq!(
-            resolve_ptt_toggles(true, 1, 9, 10),
+            resolve_ptt_toggles(true, 1, min - 1, min),
             PttBatchAction::DiscardTooShort
         );
         assert_eq!(
-            resolve_ptt_toggles(false, 2, 0, 10),
+            resolve_ptt_toggles(false, 2, 0, min),
             PttBatchAction::DiscardTooShort
         );
         // Three presses from idle: the intermediate open+close pair streamed
         // zero frames, so a single Start is the whole batch.
-        assert_eq!(resolve_ptt_toggles(false, 3, 0, 10), PttBatchAction::Start);
+        assert_eq!(resolve_ptt_toggles(false, 3, 0, min), PttBatchAction::Start);
     }
 
     #[test]
@@ -1078,10 +1185,11 @@ mod tests {
 #[cfg(all(test, target_os = "linux"))]
 mod linux_tests {
     use super::{
-        is_push_to_talk_toggle_command, remove_stale_control_socket,
+        create_private_directory_tree, is_push_to_talk_toggle_command, remove_stale_control_socket,
         select_push_to_talk_control_dir,
     };
     use std::ffi::OsString;
+    use std::os::unix::fs::{symlink, PermissionsExt};
 
     #[test]
     fn control_socket_requires_exact_toggle_command() {
@@ -1130,5 +1238,53 @@ mod linux_tests {
         assert!(remove_stale_control_socket(&path).is_err());
         assert_eq!(std::fs::read(&path).expect("file preserved"), b"keep me");
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn private_directory_tree_is_created_with_private_final_mode() {
+        let base =
+            std::env::temp_dir().join(format!("aura-cli-private-tree-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir(&base).expect("test base");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+            .expect("private base");
+
+        create_private_directory_tree(&base, std::path::Path::new(".cache/aura/runtime"))
+            .expect("safe descriptor-relative creation");
+        let runtime = base.join(".cache/aura/runtime");
+        let mode = std::fs::symlink_metadata(&runtime)
+            .expect("runtime metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        std::fs::remove_dir_all(&base).expect("cleanup");
+    }
+
+    #[test]
+    fn private_directory_tree_rejects_intermediate_symlink() {
+        let base =
+            std::env::temp_dir().join(format!("aura-cli-symlink-tree-test-{}", std::process::id()));
+        let target = std::env::temp_dir().join(format!(
+            "aura-cli-symlink-target-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::create_dir(&base).expect("test base");
+        std::fs::create_dir(&target).expect("symlink target");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+            .expect("private base");
+        symlink(&target, base.join(".cache")).expect("intermediate symlink");
+
+        let err = create_private_directory_tree(&base, std::path::Path::new(".cache/aura/runtime"))
+            .expect_err("intermediate symlink must be rejected");
+        assert!(
+            err.to_string().contains("Not a directory")
+                || err.to_string().contains("Too many levels")
+                || err.to_string().contains("os error")
+        );
+        assert!(!target.join("aura/runtime").exists());
+        std::fs::remove_dir_all(&base).expect("cleanup base");
+        std::fs::remove_dir_all(&target).expect("cleanup target");
     }
 }

@@ -97,10 +97,6 @@ pub enum VoiceEvent {
     UserSpeechStopped,
     /// The model requested a tool call.
     ToolCall(VoiceToolCall),
-    /// The provider accepted a `response.create` request and started a model
-    /// response. This can arrive before the first audio delta, which lets the
-    /// engine cancel a cold-start or manually committed response immediately.
-    ResponseCreated,
     /// A model response finished; carries usage if the provider reports it.
     ResponseDone { input_tokens: Option<u32> },
     /// A protocol/transport error. Carries [`VoiceError::is_terminal`].
@@ -260,6 +256,28 @@ pub trait VoiceSink: Send {
 pub trait VoiceStream: Send {
     /// Next decoded event, or `None` when the stream is closed.
     async fn next_event(&mut self) -> Option<Result<VoiceEvent, VoiceError>>;
+
+    /// Runtime-only lifecycle stream used by `aura-engine`. The default wraps
+    /// [`Self::next_event`], so existing third-party providers do not need to
+    /// implement this method.
+    #[doc(hidden)]
+    async fn next_runtime_event(&mut self) -> Option<Result<VoiceRuntimeEvent, VoiceError>> {
+        self.next_event()
+            .await
+            .map(|result| result.map(VoiceRuntimeEvent::Voice))
+    }
+}
+
+/// Internal lifecycle envelope consumed by `aura-engine`.
+///
+/// This type is public only because it appears in the object-safe
+/// [`VoiceStream`] trait. Provider consumers should keep matching on
+/// [`VoiceEvent`].
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub enum VoiceRuntimeEvent {
+    Voice(VoiceEvent),
+    ResponseCreated,
 }
 
 /// Errors from the voice provider seam. [`VoiceError::is_terminal`]

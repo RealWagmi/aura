@@ -37,7 +37,8 @@ use aura_core::tools::{
 use aura_core::CallbackMode;
 use aura_hosts::HostAdapter;
 use aura_voice::{
-    VoiceEvent, VoiceProvider, VoiceSessionConfig, VoiceSink, VoiceStream, VoiceToolCall,
+    VoiceEvent, VoiceProvider, VoiceRuntimeEvent, VoiceSessionConfig, VoiceSink, VoiceStream,
+    VoiceToolCall,
 };
 
 pub mod barge_in;
@@ -234,20 +235,21 @@ struct CallState {
     /// Deadline for the terminal `response.done` belonging to a successfully
     /// sent cancellation. While set, every new `response.create` is deferred.
     cancel_done_deadline: Option<tokio::time::Instant>,
-    /// A user turn or tool result is already committed, but its response must
-    /// wait for `cancel_done_deadline` to clear.
+    /// One or more conversation items are committed, but their response must
+    /// wait for `cancel_done_deadline` to clear (and for an open PTT turn to
+    /// close).
     deferred_response: bool,
-    /// The deferred response includes a committed PTT user item. This is kept
-    /// separate from tool-result responses so timeout recovery replays the
-    /// correct conversation items.
-    deferred_ptt_committed: bool,
-    /// Tool results sent while cancellation is pending, retained so a timeout
-    /// reconnect can restore them to the replacement provider session.
-    deferred_tool_results: Vec<(Option<String>, serde_json::Value)>,
-    /// PTT frames retained only while a cancellation is pending. They allow a
-    /// timeout reconnect to replay a committed turn instead of losing it with
-    /// the old provider session.
-    deferred_ptt_audio: Vec<Vec<i16>>,
+    /// Ordered, typed conversation items sent while cancellation is pending.
+    /// The explicit PTT item boundaries are required for timeout replay: two
+    /// user turns must never become one combined input-audio item.
+    deferred_items: Vec<DeferredConversationItem>,
+    /// Audio for the currently open PTT turn. It is separate from committed
+    /// items so timeout recovery can restore a partially recorded turn without
+    /// accidentally committing or combining it.
+    deferred_open_ptt_audio: Vec<Vec<i16>>,
+    /// Whether a manual PTT turn is currently open. Duplicate `PttOpen`
+    /// controls are idempotent and must not cancel again or reset the timeout.
+    ptt_open: bool,
     /// Whether the user is currently speaking (server-VAD).
     user_speaking: bool,
     /// The model called `end_voice_session`; hang up once its farewell turn
@@ -288,7 +290,9 @@ impl CallState {
     }
 
     fn mark_cancel_pending(&mut self) {
-        self.cancel_done_deadline = Some(tokio::time::Instant::now() + CANCEL_DONE_TIMEOUT);
+        if self.cancel_done_deadline.is_none() {
+            self.cancel_done_deadline = Some(tokio::time::Instant::now() + CANCEL_DONE_TIMEOUT);
+        }
     }
 
     fn clear_cancel_pending(&mut self) {
@@ -302,14 +306,23 @@ impl CallState {
         self.mark_response_done();
         self.clear_cancel_pending();
         self.deferred_response = false;
-        self.deferred_ptt_committed = false;
-        self.deferred_tool_results.clear();
-        self.deferred_ptt_audio.clear();
+        self.deferred_items.clear();
+        self.deferred_open_ptt_audio.clear();
+        self.ptt_open = false;
         self.user_speaking = false;
         self.current_item = None;
         self.item_delivered_samples = 0;
         self.ptt_input_samples = 0;
     }
+}
+
+#[derive(Debug)]
+enum DeferredConversationItem {
+    PttAudio(Vec<Vec<i16>>),
+    ToolResult {
+        call_id: Option<String>,
+        content: serde_json::Value,
+    },
 }
 
 const MIN_PTT_COMMIT_SAMPLES: u64 = 2_400; // 100 ms at 24 kHz
@@ -479,7 +492,7 @@ impl CallSession {
                                     .ptt_input_samples
                                     .saturating_add(pcm.len() as u64);
                                 if state.cancel_done_deadline.is_some() {
-                                    state.deferred_ptt_audio.push(pcm.clone());
+                                    state.deferred_open_ptt_audio.push(pcm.clone());
                                 }
                             }
                             if sink.send_audio(&pcm).await.is_err() {
@@ -491,6 +504,15 @@ impl CallSession {
                         }
                         Some(TransportInput::Control(TransportControl::PttOpen)) => {
                             if manual_turn_detection {
+                                // Reliable controls are deduplicated by the
+                                // tunnel, but keep the engine idempotent too:
+                                // a repeated open must not erase this turn,
+                                // resend cancel, or extend the cancel timeout.
+                                if state.ptt_open {
+                                    continue;
+                                }
+                                state.ptt_open = true;
+                                state.deferred_open_ptt_audio.clear();
                                 // A PTT press while Aura is speaking is a
                                 // barge-in and gets the SAME atomic unit as the
                                 // VAD path: heard-position capture → clear
@@ -520,10 +542,25 @@ impl CallSession {
                                 eprintln!("aura-engine: ignoring PTT close in voice mode.");
                                 continue;
                             }
+                            if !state.ptt_open {
+                                continue;
+                            }
                             if state.ptt_input_samples < MIN_PTT_COMMIT_SAMPLES {
                                 state.ptt_input_samples = 0;
+                                state.ptt_open = false;
+                                state.deferred_open_ptt_audio.clear();
                                 if sink.clear_user_audio().await.is_err() {
                                     match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk clear failed").await {
+                                        Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
+                                        None => break Transition::Ended(EndReason::ReconnectExhausted),
+                                    }
+                                }
+                                if state.deferred_response
+                                    && request_response_when_ready(sink.as_mut(), &mut state)
+                                        .await
+                                        .is_err()
+                                {
+                                    match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk response request failed").await {
                                         Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
                                         None => break Transition::Ended(EndReason::ReconnectExhausted),
                                     }
@@ -531,6 +568,7 @@ impl CallSession {
                                 continue;
                             }
                             state.ptt_input_samples = 0;
+                            state.ptt_open = false;
                             if commit_ptt_turn_when_ready(sink.as_mut(), &mut state).await.is_err() {
                                 match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk commit failed").await {
                                     Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
@@ -543,12 +581,27 @@ impl CallSession {
                                 eprintln!("aura-engine: ignoring PTT cancel in voice mode.");
                                 continue;
                             }
+                            if !state.ptt_open {
+                                continue;
+                            }
                             // The client discarded the open turn: drop the
                             // frames it already streamed so they cannot prefix
                             // the next committed turn.
                             state.ptt_input_samples = 0;
+                            state.ptt_open = false;
+                            state.deferred_open_ptt_audio.clear();
                             if sink.clear_user_audio().await.is_err() {
                                 match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk clear failed").await {
+                                    Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
+                                    None => break Transition::Ended(EndReason::ReconnectExhausted),
+                                }
+                            }
+                            if state.deferred_response
+                                && request_response_when_ready(sink.as_mut(), &mut state)
+                                    .await
+                                    .is_err()
+                            {
+                                match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk response request failed").await {
                                     Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
                                     None => break Transition::Ended(EndReason::ReconnectExhausted),
                                 }
@@ -556,7 +609,7 @@ impl CallSession {
                         }
                         None => break Transition::Ended(EndReason::HangUp),
                     },
-                    ev = stream.next_event() => match ev {
+                    ev = stream.next_runtime_event() => match ev {
                         None => match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "the provider closed the event stream").await {
                             Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
                             None => break Transition::Ended(EndReason::ReconnectExhausted),
@@ -570,7 +623,10 @@ impl CallSession {
                                 None => break Transition::Ended(EndReason::ReconnectExhausted),
                             }
                         }
-                        Some(Ok(VoiceEvent::ToolCall(call))) => {
+                        Some(Ok(VoiceRuntimeEvent::ResponseCreated)) => {
+                            state.mark_response_created();
+                        }
+                        Some(Ok(VoiceRuntimeEvent::Voice(VoiceEvent::ToolCall(call)))) => {
                             // Cancel + suppress as a unit: a tool call that
                             // belongs to a response the user barged-in over (cancelled)
                             // must NOT be acted on — including the control tools. Acting
@@ -598,16 +654,19 @@ impl CallSession {
                                     .await
                                     .is_ok();
                                 if sent && state.cancel_done_deadline.is_some() {
-                                    state
-                                        .deferred_tool_results
-                                        .push((call.call_id.clone(), content));
+                                    state.deferred_items.push(
+                                        DeferredConversationItem::ToolResult {
+                                            call_id: call.call_id.clone(),
+                                            content,
+                                        },
+                                    );
                                 }
                                 let _ = request_response_when_ready(sink.as_mut(), &mut state).await;
                             } else {
                                 spawn_dispatch(&router, &mut dispatch, call);
                             }
                         }
-                        Some(Ok(event)) => {
+                        Some(Ok(VoiceRuntimeEvent::Voice(event))) => {
                             transcript.observe(&event);
                             match handle_event(event, transport.as_mut(), sink.as_mut(), &mut state, echo_risk).await {
                                 Flow::Continue => {}
@@ -628,12 +687,7 @@ impl CallSession {
                         // closed that response. Preserve any PTT audio locally,
                         // replace the wedged session, and replay the user item
                         // before requesting its answer.
-                        let retained_audio = std::mem::take(&mut state.deferred_ptt_audio);
-                        let retained_samples = state.ptt_input_samples;
-                        let committed_ptt = state.deferred_ptt_committed;
-                        let deferred_response = state.deferred_response;
-                        let retained_tool_results =
-                            std::mem::take(&mut state.deferred_tool_results);
+                        let recovery = CancelTimeoutRecovery::take(&mut state);
                         match reconnect(
                             &provider,
                             &build_reconnect_cfg(&cfg, &transcript),
@@ -643,34 +697,15 @@ impl CallSession {
                                 sink = s;
                                 stream = st;
                                 state.on_reconnect();
-                                for pcm in &retained_audio {
-                                    if sink.send_audio(pcm).await.is_err() {
-                                        break 'active Transition::Ended(EndReason::ReconnectExhausted);
-                                    }
-                                }
-                                if committed_ptt && sink.commit_user_audio().await.is_err() {
-                                    break 'active Transition::Ended(EndReason::ReconnectExhausted);
-                                }
-                                for (call_id, content) in retained_tool_results {
-                                    if sink
-                                        .send_tool_result(call_id.as_deref(), content)
-                                        .await
-                                        .is_err()
-                                    {
-                                        break 'active Transition::Ended(EndReason::ReconnectExhausted);
-                                    }
-                                }
-                                if deferred_response
-                                    && request_response_when_ready(sink.as_mut(), &mut state)
-                                        .await
-                                        .is_err()
+                                if replay_after_cancel_timeout(
+                                    sink.as_mut(),
+                                    &mut state,
+                                    recovery,
+                                )
+                                .await
+                                .is_err()
                                 {
                                     break 'active Transition::Ended(EndReason::ReconnectExhausted);
-                                }
-                                if !committed_ptt {
-                                    // The user was still holding PTT when the
-                                    // timeout fired; continue that same turn.
-                                    state.ptt_input_samples = retained_samples;
                                 }
                             }
                             None => break Transition::Ended(EndReason::ReconnectExhausted),
@@ -691,7 +726,12 @@ impl CallSession {
                                 .await
                                 .is_ok();
                             if sent && state.cancel_done_deadline.is_some() {
-                                state.deferred_tool_results.push((call_id.clone(), content));
+                                state.deferred_items.push(
+                                    DeferredConversationItem::ToolResult {
+                                        call_id: call_id.clone(),
+                                        content,
+                                    },
+                                );
                             }
                             let _ = request_response_when_ready(sink.as_mut(), &mut state).await;
                             // Universal callback seam: a completed
@@ -781,10 +821,6 @@ async fn handle_event(
 ) -> Flow {
     match event {
         VoiceEvent::SessionReady => Flow::Continue,
-        VoiceEvent::ResponseCreated => {
-            state.mark_response_created();
-            Flow::Continue
-        }
         VoiceEvent::OutputAudio { pcm, item_id } => {
             // Drop the cancelled response's late audio while suppressing.
             if state.suppress {
@@ -836,7 +872,7 @@ async fn handle_event(
                 // never lingering to eat the NEXT response's audio/tool calls
                 // (that stale-suppress bug refused to hang up on a spoken "end
                 // the call").
-                if state.response_in_flight() {
+                if state.response_in_flight() && state.cancel_done_deadline.is_none() {
                     if let Err(e) = sink.cancel_response().await {
                         eprintln!("aura-engine: barge-in cancel send failed: {e}");
                         return Flow::Reconnect;
@@ -940,7 +976,7 @@ async fn ptt_barge_in(
 ) -> Result<(), &'static str> {
     let heard_ms = (state.item_delivered_samples / 24).saturating_sub(transport.queued_ms());
     transport.clear_playout();
-    if state.response_in_flight() {
+    if state.response_in_flight() && state.cancel_done_deadline.is_none() {
         if sink.cancel_response().await.is_err() {
             return Err("push-to-talk barge-in cancel failed");
         }
@@ -965,15 +1001,14 @@ async fn request_response_when_ready(
     sink: &mut dyn VoiceSink,
     state: &mut CallState,
 ) -> Result<(), aura_voice::VoiceError> {
-    if state.cancel_done_deadline.is_some() {
+    if state.cancel_done_deadline.is_some() || state.ptt_open {
         state.deferred_response = true;
         return Ok(());
     }
     sink.request_response().await?;
     state.deferred_response = false;
-    state.deferred_ptt_committed = false;
-    state.deferred_tool_results.clear();
-    state.deferred_ptt_audio.clear();
+    state.deferred_items.clear();
+    state.deferred_open_ptt_audio.clear();
     state.mark_response_requested();
     Ok(())
 }
@@ -984,9 +1019,71 @@ async fn commit_ptt_turn_when_ready(
 ) -> Result<(), aura_voice::VoiceError> {
     sink.commit_user_audio().await?;
     if state.cancel_done_deadline.is_some() {
-        state.deferred_ptt_committed = true;
+        state
+            .deferred_items
+            .push(DeferredConversationItem::PttAudio(std::mem::take(
+                &mut state.deferred_open_ptt_audio,
+            )));
     }
     request_response_when_ready(sink, state).await
+}
+
+/// Everything needed to reconstruct the conversation tail after a provider
+/// ignores `response.cancel`. Committed items and the open input buffer are
+/// intentionally separate so replay preserves every original boundary.
+#[derive(Debug)]
+struct CancelTimeoutRecovery {
+    items: Vec<DeferredConversationItem>,
+    open_ptt_audio: Vec<Vec<i16>>,
+    open_ptt_samples: u64,
+    ptt_open: bool,
+    response_needed: bool,
+}
+
+impl CancelTimeoutRecovery {
+    fn take(state: &mut CallState) -> Self {
+        Self {
+            items: std::mem::take(&mut state.deferred_items),
+            open_ptt_audio: std::mem::take(&mut state.deferred_open_ptt_audio),
+            open_ptt_samples: state.ptt_input_samples,
+            ptt_open: state.ptt_open,
+            response_needed: state.deferred_response,
+        }
+    }
+}
+
+async fn replay_after_cancel_timeout(
+    sink: &mut dyn VoiceSink,
+    state: &mut CallState,
+    recovery: CancelTimeoutRecovery,
+) -> Result<(), aura_voice::VoiceError> {
+    for item in recovery.items {
+        match item {
+            DeferredConversationItem::PttAudio(frames) => {
+                for pcm in frames {
+                    sink.send_audio(&pcm).await?;
+                }
+                sink.commit_user_audio().await?;
+            }
+            DeferredConversationItem::ToolResult { call_id, content } => {
+                sink.send_tool_result(call_id.as_deref(), content).await?;
+            }
+        }
+    }
+
+    // Restore an in-progress turn only after every earlier committed item.
+    // It remains open and uncommitted; its eventual PttClose owns the single
+    // response.create for all deferred conversation items.
+    for pcm in recovery.open_ptt_audio {
+        sink.send_audio(&pcm).await?;
+    }
+    state.ptt_open = recovery.ptt_open;
+    state.ptt_input_samples = recovery.open_ptt_samples;
+    state.deferred_response = recovery.response_needed;
+    if recovery.response_needed {
+        request_response_when_ready(sink, state).await?;
+    }
+    Ok(())
 }
 
 /// Pend forever when there is no cancellation in flight, otherwise wake at
@@ -1467,6 +1564,17 @@ mod tests {
         commits: usize,
         clears: usize,
         closed: bool,
+        actions: Vec<SinkAction>,
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum SinkAction {
+        Audio(i16),
+        Cancel,
+        ToolResult(Option<String>, serde_json::Value),
+        Request,
+        Commit,
+        Clear,
     }
 
     struct FakeSink {
@@ -1476,11 +1584,17 @@ mod tests {
     #[async_trait]
     impl VoiceSink for FakeSink {
         async fn send_audio(&mut self, pcm16: &[i16]) -> Result<(), VoiceError> {
-            self.log.lock().unwrap().audio.push(pcm16.to_vec());
+            let mut log = self.log.lock().unwrap();
+            log.audio.push(pcm16.to_vec());
+            log.actions.push(SinkAction::Audio(
+                pcm16.first().copied().unwrap_or_default(),
+            ));
             Ok(())
         }
         async fn cancel_response(&mut self) -> Result<(), VoiceError> {
-            self.log.lock().unwrap().cancels += 1;
+            let mut log = self.log.lock().unwrap();
+            log.cancels += 1;
+            log.actions.push(SinkAction::Cancel);
             Ok(())
         }
         async fn truncate_item(
@@ -1497,10 +1611,13 @@ mod tests {
         }
         async fn send_tool_result(
             &mut self,
-            _call_id: Option<&str>,
-            _output: serde_json::Value,
+            call_id: Option<&str>,
+            output: serde_json::Value,
         ) -> Result<(), VoiceError> {
-            self.log.lock().unwrap().tool_results += 1;
+            let mut log = self.log.lock().unwrap();
+            log.tool_results += 1;
+            log.actions
+                .push(SinkAction::ToolResult(call_id.map(str::to_owned), output));
             Ok(())
         }
         async fn inject_system_context(&mut self, text: &str) -> Result<(), VoiceError> {
@@ -1508,15 +1625,21 @@ mod tests {
             Ok(())
         }
         async fn request_response(&mut self) -> Result<(), VoiceError> {
-            self.log.lock().unwrap().requests += 1;
+            let mut log = self.log.lock().unwrap();
+            log.requests += 1;
+            log.actions.push(SinkAction::Request);
             Ok(())
         }
         async fn commit_user_audio(&mut self) -> Result<(), VoiceError> {
-            self.log.lock().unwrap().commits += 1;
+            let mut log = self.log.lock().unwrap();
+            log.commits += 1;
+            log.actions.push(SinkAction::Commit);
             Ok(())
         }
         async fn clear_user_audio(&mut self) -> Result<(), VoiceError> {
-            self.log.lock().unwrap().clears += 1;
+            let mut log = self.log.lock().unwrap();
+            log.clears += 1;
+            log.actions.push(SinkAction::Clear);
             Ok(())
         }
         async fn close(&mut self) -> Result<(), VoiceError> {
@@ -1901,6 +2024,148 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn cancel_timeout_replay_preserves_two_committed_ptt_boundaries() {
+        let mut h = harness_input(
+            vec![
+                Script::Ok {
+                    events: vec![],
+                    end: End::Pending,
+                },
+                Script::Ok {
+                    events: vec![VoiceEvent::SessionReady],
+                    end: End::Pending,
+                },
+            ],
+            vec![
+                TransportInput::Control(TransportControl::PttOpen),
+                TransportInput::Audio(vec![1; MIN_PTT_COMMIT_SAMPLES as usize]),
+                TransportInput::Control(TransportControl::PttClose),
+                TransportInput::Control(TransportControl::PttOpen),
+                TransportInput::Audio(vec![2; MIN_PTT_COMMIT_SAMPLES as usize]),
+                TransportInput::Control(TransportControl::PttClose),
+            ],
+            false,
+        );
+        h.transport.hangup_after_request = Some(h.sink_log.clone());
+        let mut config = ptt_cfg();
+        config.cold_start_kick = true;
+
+        let _ = CallSession::run_with_manual_turn_detection(
+            h.transport,
+            h.provider,
+            host(),
+            None,
+            config,
+        )
+        .await
+        .unwrap();
+
+        let log = h.sink_log.lock().unwrap();
+        assert_eq!(log.cancels, 1, "the second open must not cancel again");
+        assert_eq!(log.requests, 1);
+        assert_eq!(log.commits, 4, "two original commits plus two replays");
+        assert_eq!(
+            &log.actions[log.actions.len() - 5..],
+            &[
+                SinkAction::Audio(1),
+                SinkAction::Commit,
+                SinkAction::Audio(2),
+                SinkAction::Commit,
+                SinkAction::Request,
+            ],
+            "recovery must replay two items, not one flattened audio buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_ptt_open_while_cancel_pending_is_idempotent() {
+        let h = harness_input(
+            vec![Script::Ok {
+                events: vec![VoiceEvent::SessionReady],
+                end: End::Pending,
+            }],
+            vec![
+                TransportInput::Control(TransportControl::PttOpen),
+                TransportInput::Control(TransportControl::PttOpen),
+                TransportInput::Audio(vec![3; MIN_PTT_COMMIT_SAMPLES as usize]),
+                TransportInput::Control(TransportControl::PttClose),
+            ],
+            true,
+        );
+        let mut config = ptt_cfg();
+        config.cold_start_kick = true;
+
+        let _ = CallSession::run_with_manual_turn_detection(
+            h.transport,
+            h.provider,
+            host(),
+            None,
+            config,
+        )
+        .await
+        .unwrap();
+
+        let log = h.sink_log.lock().unwrap();
+        assert_eq!(log.cancels, 1);
+        assert_eq!(log.clears, 1);
+        assert_eq!(log.commits, 1);
+        assert_eq!(log.audio.len(), 1, "duplicate open must not erase audio");
+    }
+
+    #[tokio::test]
+    async fn timeout_replay_keeps_committed_items_separate_from_open_ptt() {
+        let log = Arc::new(Mutex::new(SinkLog::default()));
+        let mut sink = FakeSink { log: log.clone() };
+        let mut state = CallState::default();
+        let tool_content = serde_json::json!({ "ok": true });
+        let recovery = CancelTimeoutRecovery {
+            items: vec![
+                DeferredConversationItem::PttAudio(vec![vec![4; 2_400]]),
+                DeferredConversationItem::ToolResult {
+                    call_id: Some("tool-1".to_owned()),
+                    content: tool_content.clone(),
+                },
+            ],
+            open_ptt_audio: vec![vec![5; 1_200]],
+            open_ptt_samples: 1_200,
+            ptt_open: true,
+            response_needed: true,
+        };
+
+        replay_after_cancel_timeout(&mut sink, &mut state, recovery)
+            .await
+            .unwrap();
+
+        assert!(state.ptt_open);
+        assert_eq!(state.ptt_input_samples, 1_200);
+        assert!(state.deferred_response);
+        assert_eq!(log.lock().unwrap().requests, 0);
+        assert_eq!(
+            log.lock().unwrap().actions,
+            vec![
+                SinkAction::Audio(4),
+                SinkAction::Commit,
+                SinkAction::ToolResult(Some("tool-1".to_owned()), tool_content),
+                SinkAction::Audio(5),
+            ]
+        );
+
+        // The still-open turn remains a distinct item. Closing it commits that
+        // item once, then emits the one response.create deferred for the tail.
+        state.ptt_open = false;
+        commit_ptt_turn_when_ready(&mut sink, &mut state)
+            .await
+            .unwrap();
+        let log = log.lock().unwrap();
+        assert_eq!(log.commits, 2);
+        assert_eq!(log.requests, 1);
+        assert_eq!(
+            &log.actions[log.actions.len() - 2..],
+            &[SinkAction::Commit, SinkAction::Request]
+        );
+    }
+
     #[tokio::test]
     async fn first_ptt_open_cancels_cold_start_before_audio() {
         let h = harness_input(
@@ -2139,17 +2404,7 @@ mod tests {
             ..CallState::default()
         };
 
-        assert!(matches!(
-            handle_event(
-                VoiceEvent::ResponseCreated,
-                &mut transport,
-                &mut sink,
-                &mut state,
-                false,
-            )
-            .await,
-            Flow::Continue
-        ));
+        state.mark_response_created();
         assert!(!state.response_requested);
         assert!(state.response_created);
 
