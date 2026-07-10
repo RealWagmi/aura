@@ -439,7 +439,7 @@ async fn pump<T: VoiceTunnel>(
     loop {
         tokio::select! {
             _ = wait_ptt_control_failure(&input_mode) => {
-                return Err("Linux push-to-talk control socket failed; ending the call rather than leaving microphone control unavailable".into());
+                return Err("Push-to-talk control failed; ending the call rather than leaving microphone control unavailable".into());
             }
             mic = audio.recv_pcm24() => match mic {
                 Some(frame) => match &input_mode {
@@ -540,7 +540,6 @@ async fn pump<T: VoiceTunnel>(
     Ok(())
 }
 
-#[cfg(any(windows, target_os = "linux"))]
 async fn wait_ptt_control_failure(input_mode: &InputMode) {
     match input_mode {
         InputMode::TogglePushToTalk(gate) => gate.wait_for_failure().await,
