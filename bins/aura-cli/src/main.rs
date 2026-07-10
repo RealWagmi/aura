@@ -542,6 +542,7 @@ async fn pump<T: VoiceTunnel>(
 
 async fn wait_ptt_control_failure(input_mode: &InputMode) {
     match input_mode {
+        #[cfg(any(windows, target_os = "linux"))]
         InputMode::TogglePushToTalk(gate) => gate.wait_for_failure().await,
         InputMode::Voice => std::future::pending().await,
     }
