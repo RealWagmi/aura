@@ -144,7 +144,13 @@ Set `AURA_PUSH_TO_TALK_HOTKEY` before starting `aura-cli.exe`; changing `.env`
 does not affect an already-running client. `AURA_PUSH_TO_TALK_MAX_RECORDING_MS`
 is a client safety cap for an accidentally open mic. The default is `300000`
 ms, about five minutes. Three seconds before the cap, Aura warns that the voice
-message limit is near.
+message limit is near. Very short push-to-talk taps are discarded instead of
+sent; the client prints that the message was too short.
+
+`aura-cli.exe` deliberately ignores `AURA_CONNECT` from `.env` files. The
+connection string must come from the real process environment or stdin, so a
+target repository cannot redirect the user's microphone by planting a local
+`.env`.
 
 For a local call on the same Windows machine:
 

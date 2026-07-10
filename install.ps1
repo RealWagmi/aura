@@ -401,7 +401,7 @@ if ($BuildClient) {
     Write-Note 'aura-cli is the CLIENT. It reads the connection string from the'
     Write-Note 'AURA_CONNECT environment variable (never from the command line), or'
     Write-Note 'from one line on stdin. To join a call:'
-    Write-Note '    $env:AURA_CONNECT = ''aura://HOST:PORT#k=...&c=...''; aura-cli'
+    Write-Note '    $env:AURA_CONNECT = ''aura://HOST:PORT#k=...&c=...&t=direct&m=voice''; aura-cli'
     Write-Note '  or run `aura-cli` and paste the connection string when prompted.'
 }
 if ($BuildServer) {

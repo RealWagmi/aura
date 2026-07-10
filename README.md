@@ -145,13 +145,13 @@ Run via the `curl | bash` one-liner, `install.sh` first clones the source into `
 You ask the AI for a call ("call me", a slash command, etc.). The AI launches `aura-server`, which mints a single-use per-call secret (valid for about 120 seconds) and produces a **connection string** of the form:
 
 ```
-aura://HOST:PORT#k=<secret>&c=<call_id>
+aura://HOST:PORT#k=<secret>&c=<call_id>&t=direct&m=voice
 ```
 
 The secret lives in the URL fragment. You connect by handing that string to the client through the `AURA_CONNECT` environment variable — never on the command line, so the secret never appears in `ps`:
 
 ```bash
-AURA_CONNECT='aura://HOST:PORT#k=...&c=...' aura-cli
+AURA_CONNECT='aura://HOST:PORT#k=...&c=...&t=direct&m=voice' aura-cli
 ```
 
 Or run `aura-cli` with no arguments and paste the string on its first line of standard input.
@@ -160,6 +160,8 @@ Or run `aura-cli` with no arguments and paste the string on its first line of st
 - **REMOTE call** — the AI runs the server on its VPS and sends you the connection string over the chat; you run `AURA_CONNECT='aura://...' aura-cli` on your own machine.
 
 **Open speakers / echo.** The client runs echo cancellation (WebRTC AEC3) on the mic by default, so you can talk — and interrupt the model mid-sentence — on open speakers without the model hearing itself. Headphones remain the zero-processing option. Tunables via the `AURA_AEC` environment variable: `on` (default), `gate` (no AEC — the mic is muted while the model speaks, so no barge-in), `off` (raw mic, headset users only).
+
+**Push-to-talk.** Set `AURA_INPUT_MODE=push_to_talk` before starting the client. On Windows, use `AURA_PUSH_TO_TALK_HOTKEY` for a global toggle hotkey. On Linux, bind your desktop shortcut to `aura-cli ptt-toggle`; it toggles the active call through `AURA_PUSH_TO_TALK_CONTROL_PATH` or `$XDG_RUNTIME_DIR/aura-ptt.sock`.
 
 When the call ends, the server posts a short recap of the in-call transcript back into the chat, so the AI can pick the conversation back up where the voice call left off.
 

@@ -58,6 +58,10 @@ pub enum ConnError {
     MissingSecret,
     #[error("connection string is missing the `c=` call id")]
     MissingCallId,
+    #[error("unsupported transport tag in connection string: {0:?}")]
+    UnknownTransport(String),
+    #[error("unsupported input mode tag in connection string: {0:?}")]
+    UnknownInputMode(String),
     #[error("session secret: {0}")]
     Secret(#[from] SecretError),
 }
@@ -143,10 +147,14 @@ impl ConnectionString {
             } else if let Some(v) = pair.strip_prefix("t=") {
                 transport = match v {
                     "iroh" => TransportKind::Iroh,
-                    _ => TransportKind::Direct,
+                    "direct" => TransportKind::Direct,
+                    _ => return Err(ConnError::UnknownTransport(v.to_owned())),
                 };
             } else if let Some(v) = pair.strip_prefix("m=") {
-                input_mode = parse_input_mode_tag(v);
+                input_mode = Some(
+                    parse_input_mode_tag(v)
+                        .ok_or_else(|| ConnError::UnknownInputMode(v.to_owned()))?,
+                );
             }
         }
         let secret = SessionSecret::from_base64url(secret_b64.ok_or(ConnError::MissingSecret)?)?;
@@ -304,6 +312,18 @@ mod tests {
         assert!(matches!(
             ConnectionString::parse(&format!("aura://h:1#k={good_secret}")),
             Err(ConnError::MissingCallId)
+        ));
+        assert!(matches!(
+            ConnectionString::parse(&format!(
+                "aura://h:1#k={good_secret}&c=call-x&t=warp&m=voice"
+            )),
+            Err(ConnError::UnknownTransport(t)) if t == "warp"
+        ));
+        assert!(matches!(
+            ConnectionString::parse(&format!(
+                "aura://h:1#k={good_secret}&c=call-x&t=direct&m=manual"
+            )),
+            Err(ConnError::UnknownInputMode(m)) if m == "manual"
         ));
     }
 

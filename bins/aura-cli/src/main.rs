@@ -6,13 +6,13 @@
 //! model, the chat context, the tools, and the key all live on the server.
 
 use aura_audio::{AudioSettings, CpalTransport};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use aura_tunnel::TunnelControl;
 use aura_tunnel::{
     ConnectionString, IrohEndpoint, IrohPreset, TransportKind, TunnelConfig, TunnelEndpoint,
     TunnelInputMode,
 };
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use std::sync::Arc;
 
 #[cfg(windows)]
@@ -21,11 +21,11 @@ mod hotkey;
 #[derive(Debug, Clone)]
 enum InputMode {
     Voice,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     TogglePushToTalk(PushToTalkGate),
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[derive(Debug, Clone)]
 struct PushToTalkGate {
     state: Arc<std::sync::atomic::AtomicU64>,
@@ -52,7 +52,7 @@ impl InputMode {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl PushToTalkGate {
     fn press_count(&self) -> u64 {
         self.state.load(std::sync::atomic::Ordering::Acquire)
@@ -69,9 +69,49 @@ fn start_push_to_talk() -> Result<InputMode, Box<dyn std::error::Error>> {
     }))
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn start_push_to_talk() -> Result<InputMode, Box<dyn std::error::Error>> {
-    Err("AURA_INPUT_MODE=push_to_talk currently supports Windows global hotkeys only".into())
+    let path = push_to_talk_control_path();
+    let _ = std::fs::remove_file(&path);
+    let listener = std::os::unix::net::UnixListener::bind(&path).map_err(|err| {
+        format!(
+            "failed to bind Linux push-to-talk control socket {}: {err}",
+            path.display()
+        )
+    })?;
+    listener.set_nonblocking(true)?;
+    let listener = tokio::net::UnixListener::from_std(listener)?;
+    let presses = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let task_presses = Arc::clone(&presses);
+    let task_path = path.clone();
+    let _listener_task = tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((_stream, _addr)) => {
+                    task_presses.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                Err(err) => {
+                    eprintln!(
+                        "aura: Linux push-to-talk control socket {} stopped: {err}",
+                        task_path.display()
+                    );
+                    break;
+                }
+            }
+        }
+    });
+    Ok(InputMode::TogglePushToTalk(PushToTalkGate {
+        state: presses,
+        label: format!("aura-cli ptt-toggle ({})", path.display()),
+    }))
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn start_push_to_talk() -> Result<InputMode, Box<dyn std::error::Error>> {
+    Err(
+        "AURA_INPUT_MODE=push_to_talk currently supports Windows global hotkeys and Linux ptt-toggle only"
+            .into(),
+    )
 }
 
 #[tokio::main]
@@ -92,6 +132,13 @@ async fn main() {
 /// never read from argv (only `AURA_CONNECT`/stdin), so no other flags exist.
 fn handle_cli_flags() -> Option<i32> {
     match std::env::args().nth(1).as_deref() {
+        Some("ptt-toggle") => match send_push_to_talk_toggle() {
+            Ok(()) => Some(0),
+            Err(err) => {
+                eprintln!("aura-cli: {err}");
+                Some(1)
+            }
+        },
         Some("-v" | "-V" | "--version") => {
             println!("aura-cli {}", env!("CARGO_PKG_VERSION"));
             Some(0)
@@ -102,19 +149,25 @@ fn handle_cli_flags() -> Option<i32> {
                  Give the connection string via the AURA_CONNECT env var, or run with no\n\
                  arguments and paste it on the first line of stdin. The single-use secret is\n\
                  never taken from the command line.\n\n\
+                 Commands:\n  \
+                 aura-cli              start a call from AURA_CONNECT/stdin\n  \
+                 aura-cli ptt-toggle   Linux: toggle the active push_to_talk call\n\n\
                  Options:\n  \
                  -V, --version   print the version and exit\n  \
                  -h, --help      show this help and exit\n\n\
                  Environment:\n  \
                  AURA_CONNECT    the connection string — either form:\n                  \
-                 direct: aura://HOST:PORT#k=...&c=...\n                  \
-                 iroh:   aura://<node-id>#k=...&c=...&t=iroh (server behind NAT)\n  \
+                 direct: aura://HOST:PORT#k=...&c=...&t=direct&m=voice\n                  \
+                 iroh:   aura://<node-id>#k=...&c=...&t=iroh&m=ptt (server behind NAT)\n  \
                  AURA_AEC        echo handling on the mic: on (default, AEC3 echo\n                  \
                  cancellation — speakers + barge-in work), gate (mute mic while\n                  \
                  the model speaks; no barge-in), off (raw mic; headsets only)\n  \
                  AURA_INPUT_MODE voice (default) or push_to_talk\n  \
                  AURA_PUSH_TO_TALK_HOTKEY Windows global toggle hotkey\n                  \
                  for push_to_talk mode (default ctrl+space)\n  \
+                 AURA_PUSH_TO_TALK_CONTROL_PATH Linux socket path used by\n                  \
+                 `aura-cli ptt-toggle` (default: $XDG_RUNTIME_DIR/aura-ptt.sock,\n                  \
+                 then the OS temp dir)\n  \
                  AURA_PUSH_TO_TALK_MAX_RECORDING_MS max push_to_talk open-mic time\n                  \
                  in milliseconds (default 300000, about 5 minutes)",
                 env!("CARGO_PKG_VERSION")
@@ -189,6 +242,7 @@ fn resolve_input_mode(
 ) -> Result<TunnelInputMode, Box<dyn std::error::Error>> {
     let local_mode = InputMode::local_mode_from_env()?;
     if let Some(mode) = connection_mode {
+        reject_unsupported_input_mode(mode)?;
         if mode != local_mode {
             eprintln!("aura: connection string input mode wins over local AURA_INPUT_MODE.");
         }
@@ -198,11 +252,23 @@ fn resolve_input_mode(
     }
 }
 
+fn reject_unsupported_input_mode(mode: TunnelInputMode) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(not(any(windows, target_os = "linux")))]
+    if mode == TunnelInputMode::PushToTalk {
+        return Err(
+            "connection string requests push_to_talk, but aura-cli supports push_to_talk only on Windows and Linux"
+                .into(),
+        );
+    }
+    let _ = mode;
+    Ok(())
+}
+
 /// One audio-tunnel surface regardless of transport (direct Noise/UDP or iroh).
 #[allow(async_fn_in_trait)]
 trait VoiceTunnel {
     fn send_pcm24(&self, pcm: &[i16]);
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     fn send_control(&self, control: TunnelControl);
     async fn recv_pcm24(&mut self) -> Option<Vec<i16>>;
 }
@@ -211,7 +277,7 @@ impl VoiceTunnel for TunnelEndpoint {
     fn send_pcm24(&self, pcm: &[i16]) {
         TunnelEndpoint::send_pcm24(self, pcm);
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     fn send_control(&self, control: TunnelControl) {
         TunnelEndpoint::send_control(self, control);
     }
@@ -224,7 +290,7 @@ impl VoiceTunnel for IrohEndpoint {
     fn send_pcm24(&self, pcm: &[i16]) {
         IrohEndpoint::send_pcm24(self, pcm);
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     fn send_control(&self, control: TunnelControl) {
         IrohEndpoint::send_control(self, control);
     }
@@ -243,20 +309,20 @@ async fn pump<T: VoiceTunnel>(
     eprintln!("aura: tunnel up. Acquiring microphone and speaker…");
     let mut audio = CpalTransport::start(AudioSettings::default())?;
     let input_mode = InputMode::from_mode(tunnel_input_mode)?;
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     let mut ptt_recording = false;
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     let mut ptt_seen_presses = match &input_mode {
         InputMode::Voice => 0,
         InputMode::TogglePushToTalk(gate) => gate.press_count(),
     };
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     let mut ptt_frames_open = 0usize;
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     let ptt_max_frames = push_to_talk_max_recording_frames()?;
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     let mut ptt_warned_near_limit = false;
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     if let InputMode::TogglePushToTalk(gate) = &input_mode {
         eprintln!(
             "aura: push-to-talk is enabled. Press {} to start talking, then press {} again to send.",
@@ -269,7 +335,7 @@ async fn pump<T: VoiceTunnel>(
             mic = audio.recv_pcm24() => match mic {
                 Some(frame) => match &input_mode {
                     InputMode::Voice => tunnel.send_pcm24(&frame),
-                    #[cfg(windows)]
+                    #[cfg(any(windows, target_os = "linux"))]
                     InputMode::TogglePushToTalk(gate) => {
                         let presses = gate.press_count();
                         if presses != ptt_seen_presses {
@@ -365,16 +431,16 @@ async fn pump<T: VoiceTunnel>(
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const DEFAULT_PUSH_TO_TALK_MAX_RECORDING_MS: u64 = 300_000;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const PUSH_TO_TALK_FRAME_MS: u64 = 20;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const PUSH_TO_TALK_LIMIT_WARNING_MS: u64 = 3_000;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const PUSH_TO_TALK_MIN_RECORDING_FRAMES: usize = 10;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PttBatchAction {
     None,
@@ -391,7 +457,7 @@ enum PttBatchAction {
     DiscardThenRestart,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn resolve_ptt_toggles(
     recording: bool,
     toggles: u64,
@@ -414,7 +480,7 @@ fn resolve_ptt_toggles(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn push_to_talk_max_recording_frames() -> Result<usize, Box<dyn std::error::Error>> {
     parse_push_to_talk_max_recording_ms(
         std::env::var("AURA_PUSH_TO_TALK_MAX_RECORDING_MS")
@@ -423,7 +489,7 @@ fn push_to_talk_max_recording_frames() -> Result<usize, Box<dyn std::error::Erro
     )
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn parse_push_to_talk_max_recording_ms(
     raw: Option<&str>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
@@ -443,21 +509,56 @@ fn parse_push_to_talk_max_recording_ms(
     recording_ms_to_frames(ms)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn recording_ms_to_frames(ms: u64) -> Result<usize, Box<dyn std::error::Error>> {
     let frames = ms.div_ceil(PUSH_TO_TALK_FRAME_MS);
     usize::try_from(frames).map_err(|_| "AURA_PUSH_TO_TALK_MAX_RECORDING_MS is too large".into())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn push_to_talk_limit_warning_frame(max_frames: usize) -> usize {
     let warning_frames = recording_ms_to_frames(PUSH_TO_TALK_LIMIT_WARNING_MS).unwrap_or(150);
     max_frames.saturating_sub(warning_frames).max(1)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn signal_push_to_talk_limit_warning() {
     eprint!("\x07");
+}
+
+#[cfg(target_os = "linux")]
+fn push_to_talk_control_path() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("AURA_PUSH_TO_TALK_CONTROL_PATH").filter(|s| !s.is_empty())
+    {
+        return std::path::PathBuf::from(path);
+    }
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|s| !s.is_empty()) {
+        return std::path::PathBuf::from(runtime_dir).join("aura-ptt.sock");
+    }
+    std::env::temp_dir().join("aura-ptt.sock")
+}
+
+#[cfg(target_os = "linux")]
+fn send_push_to_talk_toggle() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    let path = push_to_talk_control_path();
+    let mut stream = std::os::unix::net::UnixStream::connect(&path).map_err(|err| {
+        format!(
+            "failed to reach Linux push-to-talk control socket {}: {err}. Start an Aura call with AURA_INPUT_MODE=push_to_talk first.",
+            path.display()
+        )
+    })?;
+    stream.write_all(b"toggle\n")?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn send_push_to_talk_toggle() -> Result<(), Box<dyn std::error::Error>> {
+    Err(
+        "`aura-cli ptt-toggle` is supported only on Linux; Windows uses AURA_PUSH_TO_TALK_HOTKEY"
+            .into(),
+    )
 }
 
 /// Read the connection string from `AURA_CONNECT`, else one line from stdin.
@@ -490,9 +591,12 @@ fn ensure_mic_permission() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Minimal `.env` loader. Keep this in sync with `aura-server`: the client must
-/// see settings such as `AURA_INPUT_MODE=push_to_talk`, or server/client mode can
-/// split-brain.
+/// Minimal `.env` loader for client-side settings only.
+///
+/// Do not load `AURA_CONNECT` from cwd/global `.env`: the connection string is a
+/// live microphone routing secret and must come only from the real process env
+/// or stdin. A target repository must not be able to redirect `aura-cli` by
+/// planting `.env`.
 fn load_dotenv() {
     load_dotenv_file(std::path::Path::new(".env"));
     if let Some(dir) = global_config_dir() {
@@ -536,6 +640,9 @@ fn load_dotenv_file(path: &std::path::Path) {
             continue;
         };
         let key = key.trim();
+        if !is_cli_dotenv_key_allowed(key) {
+            continue;
+        }
         let mut value = value.trim();
         if value.len() >= 2
             && ((value.starts_with('"') && value.ends_with('"'))
@@ -552,6 +659,17 @@ fn load_dotenv_file(path: &std::path::Path) {
     }
 }
 
+fn is_cli_dotenv_key_allowed(key: &str) -> bool {
+    matches!(
+        key,
+        "AURA_AEC"
+            | "AURA_INPUT_MODE"
+            | "AURA_PUSH_TO_TALK_HOTKEY"
+            | "AURA_PUSH_TO_TALK_CONTROL_PATH"
+            | "AURA_PUSH_TO_TALK_MAX_RECORDING_MS"
+    )
+}
+
 fn expand_home(value: &str) -> String {
     let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
         return value.to_owned();
@@ -566,12 +684,27 @@ fn expand_home(value: &str) -> String {
     v
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
+mod cross_platform_tests {
+    use super::reject_unsupported_input_mode;
+    use aura_tunnel::TunnelInputMode;
+
+    #[test]
+    fn ptt_mode_is_rejected_only_where_unsupported() {
+        #[cfg(any(windows, target_os = "linux"))]
+        assert!(reject_unsupported_input_mode(TunnelInputMode::PushToTalk).is_ok());
+        #[cfg(not(any(windows, target_os = "linux")))]
+        assert!(reject_unsupported_input_mode(TunnelInputMode::PushToTalk).is_err());
+        assert!(reject_unsupported_input_mode(TunnelInputMode::Voice).is_ok());
+    }
+}
+
+#[cfg(all(test, any(windows, target_os = "linux")))]
 mod tests {
     use super::{
-        global_config_dir_from, parse_push_to_talk_max_recording_ms,
-        push_to_talk_limit_warning_frame, resolve_ptt_toggles, PttBatchAction,
-        DEFAULT_PUSH_TO_TALK_MAX_RECORDING_MS,
+        global_config_dir_from, is_cli_dotenv_key_allowed, load_dotenv_file,
+        parse_push_to_talk_max_recording_ms, push_to_talk_limit_warning_frame, resolve_ptt_toggles,
+        PttBatchAction, DEFAULT_PUSH_TO_TALK_MAX_RECORDING_MS,
     };
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -598,6 +731,46 @@ mod tests {
             global_config_dir_from(None, None, Some(OsString::from("/home/u"))),
             Some(PathBuf::from("/home/u/.config/aura"))
         );
+    }
+
+    #[test]
+    fn cli_dotenv_allowlist_blocks_connection_string() {
+        assert!(is_cli_dotenv_key_allowed("AURA_INPUT_MODE"));
+        assert!(is_cli_dotenv_key_allowed("AURA_PUSH_TO_TALK_HOTKEY"));
+        assert!(is_cli_dotenv_key_allowed(
+            "AURA_PUSH_TO_TALK_MAX_RECORDING_MS"
+        ));
+        assert!(is_cli_dotenv_key_allowed("AURA_AEC"));
+        assert!(!is_cli_dotenv_key_allowed("AURA_CONNECT"));
+        assert!(!is_cli_dotenv_key_allowed("XAI_API_KEY"));
+        assert!(!is_cli_dotenv_key_allowed("OPENAI_API_KEY"));
+        assert!(!is_cli_dotenv_key_allowed("AURA_REALTIME_URL"));
+    }
+
+    #[test]
+    fn cli_dotenv_ignores_aura_connect_from_file() {
+        unsafe {
+            std::env::remove_var("AURA_CONNECT");
+            std::env::remove_var("AURA_INPUT_MODE");
+        }
+        let tmp = std::env::temp_dir().join(format!("aura-cli-dotenv-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir(&tmp).unwrap();
+        let env_file = tmp.join(".env");
+        std::fs::write(
+            &env_file,
+            "AURA_CONNECT=aura://attacker.invalid#k=bad&c=call-bad\nAURA_INPUT_MODE=push_to_talk\n",
+        )
+        .unwrap();
+
+        load_dotenv_file(&env_file);
+
+        assert!(std::env::var_os("AURA_CONNECT").is_none());
+        assert_eq!(std::env::var("AURA_INPUT_MODE").unwrap(), "push_to_talk");
+        unsafe {
+            std::env::remove_var("AURA_INPUT_MODE");
+        }
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
