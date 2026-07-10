@@ -71,6 +71,9 @@ fn reject_symlink_components(path: &Path) -> Result<(), String> {
         current.push(component.as_os_str());
         match fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
+                if is_trusted_macos_root_alias(&current) {
+                    continue;
+                }
                 return Err(format!(
                     "refusing state path with symlink component {}",
                     current.display()
@@ -87,6 +90,31 @@ fn reject_symlink_components(path: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// macOS intentionally exposes `/var` and `/tmp` as root-owned aliases into
+/// `/private`. Temporary directories therefore begin with a symlink even
+/// though no project or unprivileged user controls that component. Keep the
+/// exception exact: nested links and aliases to any other target remain
+/// rejected.
+#[cfg(target_os = "macos")]
+fn is_trusted_macos_root_alias(path: &Path) -> bool {
+    let expected_target = if path == Path::new("/var") {
+        Path::new("private/var")
+    } else if path == Path::new("/tmp") {
+        Path::new("private/tmp")
+    } else {
+        return false;
+    };
+
+    fs::read_link(path)
+        .map(|target| target == expected_target || target == Path::new("/").join(expected_target))
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_trusted_macos_root_alias(_path: &Path) -> bool {
+    false
 }
 
 /// Create `path` (recursively if needed) as a private 0o700 directory.
