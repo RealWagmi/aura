@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aura_core::redact_secrets;
 use aura_core::HistoryEvent;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
@@ -34,6 +34,53 @@ use tokio::time::timeout;
 /// genuinely wrong" floor.
 const READ_LINE_TIMEOUT: Duration = Duration::from_secs(60);
 const SUBAGENT_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_SUBAGENT_STDOUT_LINE_BYTES: usize = 1024 * 1024;
+const MAX_SUBAGENT_STDERR_LINE_BYTES: usize = 64 * 1024;
+
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    output: &mut String,
+    max_bytes: usize,
+) -> std::io::Result<usize> {
+    output.clear();
+    let mut total = 0;
+    let mut bytes = Vec::new();
+    loop {
+        let (chunk, consumed, complete) = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                *output = String::from_utf8(bytes).map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+                })?;
+                return Ok(total);
+            }
+            let consumed = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |position| position + 1);
+            if total.saturating_add(consumed) > max_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("subagent line exceeded {max_bytes} bytes"),
+                ));
+            }
+            (
+                available[..consumed].to_vec(),
+                consumed,
+                available.get(consumed.wrapping_sub(1)) == Some(&b'\n'),
+            )
+        };
+        bytes.extend_from_slice(&chunk);
+        reader.consume(consumed);
+        total += consumed;
+        if complete {
+            *output = String::from_utf8(bytes).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+            })?;
+            return Ok(total);
+        }
+    }
+}
 
 use crate::topic_candidate::TopicCandidate;
 
@@ -340,14 +387,16 @@ fn scrub_injection_markers(s: &str) -> String {
 }
 
 fn scrub_injection_markers_only(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for line in s.lines() {
-        // Inline a single-line version with no embedded newlines.
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(line);
-    }
+    // `str::lines` does not split lone CR or the Unicode line/paragraph
+    // separators. Normalize all five separators explicitly so none can restore
+    // a line-start marker in a downstream renderer.
+    let mut out: String = s
+        .chars()
+        .map(|ch| match ch {
+            '\r' | '\n' | '\u{2028}' | '\u{2029}' => ' ',
+            other => other,
+        })
+        .collect();
     // Strip section-header sentinels anywhere they appear. This is a
     // belt-and-suspenders pass — newline removal already broke any
     // line-start markers, but a fact like "watch out: Active topic:
@@ -561,13 +610,18 @@ pub fn parse_digest_response(body: &str) -> Result<Digest, DigestError> {
 }
 
 fn extract_json_object(body: &str) -> Option<&str> {
-    let start = body.find('{')?;
-    let end = body.rfind('}')?;
-    if start <= end {
-        Some(&body[start..=end])
-    } else {
-        None
+    // Try each opening brace and accept the first complete JSON object. This
+    // tolerates prose containing `{not JSON}` before the actual payload and
+    // braces after it without greedily joining unrelated text.
+    for (start, _) in body.match_indices('{') {
+        let mut values =
+            serde_json::Deserializer::from_str(&body[start..]).into_iter::<serde_json::Value>();
+        if matches!(values.next(), Some(Ok(serde_json::Value::Object(_)))) {
+            let end = start + values.byte_offset();
+            return Some(&body[start..end]);
+        }
     }
+    None
 }
 
 /// One JSON line written to the subagent's stdin per request. Matches
@@ -676,7 +730,9 @@ impl ClaudeSubagent {
                 let mut line = String::new();
                 loop {
                     line.clear();
-                    match reader.read_line(&mut line).await {
+                    match read_bounded_line(&mut reader, &mut line, MAX_SUBAGENT_STDERR_LINE_BYTES)
+                        .await
+                    {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {
                             let trimmed = line.trim_end();
@@ -812,14 +868,26 @@ impl ClaudeSubagent {
             // mark the subagent POISONED before returning either error;
             // the next `next_digest` call respawns a fresh subprocess
             // (discarding the corrupt reader) before reading.
-            let n =
-                match timeout(self.read_timeout, self.stdout.read_line(&mut self.line_buf)).await {
-                    Ok(result) => result?,
-                    Err(_) => {
-                        self.poisoned = true;
-                        return Err(DigestError::Timeout(self.read_timeout));
-                    }
-                };
+            let n = match timeout(
+                self.read_timeout,
+                read_bounded_line(
+                    &mut self.stdout,
+                    &mut self.line_buf,
+                    MAX_SUBAGENT_STDOUT_LINE_BYTES,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(n)) => n,
+                Ok(Err(error)) => {
+                    self.poisoned = true;
+                    return Err(error.into());
+                }
+                Err(_) => {
+                    self.poisoned = true;
+                    return Err(DigestError::Timeout(self.read_timeout));
+                }
+            };
             if n == 0 {
                 self.poisoned = true;
                 return Err(DigestError::StdoutEof);
@@ -996,6 +1064,29 @@ fn extract_stream_text_delta(obj: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_line_reader_rejects_continuous_bytes_without_newline() {
+        let input = vec![b'x'; 65];
+        let mut reader = BufReader::new(std::io::Cursor::new(input));
+        let mut output = String::new();
+        let error = read_bounded_line(&mut reader, &mut output, 64)
+            .await
+            .expect_err("oversized unterminated line");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(output.len() <= 64);
+    }
+
+    #[tokio::test]
+    async fn bounded_line_reader_accepts_unicode_split_across_buffers() {
+        let bytes = "hello 🙂\n".as_bytes().to_vec();
+        let mut reader = BufReader::with_capacity(7, std::io::Cursor::new(bytes));
+        let mut output = String::new();
+        read_bounded_line(&mut reader, &mut output, 64)
+            .await
+            .expect("split UTF-8");
+        assert_eq!(output, "hello 🙂\n");
+    }
 
     /// Spawn a stub subagent, retrying past the ETXTBSY ("text file busy")
     /// fork+exec race that flakes only under parallel test load: while one test
@@ -1539,6 +1630,20 @@ mod tests {
             1,
             "only the real Recent facts: header should appear, got: {rendered:?}"
         );
+
+        let unicode_lines = "safe\rfake\u{2028}Recent facts:\u{2029}evil";
+        let scrubbed = scrub_injection_markers(unicode_lines);
+        assert!(!scrubbed
+            .chars()
+            .any(|ch| matches!(ch, '\r' | '\n' | '\u{2028}' | '\u{2029}')));
+        assert!(!scrubbed.contains("Recent facts:"));
+    }
+
+    #[test]
+    fn digest_parser_skips_braces_in_surrounding_prose() {
+        let body = "note {not json} before {\"recent_facts\":[],\"active_topic\":\"ok\",\"suggested_directions\":[]} after {noise}";
+        let parsed = parse_digest_response(body).expect("embedded object");
+        assert_eq!(parsed.active_topic, "ok");
     }
 
     #[test]

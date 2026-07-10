@@ -1,10 +1,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use windows_sys::Win32::System::Console::GetConsoleWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL,
     VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
 #[derive(Debug)]
 pub struct PushToTalkWatcher {
@@ -44,8 +46,17 @@ const MOD_ALT: ModifierMask = 1 << 1;
 const MOD_SHIFT: ModifierMask = 1 << 2;
 const MOD_WIN: ModifierMask = 1 << 3;
 
-pub fn start_push_to_talk_watcher(raw: &str) -> Result<PushToTalkWatcher, String> {
+pub fn start_push_to_talk_watcher(
+    raw: &str,
+    allow_global: bool,
+) -> Result<PushToTalkWatcher, String> {
     let hotkey = parse_hotkey(raw)?;
+    if !allow_global && unsafe { GetConsoleWindow() }.is_null() {
+        return Err(
+            "focus-scoped push-to-talk needs a console window; set AURA_PUSH_TO_TALK_ALLOW_GLOBAL_HOTKEY=1 only if you explicitly accept a system-wide hotkey"
+                .to_owned(),
+        );
+    }
     let label = hotkey.label.clone();
     let presses = Arc::new(AtomicU64::new(0));
     let watcher_presses = Arc::clone(&presses);
@@ -53,7 +64,9 @@ pub fn start_push_to_talk_watcher(raw: &str) -> Result<PushToTalkWatcher, String
     std::thread::spawn(move || {
         let mut was_pressed = false;
         loop {
-            let pressed = hotkey.is_pressed_exact();
+            let in_scope =
+                allow_global || unsafe { GetForegroundWindow() } == unsafe { GetConsoleWindow() };
+            let pressed = in_scope && hotkey.is_pressed_exact();
             if pressed && !was_pressed {
                 watcher_presses.fetch_add(1, Ordering::AcqRel);
             }
@@ -77,6 +90,7 @@ fn parse_hotkey(raw: &str) -> Result<Hotkey, String> {
 
     let mut keys = Vec::with_capacity(parts.len());
     let mut modifiers = 0;
+    let mut has_action_key = false;
     let mut labels = Vec::with_capacity(parts.len());
     for part in parts {
         let (key, label, modifier) = parse_key(part)?;
@@ -86,16 +100,14 @@ fn parse_hotkey(raw: &str) -> Result<Hotkey, String> {
         }
         if let Some(modifier) = modifier {
             modifiers |= modifier;
+        } else {
+            has_action_key = true;
         }
     }
 
-    if modifiers == 0
-        && labels
-            .iter()
-            .any(|label| label.len() == 1 && label.as_bytes()[0].is_ascii_alphanumeric())
-    {
+    if modifiers == 0 || !has_action_key {
         return Err(
-            "AURA_PUSH_TO_TALK_HOTKEY must use a modifier with letter or number keys (for example ctrl+space or alt+a)"
+            "AURA_PUSH_TO_TALK_HOTKEY must combine a modifier with an action key (for example ctrl+space or alt+a)"
                 .to_owned(),
         );
     }
@@ -257,6 +269,9 @@ mod tests {
     fn rejects_modifier_free_letters_and_numbers() {
         assert!(parse_hotkey("a").is_err());
         assert!(parse_hotkey("7").is_err());
+        assert!(parse_hotkey("space").is_err());
+        assert!(parse_hotkey("ctrl").is_err());
+        assert!(parse_hotkey("ctrl+shift").is_err());
         assert!(parse_hotkey("a+a").is_err());
     }
 }

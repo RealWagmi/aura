@@ -17,15 +17,31 @@ pub const FRAME_MS: u64 = 20;
 pub const MIN_DEPTH_FRAMES: usize = 2;
 /// Maximum buffered depth: 80 ms.
 pub const MAX_DEPTH_FRAMES: usize = 4;
+/// During initial prebuffering accept wider reordering than the steady jitter
+/// target. A reliable terminal control can arrive first while up to 300 ms of
+/// preceding audio is delayed; the 100 ms terminal fallback still bounds a
+/// truly lone control's latency.
+const INITIAL_REORDER_WINDOW_FRAMES: u64 = 16;
 
 /// Release an in-order control after this many 20 ms ticks even if no later
 /// sequence marker arrives. Normally the following authenticated keepalive
 /// satisfies prebuffering on the next tick; this is the loss fallback.
-const CONTROL_RELEASE_TICKS: usize = 5;
+const TERMINAL_RELEASE_TICKS: usize = 5;
+/// Sustained in-order transport positions needed before reducing an adapted
+/// target by one frame. Markers count: a quiet, healthy peer must recover from
+/// a transient loss without waiting for another audio burst.
+const TARGET_DECAY_RELEASES: usize = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushResult {
+    Accepted,
+    Duplicate,
+    TooLate,
+}
 
 struct Entry {
     payload: Vec<u8>,
-    is_control: bool,
+    is_terminal_control: bool,
 }
 
 /// RFC 1982 serial comparison for full-width transport sequence numbers: is `a` strictly
@@ -51,8 +67,11 @@ pub struct JitterBuffer {
     /// `LOSS_SKIP_TICKS` the gap is declared lost and skipped, so a tail-of-
     /// spurt loss can't strand the trailing frames forever.
     stuck: usize,
-    /// Ticks an in-order control has waited alone during prebuffering.
-    control_wait: usize,
+    /// Ticks a contiguous terminal burst (audio followed by a control) has
+    /// waited below the adaptive target during prebuffering.
+    terminal_wait: usize,
+    /// In-order positions released since the last gap skip/target decrease.
+    stable_releases: usize,
 }
 
 /// Ticks (×20 ms) to wait on a gap with later frames buffered before declaring
@@ -80,7 +99,8 @@ impl JitterBuffer {
             target: MIN_DEPTH_FRAMES,
             playing: false,
             stuck: 0,
-            control_wait: 0,
+            terminal_wait: 0,
+            stable_releases: 0,
         }
     }
 
@@ -110,29 +130,50 @@ impl JitterBuffer {
     /// dropped as too-late. The first packet establishes the release baseline;
     /// a huge forward jump (sender was idle, e.g. a gated push-to-talk mic)
     /// re-establishes it instead of walking thousands of phantom losses.
-    pub fn push(&mut self, seq: u64, payload: Vec<u8>) {
-        self.push_entry(seq, payload, false);
+    pub fn push(&mut self, seq: u64, payload: Vec<u8>) -> PushResult {
+        self.push_entry(seq, payload, false)
     }
 
     /// Insert an ordered control frame. Controls share the audio sequence but
     /// may use the bounded lone-control fallback while prebuffering.
-    pub fn push_control(&mut self, seq: u64, payload: Vec<u8>) {
-        self.push_entry(seq, payload, true);
+    pub fn push_control(&mut self, seq: u64, payload: Vec<u8>, is_terminal: bool) -> PushResult {
+        self.push_entry(seq, payload, is_terminal)
     }
 
     /// Record an authenticated transport sequence position that carries no
     /// application payload (keepalive or internal ACK).
-    pub fn push_marker(&mut self, seq: u64) {
-        self.push_entry(seq, Vec::new(), false);
+    pub fn push_marker(&mut self, seq: u64) -> PushResult {
+        self.push_entry(seq, Vec::new(), false)
     }
 
-    fn push_entry(&mut self, seq: u64, payload: Vec<u8>, is_control: bool) {
+    /// Drop buffered application data through an authenticated sequence
+    /// position while the consumer is blocked on a reliable control. This is
+    /// the explicit backpressure policy: later audio is lossy, later controls
+    /// retry because they are not ACKed, and memory remains constant while
+    /// decrypt/replay/liveness processing continues.
+    pub fn discard_through(&mut self, seq: u64) {
+        if self
+            .next_pop
+            .is_some_and(|np| seq != np && !seq_after(seq, np))
+        {
+            return;
+        }
+        self.entries.clear();
+        self.next_pop = Some(seq.wrapping_add(1));
+        self.highest = Some(seq);
+        self.playing = false;
+        self.stuck = 0;
+        self.terminal_wait = 0;
+        self.stable_releases = 0;
+    }
+
+    fn push_entry(&mut self, seq: u64, payload: Vec<u8>, is_terminal_control: bool) -> PushResult {
         match self.next_pop {
             None => self.next_pop = Some(seq),
             Some(np)
                 if !self.playing
                     && seq_after(np, seq)
-                    && np.wrapping_sub(seq) <= MAX_DEPTH_FRAMES as u64 =>
+                    && np.wrapping_sub(seq) <= INITIAL_REORDER_WINDOW_FRAMES =>
             {
                 // The first arrival is not necessarily the first packet. Move
                 // the baseline back while pre-buffering so an initially
@@ -148,10 +189,14 @@ impl JitterBuffer {
                 self.highest = None;
                 self.playing = false;
                 self.stuck = 0;
-                self.control_wait = 0;
+                self.terminal_wait = 0;
+                self.stable_releases = 0;
             }
-            Some(np) if seq != np && !seq_after(seq, np) => return, // too late
+            Some(np) if seq != np && !seq_after(seq, np) => return PushResult::TooLate,
             _ => {}
+        }
+        if self.entries.contains_key(&seq) {
+            return PushResult::Duplicate;
         }
         match self.highest {
             None => self.highest = Some(seq),
@@ -162,9 +207,38 @@ impl JitterBuffer {
             seq,
             Entry {
                 payload,
-                is_control,
+                is_terminal_control,
             },
         );
+        PushResult::Accepted
+    }
+
+    /// True when every position from `next_pop` through `highest` is present
+    /// and the burst contains a terminal control. Releasing this burst after a
+    /// bounded wait cannot overtake earlier audio: it starts at `next_pop` and
+    /// has no holes. This handles adapted targets of 3/4 when the ACK or the
+    /// following keepalive marker is lost.
+    fn has_contiguous_terminal_burst(&self) -> bool {
+        let (Some(mut seq), Some(highest)) = (self.next_pop, self.highest) else {
+            return false;
+        };
+        loop {
+            let Some(entry) = self.entries.get(&seq) else {
+                return false;
+            };
+            if seq == highest {
+                return entry.is_terminal_control;
+            }
+            seq = seq.wrapping_add(1);
+        }
+    }
+
+    fn note_stable_release(&mut self) {
+        self.stable_releases += 1;
+        if self.target > MIN_DEPTH_FRAMES && self.stable_releases >= TARGET_DECAY_RELEASES {
+            self.target -= 1;
+            self.stable_releases = 0;
+        }
     }
 
     /// Release the next in-order frame, or `None` to keep waiting. Waits until
@@ -173,22 +247,21 @@ impl JitterBuffer {
     /// target up (adaptation).
     pub fn pop(&mut self) -> Option<Vec<u8>> {
         if !self.playing {
-            let np = self.next_pop?;
+            self.next_pop?;
             // Pre-buffer: wait until the initial target depth is reached.
             if self.span() < self.target {
-                let lone_control = self.entries.get(&np).is_some_and(|entry| entry.is_control);
-                if lone_control {
-                    self.control_wait += 1;
-                    if self.control_wait < CONTROL_RELEASE_TICKS {
+                if self.has_contiguous_terminal_burst() {
+                    self.terminal_wait += 1;
+                    if self.terminal_wait < TERMINAL_RELEASE_TICKS {
                         return None;
                     }
                 } else {
-                    self.control_wait = 0;
+                    self.terminal_wait = 0;
                     return None;
                 }
             }
             self.playing = true;
-            self.control_wait = 0;
+            self.terminal_wait = 0;
         }
         // Iterative (a skip re-examines the NEXT slot; a long run of losses
         // must not grow the stack).
@@ -197,6 +270,7 @@ impl JitterBuffer {
             if let Some(entry) = self.entries.remove(&np) {
                 self.next_pop = Some(np.wrapping_add(1));
                 self.stuck = 0;
+                self.note_stable_release();
                 return Some(entry.payload);
             }
             // Missing packet at `np`. Are later frames already buffered behind it?
@@ -210,6 +284,7 @@ impl JitterBuffer {
                 self.target = (self.target + 1).min(MAX_DEPTH_FRAMES);
                 self.next_pop = Some(np.wrapping_add(1));
                 self.stuck = 0;
+                self.stable_releases = 0;
                 continue;
             }
             if have_later {
@@ -220,7 +295,7 @@ impl JitterBuffer {
             // True underrun: nothing buffered ahead; re-buffer to the target.
             self.playing = false;
             self.stuck = 0;
-            self.control_wait = 0;
+            self.terminal_wait = 0;
             return None;
         }
     }
@@ -359,7 +434,7 @@ mod tests {
     #[test]
     fn marker_advances_sequence_without_application_payload() {
         let mut jb = JitterBuffer::new();
-        jb.push_control(10, pkt(7));
+        jb.push_control(10, pkt(7), true);
         assert!(jb.pop().is_none());
         jb.push_marker(11);
         assert_eq!(jb.pop(), Some(pkt(7)));
@@ -369,10 +444,81 @@ mod tests {
     #[test]
     fn lone_control_releases_after_bounded_wait() {
         let mut jb = JitterBuffer::new();
-        jb.push_control(20, pkt(9));
-        for _ in 1..CONTROL_RELEASE_TICKS {
+        jb.push_control(20, pkt(9), true);
+        for _ in 1..TERMINAL_RELEASE_TICKS {
             assert!(jb.pop().is_none());
         }
+        assert_eq!(jb.pop(), Some(pkt(9)));
+    }
+
+    #[test]
+    fn adapted_target_does_not_strand_audio_followed_by_control() {
+        let mut jb = JitterBuffer::new();
+        jb.target = MAX_DEPTH_FRAMES;
+        jb.push(40, pkt(1));
+        jb.push_control(41, pkt(9), true);
+        for _ in 1..TERMINAL_RELEASE_TICKS {
+            assert!(jb.pop().is_none());
+        }
+        assert_eq!(jb.pop(), Some(pkt(1)));
+        assert_eq!(jb.pop(), Some(pkt(9)));
+    }
+
+    #[test]
+    fn marker_only_health_decays_adapted_target() {
+        let mut jb = JitterBuffer::new();
+        jb.target = MAX_DEPTH_FRAMES;
+        for seq in 0..(TARGET_DECAY_RELEASES as u64 + MAX_DEPTH_FRAMES as u64) {
+            jb.push_marker(seq);
+            let _ = jb.pop();
+        }
+        while jb.pop().is_some() {}
+        assert!(jb.target_frames() < MAX_DEPTH_FRAMES);
+    }
+
+    #[test]
+    fn push_control_reports_acceptance_before_ack_is_safe() {
+        let mut jb = JitterBuffer::new();
+        assert_eq!(jb.push_control(5, pkt(1), true), PushResult::Accepted);
+        assert_eq!(jb.push_control(5, pkt(1), true), PushResult::Duplicate);
+        jb.push_marker(6);
+        assert_eq!(jb.pop(), Some(pkt(1)));
+        assert_eq!(jb.push_control(5, pkt(1), true), PushResult::TooLate);
+    }
+
+    #[test]
+    fn control_first_reordering_beyond_four_frames_preserves_audio_order() {
+        let mut jb = JitterBuffer::new();
+        jb.push_control(10, pkt(10), true);
+        for seq in 5..10 {
+            jb.push(seq, pkt(seq as u8));
+        }
+        for expected in 5..=10 {
+            assert_eq!(jb.pop(), Some(pkt(expected as u8)));
+        }
+    }
+
+    #[test]
+    fn ptt_open_does_not_trigger_terminal_short_burst_release() {
+        let mut jb = JitterBuffer::new();
+        jb.target = MAX_DEPTH_FRAMES;
+        jb.push_control(10, pkt(1), false);
+        jb.push(11, pkt(2));
+        for _ in 0..(TERMINAL_RELEASE_TICKS + 2) {
+            assert!(jb.pop().is_none());
+        }
+    }
+
+    #[test]
+    fn discard_through_keeps_backpressure_memory_constant() {
+        let mut jb = JitterBuffer::new();
+        for seq in 0..10_000 {
+            jb.push(seq, pkt(1));
+            jb.discard_through(seq);
+            assert_eq!(jb.buffered(), 0);
+        }
+        jb.push(10_000, pkt(9));
+        jb.push_marker(10_001);
         assert_eq!(jb.pop(), Some(pkt(9)));
     }
 }

@@ -57,8 +57,36 @@ const O_NOFOLLOW_FLAG: i32 = 0;
 /// leave the mode untouched — same "respect user-managed dirs" policy
 /// as before.
 pub(crate) fn secure_dir(path: &Path) -> Result<(), String> {
+    reject_symlink_components(path)?;
     create_private_dir(path)
         .map_err(|err| format!("failed to create private dir {}: {err}", path.display()))
+}
+
+/// Refuse any existing symlink in a directory path, not only the final leaf.
+/// This prevents an `AURA_STATE_DIR` such as `repo/link/outside` from routing
+/// otherwise-private state writes through an intermediate link.
+fn reject_symlink_components(path: &Path) -> Result<(), String> {
+    let mut current = std::path::PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing state path with symlink component {}",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect state path component {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Create `path` (recursively if needed) as a private 0o700 directory.
@@ -232,6 +260,7 @@ pub(crate) fn reject_symlink_for_write(path: &Path) -> Result<(), String> {
 /// empty (e.g. `history.jsonl` with cwd-relative path) — same policy
 /// as the original `save_default_config` site, now applied uniformly.
 fn prepare_private_write_target(path: &Path) -> Result<(), String> {
+    reject_symlink_components(path)?;
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         secure_dir(parent)?;
     }
@@ -281,6 +310,20 @@ pub fn append_private_jsonl_line<T: serde::Serialize>(
     label: &str,
 ) -> Result<(), String> {
     append_jsonl_line(path, record, label)
+}
+
+/// Create or replace a private state file with exact contents.
+pub fn write_private_contents(path: &Path, contents: &[u8], label: &str) -> Result<(), String> {
+    prepare_private_write_target(path)?;
+    let mut opts = OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    let mut file = open_private(path, opts).map_err(|error| format!("{label}: {error}"))?;
+    file.write_all(contents)
+        .map_err(|error| format!("failed to write {label} to {}: {error}", path.display()))?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("failed to set private permissions on open {label}: {error}"))?;
+    Ok(())
 }
 
 /// Truncate-or-create + write a single payload, matching Site 3's
@@ -420,11 +463,27 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let err = secure_dir(&link).expect_err("must reject symlink");
         assert!(
-            err.contains("not a real directory"),
-            "error must mention not a real directory, got {err:?}"
+            err.contains("symlink component"),
+            "error must identify the symlink component, got {err:?}"
         );
         let _ = fs::remove_file(&link);
         let _ = fs::remove_dir_all(&target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_dir_rejects_intermediate_symlink() {
+        let root = unique_dir("aura-secure-dir-intermediate-link");
+        let outside = unique_dir("aura-secure-dir-outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+
+        let result = secure_dir(&root.join("link/nested"));
+        assert!(result.is_err());
+        assert!(!outside.join("nested").exists());
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
     }
 
     #[cfg(unix)]

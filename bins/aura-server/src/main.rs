@@ -78,9 +78,25 @@ const INSTRUCTION_BUDGET_TOKENS: u32 = 6_000;
 /// via `AURA_BIND`.
 const DEFAULT_PORT: u16 = 47821;
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // `.env` loading mutates the process environment, so complete it before
+    // Tokio creates worker threads that may concurrently read environment.
+    load_dotenv();
     let args: Vec<String> = std::env::args().collect();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("aura-server: failed to start async runtime: {err}");
+            std::process::exit(1);
+        }
+    };
+    runtime.block_on(async_main(args));
+}
+
+async fn async_main(args: Vec<String>) {
     match args.get(1).map(String::as_str) {
         // `--version` / `--help` must be handled BEFORE any call setup, so an
         // unrecognized flag never silently boots a call server.
@@ -211,7 +227,6 @@ fn choose_provider(
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    load_dotenv();
     // Pick the voice provider and fail fast if its BYOK key is absent (before
     // binding / minting). Explicit AURA_VOICE_PROVIDER wins; otherwise
     // auto-detect by which key resolves (env or OS keychain), xAI first.
@@ -333,7 +348,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("aura-server: iroh transport; endpoint {endpoint_id}; call {call_id}.");
         eprintln!("aura-server: GIVE THE CALLER THIS CONNECTION STRING (single-use, valid ~120s):");
         eprintln!("    AURA_CONNECT='{conn}' aura-cli");
-        let endpoint = server.accept(&secret, TunnelConfig::default()).await?;
+        let endpoint = server
+            .accept(
+                &secret,
+                TunnelConfig {
+                    input_mode: Some(input_mode),
+                    ..TunnelConfig::default()
+                },
+            )
+            .await?;
         eprintln!("aura-server: client connected; bridging to the model.");
         Box::new(IrohTransport::new(endpoint))
     } else {
@@ -381,7 +404,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         eprintln!("aura-server: GIVE THE CALLER THIS CONNECTION STRING (single-use, valid ~120s):");
         eprintln!("    AURA_CONNECT='{conn}' aura-cli");
-        let endpoint = server.accept(&secret, TunnelConfig::default()).await?;
+        let endpoint = server
+            .accept(
+                &secret,
+                TunnelConfig {
+                    input_mode: Some(input_mode),
+                    ..TunnelConfig::default()
+                },
+            )
+            .await?;
         eprintln!("aura-server: client connected; bridging to the model.");
         Box::new(TunnelTransport::new(endpoint))
     };
@@ -444,10 +475,8 @@ async fn run_inbox_cli(args: &[String]) -> i32 {
             return 2;
         }
     }
-    // Load .env (cwd, then the global ~/.config/aura/.env) BEFORE resolving the
-    // state root: AURA_STATE_DIR persisted at onboarding must bind the CLI to
-    // the same inbox as the server, regardless of each process's cwd.
-    load_dotenv();
+    // The sync process entrypoint loaded `.env` before Tokio started, so state
+    // resolution is deterministic and environment access is race-free.
     let inbox = match Inbox::open(&state_root()) {
         Ok(inbox) => inbox,
         Err(e) => {
@@ -952,8 +981,11 @@ fn write_status(state: &str, call_id: &str, reason: Option<&str>) {
     let root = state_root();
     let _ = ensure_aura_excluded(&root);
     let dir = root.join(".aura");
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(dir.join("call-status.json"), body);
+    let _ = aura_core::write_private_contents(
+        &dir.join("call-status.json"),
+        body.as_bytes(),
+        "call status",
+    );
 }
 
 fn ensure_aura_excluded(root: &std::path::Path) -> std::io::Result<()> {
@@ -962,7 +994,21 @@ fn ensure_aura_excluded(root: &std::path::Path) -> std::io::Result<()> {
     };
     let info = git_dir.join("info");
     std::fs::create_dir_all(&info)?;
+    let canonical_git_dir = std::fs::canonicalize(&git_dir)?;
+    let canonical_info = std::fs::canonicalize(&info)?;
+    if !canonical_info.starts_with(&canonical_git_dir) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing git info directory outside authenticated git metadata",
+        ));
+    }
     let exclude = info.join("exclude");
+    if std::fs::symlink_metadata(&exclude).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing symlinked git info/exclude",
+        ));
+    }
     let existing = match std::fs::read_to_string(&exclude) {
         Ok(body) => body,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -971,10 +1017,17 @@ fn ensure_aura_excluded(root: &std::path::Path) -> std::io::Result<()> {
     if existing.lines().map(str::trim).any(is_aura_exclude_entry) {
         return Ok(());
     }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&exclude)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(target_os = "linux")]
+        options.custom_flags(0o400000);
+        #[cfg(target_os = "macos")]
+        options.custom_flags(0x0000_0100);
+    }
+    let mut file = options.open(&exclude)?;
     use std::io::Write;
     if !existing.is_empty() && !existing.ends_with('\n') {
         writeln!(file)?;
@@ -995,10 +1048,14 @@ fn nearest_git_dir(root: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut cursor = Some(root);
     while let Some(path) = cursor {
         let git = path.join(".git");
-        if git.is_dir() {
-            return Some(git);
+        let metadata = std::fs::symlink_metadata(&git).ok();
+        if metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.file_type().is_dir())
+        {
+            return std::fs::canonicalize(git).ok();
         }
-        if git.is_file() {
+        if metadata.is_some_and(|metadata| metadata.file_type().is_file()) {
             // Linked `git worktree` or submodule checkout: `.git` is a
             // pointer file ("gitdir: <path>"). Resolve it so those checkouts
             // get the same `.aura/` exclusion as a primary checkout.
@@ -1030,7 +1087,32 @@ fn resolve_gitdir_pointer(
     } else {
         worktree.join(target)
     };
-    if !git_dir.is_dir() {
+    let git_dir = std::fs::canonicalize(git_dir).ok()?;
+    let worktree = std::fs::canonicalize(worktree).ok()?;
+    let git_file = std::fs::canonicalize(git_file).ok()?;
+
+    // A pointer is trusted only when it is either beneath an ancestor's
+    // `.git` directory (submodule layout), or its linked-worktree metadata
+    // points back to this exact `.git` file. Merely naming an arbitrary
+    // existing directory must never authorize appending to its info/exclude.
+    let under_ancestor_git = worktree
+        .ancestors()
+        .map(|ancestor| ancestor.join(".git"))
+        .filter_map(|candidate| std::fs::canonicalize(candidate).ok())
+        .any(|candidate| git_dir.starts_with(candidate));
+    let backlink_matches = std::fs::read_to_string(git_dir.join("gitdir"))
+        .ok()
+        .map(|backlink| std::path::PathBuf::from(backlink.trim()))
+        .map(|backlink| {
+            if backlink.is_absolute() {
+                backlink
+            } else {
+                git_dir.join(backlink)
+            }
+        })
+        .and_then(|backlink| std::fs::canonicalize(backlink).ok())
+        .is_some_and(|backlink| backlink == git_file);
+    if !under_ancestor_git && !backlink_matches {
         return None;
     }
     if let Ok(common) = std::fs::read_to_string(git_dir.join("commondir")) {
@@ -1042,8 +1124,13 @@ fn resolve_gitdir_pointer(
             } else {
                 git_dir.join(common_path)
             };
-            if common_dir.is_dir() {
-                return Some(common_dir);
+            if let Ok(common_dir) = std::fs::canonicalize(common_dir) {
+                // A real linked-worktree commondir is an ancestor of its
+                // `.git/worktrees/<name>` directory. Reject traversal to an
+                // unrelated repository or filesystem location.
+                if git_dir.starts_with(&common_dir) {
+                    return Some(common_dir);
+                }
             }
         }
     }
@@ -1483,6 +1570,11 @@ mod tests {
             format!("gitdir: {}\n", wt_gitdir.display()),
         )
         .unwrap();
+        std::fs::write(
+            wt_gitdir.join("gitdir"),
+            worktree.join(".git").display().to_string(),
+        )
+        .unwrap();
 
         ensure_aura_excluded(&worktree).unwrap();
 
@@ -1517,6 +1609,63 @@ mod tests {
 
         assert!(!tmp.path().join(".git/info/exclude").exists());
         assert!(!tmp.path().join("../real.git").exists());
+    }
+
+    #[test]
+    fn aura_exclude_refuses_pointer_to_unrelated_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("checkout");
+        let unrelated = tmp.path().join("unrelated");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(unrelated.join("info")).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", unrelated.display()),
+        )
+        .unwrap();
+
+        ensure_aura_excluded(&worktree).unwrap();
+        assert!(!unrelated.join("info/exclude").exists());
+    }
+
+    #[test]
+    fn aura_exclude_refuses_commondir_traversal_outside_git_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main_git = tmp.path().join("main/.git");
+        let wt_gitdir = main_git.join("worktrees/feature");
+        let unrelated = tmp.path().join("unrelated");
+        std::fs::create_dir_all(&wt_gitdir).unwrap();
+        std::fs::create_dir_all(&unrelated).unwrap();
+        let worktree = tmp.path().join("checkout");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", wt_gitdir.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            wt_gitdir.join("gitdir"),
+            worktree.join(".git").display().to_string(),
+        )
+        .unwrap();
+        std::fs::write(wt_gitdir.join("commondir"), unrelated.display().to_string()).unwrap();
+
+        ensure_aura_excluded(&worktree).unwrap();
+        assert!(!unrelated.join("info/exclude").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aura_exclude_refuses_symlinked_exclude_leaf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = tmp.path().join(".git/info");
+        let outside = tmp.path().join("outside.txt");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(&outside, "keep\n").unwrap();
+        std::os::unix::fs::symlink(&outside, info.join("exclude")).unwrap();
+
+        assert!(ensure_aura_excluded(tmp.path()).is_err());
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "keep\n");
     }
 
     #[test]

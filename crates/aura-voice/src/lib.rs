@@ -176,6 +176,12 @@ pub trait VoiceProvider: Send + Sync {
     fn default_voice(&self) -> &str;
     /// Advertised audio capabilities.
     fn audio_caps(&self) -> AudioCaps;
+    /// Whether [`Self::connect_with_manual_turn_detection`] can guarantee
+    /// provider-side VAD is disabled. Existing providers default to false so
+    /// PTT fails closed instead of silently combining manual commits with VAD.
+    fn supports_manual_turn_detection(&self) -> bool {
+        false
+    }
     /// Host-pin the endpoint, open the WS with `Authorization: Bearer`,
     /// send `session.update` (+ optional cold-start) as ONE batched flush,
     /// and return the split sink/stream pair.
@@ -189,8 +195,13 @@ pub trait VoiceProvider: Send + Sync {
     async fn connect_with_manual_turn_detection(
         &self,
         cfg: &VoiceSessionConfig,
-        _manual_turn_detection: bool,
+        manual_turn_detection: bool,
     ) -> Result<(Box<dyn VoiceSink>, Box<dyn VoiceStream>), VoiceError> {
+        if manual_turn_detection {
+            return Err(VoiceError::Protocol(
+                "provider does not support manual turn detection".to_owned(),
+            ));
+        }
         self.connect(cfg).await
     }
 }
@@ -198,6 +209,13 @@ pub trait VoiceProvider: Send + Sync {
 /// The write half: owns the mic-pump (LOCAL) / inbound side (REMOTE).
 #[async_trait]
 pub trait VoiceSink: Send {
+    /// Whether this sink supports committing manual-turn audio without also
+    /// requesting a response. Existing third-party sinks default to the
+    /// legacy combined [`Self::commit_user_turn`] contract; built-in realtime
+    /// sinks opt into the split contract.
+    fn supports_split_manual_turn(&self) -> bool {
+        false
+    }
     /// Send a PCM16 mono LE @ 24k frame to the model. base64 framing is
     /// internal to the impl.
     async fn send_audio(&mut self, pcm16: &[i16]) -> Result<(), VoiceError>;
@@ -344,5 +362,86 @@ mod tests {
         assert_eq!(cfg.latency_target_ms, 800);
         assert!(!cfg.cold_start_kick);
         assert!(cfg.transcription_language.is_none());
+    }
+
+    struct LegacyCombinedSink {
+        requested: bool,
+    }
+
+    #[async_trait]
+    impl VoiceSink for LegacyCombinedSink {
+        async fn send_audio(&mut self, _pcm16: &[i16]) -> Result<(), VoiceError> {
+            Ok(())
+        }
+        async fn cancel_response(&mut self) -> Result<(), VoiceError> {
+            Ok(())
+        }
+        async fn send_tool_result(
+            &mut self,
+            _call_id: Option<&str>,
+            _output: serde_json::Value,
+        ) -> Result<(), VoiceError> {
+            Ok(())
+        }
+        async fn inject_system_context(&mut self, _text: &str) -> Result<(), VoiceError> {
+            Ok(())
+        }
+        async fn request_response(&mut self) -> Result<(), VoiceError> {
+            self.requested = true;
+            Ok(())
+        }
+        async fn close(&mut self) -> Result<(), VoiceError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_sink_keeps_combined_manual_turn_contract() {
+        let mut sink = LegacyCombinedSink { requested: false };
+        assert!(!sink.supports_split_manual_turn());
+        sink.commit_user_turn()
+            .await
+            .expect("legacy combined commit");
+        assert!(sink.requested);
+        assert!(sink.commit_user_audio().await.is_err());
+    }
+
+    struct LegacyVadProvider;
+
+    #[async_trait]
+    impl VoiceProvider for LegacyVadProvider {
+        fn model_id(&self) -> &str {
+            "legacy"
+        }
+        fn default_voice(&self) -> &str {
+            "legacy"
+        }
+        fn audio_caps(&self) -> AudioCaps {
+            AudioCaps {
+                server_vad: true,
+                input_sample_rate_hz: 24_000,
+                output_sample_rate_hz: 24_000,
+            }
+        }
+        async fn connect(
+            &self,
+            _cfg: &VoiceSessionConfig,
+        ) -> Result<(Box<dyn VoiceSink>, Box<dyn VoiceStream>), VoiceError> {
+            Err(VoiceError::ProviderUnavailable("test".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_provider_fails_closed_for_manual_turn_detection() {
+        let provider = LegacyVadProvider;
+        assert!(!provider.supports_manual_turn_detection());
+        let error = match provider
+            .connect_with_manual_turn_detection(&VoiceSessionConfig::default(), true)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("manual PTT must not silently retain server VAD"),
+        };
+        assert!(error.to_string().contains("manual turn detection"));
     }
 }

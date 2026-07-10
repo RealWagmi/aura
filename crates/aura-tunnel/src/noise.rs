@@ -15,11 +15,13 @@
 
 use snow::{HandshakeState, StatelessTransportState};
 
+use crate::wire::{encode_input_mode, TunnelInputMode};
+
 /// NNpsk0 with X25519 / ChaChaPoly / BLAKE2s.
 pub const NOISE_PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 /// Authenticated application-protocol marker carried in both Noise handshake
 /// messages. Incompatible transport framing must change this marker.
-pub const PROTOCOL_MARKER: &[u8] = b"aura/direct/1";
+pub const PROTOCOL_MARKER: &[u8] = b"aura/direct/2";
 /// AEAD tag length (ChaChaPoly) — transport ciphertext = plaintext + this.
 pub const TAG_LEN: usize = 16;
 /// Upper bound on a handshake message; NNpsk0 messages are well under this.
@@ -60,21 +62,35 @@ pub fn finalize(hs: HandshakeState) -> Result<Transport, NoiseError> {
 /// The fixed byte length of the NNpsk0 first handshake message (deterministic
 /// for the pattern). The server uses it to cheaply reject wrong-sized junk
 /// datagrams BEFORE building an RNG-seeded responder (anti-amplification).
-pub fn msg1_len() -> usize {
-    const FALLBACK: usize = 61; // e(32) + encrypted marker(13) + tags(16)
+pub fn msg1_len(payload: &[u8]) -> usize {
+    let fallback = 32 + payload.len() + TAG_LEN;
     match initiator(&[0u8; 32]) {
         Ok(mut hs) => {
             let mut buf = [0u8; MAX_HANDSHAKE_MSG];
-            hs.write_message(PROTOCOL_MARKER, &mut buf)
-                .unwrap_or(FALLBACK)
+            hs.write_message(payload, &mut buf).unwrap_or(fallback)
         }
-        Err(_) => FALLBACK,
+        Err(_) => fallback,
     }
 }
 
+/// Build the authenticated application payload. Binding the server-selected
+/// mode here prevents an edited connection-string fragment from silently
+/// switching a PTT client into VAD mode or vice versa.
+pub fn protocol_payload(mode: Option<TunnelInputMode>) -> Vec<u8> {
+    let mode = mode.map(encode_input_mode).unwrap_or("unspecified");
+    let mut out = Vec::with_capacity(PROTOCOL_MARKER.len() + 3 + mode.len());
+    out.extend_from_slice(PROTOCOL_MARKER);
+    out.extend_from_slice(b"|m=");
+    out.extend_from_slice(mode.as_bytes());
+    out
+}
+
 /// Verify the authenticated application payload from either handshake message.
-pub fn verify_protocol_marker(payload: &[u8]) -> Result<(), NoiseError> {
-    if payload == PROTOCOL_MARKER {
+pub fn verify_protocol_payload(
+    payload: &[u8],
+    expected_mode: Option<TunnelInputMode>,
+) -> Result<(), NoiseError> {
+    if payload == protocol_payload(expected_mode) {
         Ok(())
     } else {
         Err(NoiseError::ProtocolVersion)
@@ -116,12 +132,13 @@ mod tests {
         let mut res = responder(psk_r)?;
         let mut a = [0u8; MAX_HANDSHAKE_MSG];
         let mut b = [0u8; MAX_HANDSHAKE_MSG];
-        let n1 = ini.write_message(PROTOCOL_MARKER, &mut a)?; // msg1
+        let marker = protocol_payload(None);
+        let n1 = ini.write_message(&marker, &mut a)?; // msg1
         let p1 = res.read_message(&a[..n1], &mut b)?;
-        verify_protocol_marker(&b[..p1])?;
-        let n2 = res.write_message(PROTOCOL_MARKER, &mut a)?; // msg2
+        verify_protocol_payload(&b[..p1], None)?;
+        let n2 = res.write_message(&marker, &mut a)?; // msg2
         let p2 = ini.read_message(&a[..n2], &mut b)?;
-        verify_protocol_marker(&b[..p2])?;
+        verify_protocol_payload(&b[..p2], None)?;
         assert!(ini.is_handshake_finished() && res.is_handshake_finished());
         Ok((finalize(ini)?, finalize(res)?))
     }
@@ -146,7 +163,7 @@ mod tests {
         let mut res = responder(&[2u8; 32]).unwrap();
         let mut a = [0u8; MAX_HANDSHAKE_MSG];
         let mut b = [0u8; MAX_HANDSHAKE_MSG];
-        let n1 = ini.write_message(PROTOCOL_MARKER, &mut a).unwrap();
+        let n1 = ini.write_message(&protocol_payload(None), &mut a).unwrap();
         // The responder must reject msg1 authenticated under a different PSK.
         assert!(res.read_message(&a[..n1], &mut b).is_err());
     }
@@ -162,20 +179,42 @@ mod tests {
         let n1 = ini.write_message(b"aura/direct/0", &mut message).unwrap();
         let p1 = res.read_message(&message[..n1], &mut payload).unwrap();
         assert!(matches!(
-            verify_protocol_marker(&payload[..p1]),
+            verify_protocol_payload(&payload[..p1], None),
             Err(NoiseError::ProtocolVersion)
         ));
 
         let mut ini = initiator(&psk).unwrap();
         let mut legacy_res = responder(&psk).unwrap();
-        let n1 = ini.write_message(PROTOCOL_MARKER, &mut message).unwrap();
+        let n1 = ini
+            .write_message(&protocol_payload(None), &mut message)
+            .unwrap();
         legacy_res
             .read_message(&message[..n1], &mut payload)
             .unwrap();
         let n2 = legacy_res.write_message(&[], &mut message).unwrap();
         let p2 = ini.read_message(&message[..n2], &mut payload).unwrap();
         assert!(matches!(
-            verify_protocol_marker(&payload[..p2]),
+            verify_protocol_payload(&payload[..p2], None),
+            Err(NoiseError::ProtocolVersion)
+        ));
+    }
+
+    #[test]
+    fn authenticated_input_mode_mismatch_is_rejected() {
+        let psk = [8u8; 32];
+        let mut ini = initiator(&psk).unwrap();
+        let mut res = responder(&psk).unwrap();
+        let mut message = [0u8; MAX_HANDSHAKE_MSG];
+        let mut payload = [0u8; MAX_HANDSHAKE_MSG];
+        let n1 = ini
+            .write_message(
+                &protocol_payload(Some(TunnelInputMode::PushToTalk)),
+                &mut message,
+            )
+            .unwrap();
+        let p1 = res.read_message(&message[..n1], &mut payload).unwrap();
+        assert!(matches!(
+            verify_protocol_payload(&payload[..p1], Some(TunnelInputMode::Voice)),
             Err(NoiseError::ProtocolVersion)
         ));
     }

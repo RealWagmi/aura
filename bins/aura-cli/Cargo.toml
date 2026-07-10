@@ -16,7 +16,7 @@ aura-tunnel = { path = "../../crates/aura-tunnel", features = ["iroh"] }
 tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "net", "time"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }

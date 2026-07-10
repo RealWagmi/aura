@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 
 use crate::reframe::Reframer;
-use crate::wire::{decode_control_ack, encode_tunnel_control, is_tunnel_control, TunnelControl};
+use crate::wire::{encode_control_ack, encode_tunnel_control, is_tunnel_control, TunnelControl};
 
 /// One audio frame is 20 ms.
 const FRAME_MS: u64 = 20;
@@ -28,6 +28,12 @@ const FRAME_MS: u64 = 20;
 /// regardless of size, so a large cap costs zero interruption latency; hitting
 /// the cap is logged loudly (never unlogged again).
 pub(crate) const MAX_OUTBOUND_FRAMES: usize = 15_000;
+/// Local application controls are reliable but still bounded. A broken caller
+/// must not turn the "never evict controls for audio" rule into unbounded RAM.
+pub(crate) const MAX_OUTBOUND_CONTROLS: usize = 256;
+/// Duplicate-control replay may request the same ACK many times. Keep ACKs
+/// separate from media, coalesce by id, and cap the set to the replay window.
+pub(crate) const MAX_PENDING_ACKS: usize = 128;
 
 pub(crate) fn pcm_to_bytes(pcm: &[i16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(pcm.len() * 2);
@@ -54,6 +60,7 @@ pub(crate) struct Outbound {
     /// Total frames dropped on overflow (diagnostic; see `MAX_OUTBOUND_FRAMES`).
     dropped_frames: u64,
     frame_samples: usize,
+    pending_acks: VecDeque<u64>,
 }
 
 impl Outbound {
@@ -63,6 +70,7 @@ impl Outbound {
             reframer: Reframer::new(frame_samples),
             dropped_frames: 0,
             frame_samples,
+            pending_acks: VecDeque::new(),
         }
     }
 
@@ -101,24 +109,31 @@ impl Outbound {
 
     /// Queue an authenticated control event for the peer, in-order with the
     /// audio already queued.
-    pub(crate) fn push_control(&mut self, control: TunnelControl) {
+    pub(crate) fn push_control(&mut self, control: TunnelControl) -> bool {
+        if self.queue.iter().filter(|f| is_tunnel_control(f)).count() >= MAX_OUTBOUND_CONTROLS {
+            eprintln!("aura-tunnel: outbound control queue full; rejecting local control");
+            return false;
+        }
         self.queue.push_back(encode_tunnel_control(control));
+        true
     }
 
-    /// Queue a transport-internal acknowledgement ahead of media. ACKs are
-    /// tiny and time-sensitive; they never escape as application input.
-    pub(crate) fn push_priority(&mut self, payload: Vec<u8>) {
-        self.queue.push_front(payload);
+    /// Coalesce a transport-internal acknowledgement. The bounded ACK lane is
+    /// drained at one item per pacer tick and cannot displace or starve audio.
+    pub(crate) fn queue_ack(&mut self, id: u64) {
+        if self.pending_acks.contains(&id) {
+            return;
+        }
+        if self.pending_acks.len() == MAX_PENDING_ACKS {
+            self.pending_acks.pop_front();
+        }
+        self.pending_acks.push_back(id);
     }
 
     /// Remove an internal ACK even while application output is held behind an
     /// unacknowledged control (prevents simultaneous controls deadlocking).
     pub(crate) fn pop_priority_ack(&mut self) -> Option<Vec<u8>> {
-        let pos = self
-            .queue
-            .iter()
-            .position(|f| decode_control_ack(f).is_some())?;
-        self.queue.remove(pos)
+        self.pending_acks.pop_front().map(encode_control_ack)
     }
 
     /// The next frame for the pacer, or `None` (send a keepalive instead).
@@ -202,5 +217,30 @@ mod tests {
         assert!(is_tunnel_control(&ob.pop_next().unwrap()));
         assert_eq!(bytes_to_pcm(&ob.pop_next().unwrap())[0], 2);
         assert!(ob.pop_next().is_none());
+    }
+
+    #[test]
+    fn duplicate_ack_flood_is_coalesced_and_bounded() {
+        let mut ob = Outbound::new(480);
+        for _ in 0..10_000 {
+            ob.queue_ack(7);
+        }
+        assert_eq!(ob.pending_acks.len(), 1);
+        for id in 0..10_000 {
+            ob.queue_ack(id);
+        }
+        assert_eq!(ob.pending_acks.len(), MAX_PENDING_ACKS);
+        assert_eq!(ob.pop_priority_ack(), Some(encode_control_ack(9_872)));
+    }
+
+    #[test]
+    fn local_control_queue_is_bounded_without_evicting_audio() {
+        let mut ob = Outbound::new(480);
+        ob.push_pcm(&frame(1));
+        for _ in 0..MAX_OUTBOUND_CONTROLS {
+            assert!(ob.push_control(TunnelControl::PttOpen));
+        }
+        assert!(!ob.push_control(TunnelControl::PttClose));
+        assert_eq!(bytes_to_pcm(&ob.pop_next().unwrap())[0], 1);
     }
 }

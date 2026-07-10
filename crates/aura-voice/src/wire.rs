@@ -30,7 +30,8 @@ pub const DEFAULT_MODEL: &str = "grok-voice-think-fast-1.0";
 /// The only host the BYOK key may be sent to.
 pub const DIRECT_XAI_ALLOWED_HOST: &str = "api.x.ai";
 /// Escape hatch for isolated local testing only (loudly logged).
-pub const UNSAFE_URL_OPT_IN_ENV: &str = "AURA_XAI_DIRECT_ALLOW_UNSAFE_URL";
+pub const UNSAFE_URL_OPT_IN_ENV: &str = "AURA_DIRECT_ALLOW_UNSAFE_URL";
+const LEGACY_XAI_UNSAFE_URL_OPT_IN_ENV: &str = "AURA_XAI_DIRECT_ALLOW_UNSAFE_URL";
 /// Optional realtime URL override (staging/tests); still host-pinned.
 pub const REALTIME_URL_OVERRIDE_ENV: &str = "AURA_REALTIME_URL";
 
@@ -49,6 +50,16 @@ pub enum WireError {
     InvalidEvent(#[from] serde_json::Error),
     #[error("invalid audio delta: {0}")]
     InvalidAudio(#[from] base64::DecodeError),
+    #[error("invalid PCM16 audio byte length {0}; expected an even number of bytes")]
+    InvalidPcmByteLength(usize),
+    #[error(
+        "refusing insecure realtime endpoint {endpoint} (scheme {scheme}); wss is required unless {opt_in}=1"
+    )]
+    InsecureEndpointScheme {
+        endpoint: String,
+        scheme: String,
+        opt_in: &'static str,
+    },
     #[error(
         "refusing to send BYOK key to realtime endpoint {endpoint} (host {host}); \
          direct mode only allows host {allowed} unless {opt_in}=1 is set"
@@ -294,6 +305,9 @@ pub fn pcm16_to_base64(samples: &[i16]) -> String {
 
 pub fn base64_to_pcm16(encoded: &str) -> Result<Vec<i16>, WireError> {
     let bytes = STANDARD.decode(encoded)?;
+    if bytes.len() % 2 != 0 {
+        return Err(WireError::InvalidPcmByteLength(bytes.len()));
+    }
     Ok(bytes
         .chunks_exact(2)
         .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
@@ -444,21 +458,26 @@ pub fn validate_realtime_url(realtime_url: &str) -> Result<(), WireError> {
 
 /// Host-pin: refuse to send a BYOK key to any host other than the provider's
 /// pinned API host (`api.x.ai` / `api.openai.com`). The escape hatch
-/// (`AURA_XAI_DIRECT_ALLOW_UNSAFE_URL=1`) is loudly logged and for isolated
+/// (`AURA_DIRECT_ALLOW_UNSAFE_URL=1`) is loudly logged and for isolated
 /// local testing only. This is the single anti-exfiltration guard for the
 /// DIRECT path.
 pub fn validate_realtime_url_for(
     realtime_url: &str,
     allowed_host: &'static str,
 ) -> Result<(), WireError> {
-    let host = Url::parse(realtime_url)
-        .ok()
+    let parsed = Url::parse(realtime_url).ok();
+    let host = parsed
+        .as_ref()
         .and_then(|u| u.host_str().map(str::to_owned))
         .unwrap_or_else(|| "<invalid-url>".to_owned());
-    if host == allowed_host {
+    let secure_websocket = parsed.as_ref().is_some_and(|url| url.scheme() == "wss");
+    if host == allowed_host && secure_websocket {
         return Ok(());
     }
-    if std::env::var(UNSAFE_URL_OPT_IN_ENV).as_deref() == Ok("1") {
+    let unsafe_opt_in = std::env::var(UNSAFE_URL_OPT_IN_ENV).as_deref() == Ok("1")
+        || (allowed_host == DIRECT_XAI_ALLOWED_HOST
+            && std::env::var(LEGACY_XAI_UNSAFE_URL_OPT_IN_ENV).as_deref() == Ok("1"));
+    if unsafe_opt_in {
         eprintln!(
             "AURA SECURITY WARNING: {UNSAFE_URL_OPT_IN_ENV}=1 allows the BYOK API key to be sent \
              to realtime endpoint {realtime_url} (host {host}). Use only for isolated local \
@@ -466,12 +485,22 @@ pub fn validate_realtime_url_for(
         );
         return Ok(());
     }
-    Err(WireError::UnsafeEndpoint {
-        endpoint: realtime_url.to_owned(),
-        host,
-        allowed: allowed_host,
-        opt_in: UNSAFE_URL_OPT_IN_ENV,
-    })
+    if host == allowed_host && !secure_websocket {
+        Err(WireError::InsecureEndpointScheme {
+            endpoint: realtime_url.to_owned(),
+            scheme: parsed
+                .as_ref()
+                .map_or_else(|| "<invalid>".to_owned(), |url| url.scheme().to_owned()),
+            opt_in: UNSAFE_URL_OPT_IN_ENV,
+        })
+    } else {
+        Err(WireError::UnsafeEndpoint {
+            endpoint: realtime_url.to_owned(),
+            host,
+            allowed: allowed_host,
+            opt_in: UNSAFE_URL_OPT_IN_ENV,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -541,6 +570,15 @@ mod tests {
         let samples = vec![0i16, 1, -1, 32767, -32768, 1234];
         let encoded = pcm16_to_base64(&samples);
         assert_eq!(base64_to_pcm16(&encoded).unwrap(), samples);
+    }
+
+    #[test]
+    fn pcm16_decoder_rejects_odd_byte_count() {
+        let encoded = STANDARD.encode([1_u8, 2, 3]);
+        assert!(matches!(
+            base64_to_pcm16(&encoded),
+            Err(WireError::InvalidPcmByteLength(3))
+        ));
     }
 
     #[test]
@@ -654,6 +692,19 @@ mod tests {
         assert!(validate_realtime_url("wss://api.x.ai/v1/realtime?model=x").is_ok());
         let err = validate_realtime_url("wss://evil.example/v1/realtime").unwrap_err();
         assert!(matches!(err, WireError::UnsafeEndpoint { .. }));
+    }
+
+    #[test]
+    fn host_pin_rejects_plaintext_websocket_even_on_allowed_hosts() {
+        assert!(
+            validate_realtime_url_for("ws://api.x.ai/v1/realtime", DIRECT_XAI_ALLOWED_HOST)
+                .is_err()
+        );
+        assert!(validate_realtime_url_for(
+            "http://api.openai.com/v1/realtime",
+            DIRECT_OPENAI_ALLOWED_HOST
+        )
+        .is_err());
     }
 
     #[test]

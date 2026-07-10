@@ -92,6 +92,10 @@ impl VoiceProvider for OpenAiRealtimeProvider {
         self.connect_with_manual_turn_detection(cfg, false).await
     }
 
+    fn supports_manual_turn_detection(&self) -> bool {
+        true
+    }
+
     async fn connect_with_manual_turn_detection(
         &self,
         cfg: &VoiceSessionConfig,
@@ -137,6 +141,7 @@ mod tests {
         assert!(caps.server_vad);
         assert_eq!(caps.input_sample_rate_hz, 24_000);
         assert_eq!(caps.output_sample_rate_hz, 24_000);
+        assert!(p.supports_manual_turn_detection());
     }
 
     #[test]

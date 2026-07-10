@@ -13,8 +13,9 @@ use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
 use zeroize::Zeroizing;
 
 use crate::wire::{self, ServerEvent, WireError};
@@ -60,7 +61,14 @@ pub(crate) async fn connect_realtime(
         HeaderValue::from_str(bearer.as_str()).map_err(|e| VoiceError::Handshake(e.to_string()))?;
     request.headers_mut().insert("Authorization", header);
 
-    let (ws, _resp) = connect_async(request).await.map_err(classify_ws_error)?;
+    // Provider events are small JSON envelopes. Bound a malicious or broken
+    // peer before tungstenite allocates an unbounded application message.
+    let websocket_config = WebSocketConfig::default()
+        .max_message_size(Some(2 * 1024 * 1024))
+        .max_frame_size(Some(512 * 1024));
+    let (ws, _resp) = connect_async_with_config(request, Some(websocket_config), false)
+        .await
+        .map_err(classify_ws_error)?;
     let (mut write, read) = ws.split();
 
     // One batched flush: session.update first, then any cold-start frames in
@@ -134,6 +142,10 @@ impl RealtimeSink {
 
 #[async_trait::async_trait]
 impl VoiceSink for RealtimeSink {
+    fn supports_split_manual_turn(&self) -> bool {
+        true
+    }
+
     async fn send_audio(&mut self, pcm16: &[i16]) -> Result<(), VoiceError> {
         let frame = wire::input_audio_buffer_append_event(&wire::pcm16_to_base64(pcm16));
         self.send(frame).await

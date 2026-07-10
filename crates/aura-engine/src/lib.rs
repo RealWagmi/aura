@@ -71,6 +71,12 @@ const RECAP_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// another `response.create` is sent. Reconnect if the provider never closes
 /// that lifecycle, rather than leaving a committed PTT turn unanswered.
 const CANCEL_DONE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Hard safety ceiling for a manual turn whose close/cancel control is lost.
+/// Cancel rather than commit: an unattended open microphone must never cause
+/// Aura to submit ambient audio as an intentional user message.
+const PTT_OPEN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// A callback is best-effort and must not outlive the call indefinitely.
+const CALLBACK_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What a finished in-call dispatch carries back to the event loop: the
 /// provider's tool `call_id`, the routed result to speak back, and — for a
@@ -108,6 +114,11 @@ enum PauseCondition {
 enum Latched {
     None,
     Task(Result<ToolResponse, ToolError>),
+}
+
+enum PausedOutcome {
+    Resume(Latched),
+    HangUp,
 }
 
 /// How the active phase ended.
@@ -232,6 +243,11 @@ struct CallState {
     /// `response.created` or output. This closes the pre-audio cancellation
     /// window for cold starts, manual commits, and tool-result responses.
     response_requested: bool,
+    /// Set only for a follow-up response requested while handling the prior
+    /// response's terminal event. A duplicate late terminal event is ignored
+    /// until the follow-up proves it started. Ordinary/legacy requests keep
+    /// accepting a legitimate done-before-created sequence.
+    ignore_stale_done_until_created: bool,
     /// Deadline for the terminal `response.done` belonging to a successfully
     /// sent cancellation. While set, every new `response.create` is deferred.
     cancel_done_deadline: Option<tokio::time::Instant>,
@@ -239,6 +255,14 @@ struct CallState {
     /// wait for `cancel_done_deadline` to clear (and for an open PTT turn to
     /// close).
     deferred_response: bool,
+    /// A legacy sink combines commit and response.create in
+    /// `commit_user_turn`. It cannot be invoked until the prior response has
+    /// terminated, and must not be followed by a second request_response.
+    deferred_legacy_commit: bool,
+    /// Locally retained frames for legacy combined-commit sinks. Rebuilding
+    /// the provider buffer at commit time prevents a later PTT open/clear or a
+    /// reconnect from silently discarding an earlier deferred turn.
+    deferred_legacy_audio: Vec<Vec<i16>>,
     /// Ordered, typed conversation items sent while cancellation is pending.
     /// The explicit PTT item boundaries are required for timeout replay: two
     /// user turns must never become one combined input-audio item.
@@ -250,6 +274,8 @@ struct CallState {
     /// Whether a manual PTT turn is currently open. Duplicate `PttOpen`
     /// controls are idempotent and must not cancel again or reset the timeout.
     ptt_open: bool,
+    /// Fixed deadline for an open manual turn. Audio does not extend it.
+    ptt_open_deadline: Option<tokio::time::Instant>,
     /// Whether the user is currently speaking (server-VAD).
     user_speaking: bool,
     /// The model called `end_voice_session`; hang up once its farewell turn
@@ -282,11 +308,13 @@ impl CallState {
     fn mark_response_created(&mut self) {
         self.response_requested = false;
         self.response_created = true;
+        self.ignore_stale_done_until_created = false;
     }
 
     fn mark_response_done(&mut self) {
         self.response_requested = false;
         self.response_created = false;
+        self.ignore_stale_done_until_created = false;
     }
 
     fn mark_cancel_pending(&mut self) {
@@ -299,6 +327,14 @@ impl CallState {
         self.cancel_done_deadline = None;
     }
 
+    fn track_manual_audio(&mut self, pcm: &[i16]) {
+        if !self.ptt_open {
+            return;
+        }
+        self.ptt_input_samples = self.ptt_input_samples.saturating_add(pcm.len() as u64);
+        self.deferred_open_ptt_audio.push(pcm.to_vec());
+    }
+
     /// Reset after a reconnect: the new session has no in-flight response and
     /// no pending cancel to suppress.
     fn on_reconnect(&mut self) {
@@ -306,13 +342,18 @@ impl CallState {
         self.mark_response_done();
         self.clear_cancel_pending();
         self.deferred_response = false;
+        self.deferred_legacy_commit = false;
+        self.deferred_legacy_audio.clear();
         self.deferred_items.clear();
         self.deferred_open_ptt_audio.clear();
         self.ptt_open = false;
+        self.ptt_open_deadline = None;
         self.user_speaking = false;
         self.current_item = None;
         self.item_delivered_samples = 0;
         self.ptt_input_samples = 0;
+        self.ending = false;
+        self.pending_pause = None;
     }
 }
 
@@ -477,6 +518,7 @@ impl CallSession {
             SafetyConfig::default(),
         ));
         let mut dispatch: JoinSet<DispatchOutcome> = JoinSet::new();
+        let mut callback_delivery: JoinSet<()> = JoinSet::new();
         // Accumulates the developer's spoken lines so a resumed-from-pause
         // session doesn't lose the conversation context.
         let mut transcript = InCallTranscript::default();
@@ -488,16 +530,11 @@ impl CallSession {
                     mic = transport.recv_input() => match mic {
                         Some(TransportInput::Audio(pcm)) => {
                             if manual_turn_detection {
-                                state.ptt_input_samples = state
-                                    .ptt_input_samples
-                                    .saturating_add(pcm.len() as u64);
-                                if state.cancel_done_deadline.is_some() {
-                                    state.deferred_open_ptt_audio.push(pcm.clone());
-                                }
+                                state.track_manual_audio(&pcm);
                             }
                             if sink.send_audio(&pcm).await.is_err() {
-                                match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "mic-audio send failed").await {
-                                    Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
+                                match reconnect_with_state(&provider, &build_reconnect_cfg(&cfg, &transcript), "mic-audio send failed", &mut state).await {
+                                    Some((s, st)) => { sink = s; stream = st; }
                                     None => break Transition::Ended(EndReason::ReconnectExhausted),
                                 }
                             }
@@ -512,6 +549,8 @@ impl CallSession {
                                     continue;
                                 }
                                 state.ptt_open = true;
+                                state.ptt_open_deadline =
+                                    Some(tokio::time::Instant::now() + PTT_OPEN_TIMEOUT);
                                 state.deferred_open_ptt_audio.clear();
                                 // A PTT press while Aura is speaking is a
                                 // barge-in and gets the SAME atomic unit as the
@@ -523,13 +562,13 @@ impl CallSession {
                                 // tail) so it cannot prepend onto this turn.
                                 state.ptt_input_samples = 0;
                                 if let Err(flow_reason) = ptt_barge_in(transport.as_mut(), sink.as_mut(), &mut state).await {
-                                    match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), flow_reason).await {
-                                        Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
+                                    match reconnect_with_state(&provider, &build_reconnect_cfg(&cfg, &transcript), flow_reason, &mut state).await {
+                                        Some((s, st)) => { sink = s; stream = st; }
                                         None => break Transition::Ended(EndReason::ReconnectExhausted),
                                     }
                                 } else if sink.clear_user_audio().await.is_err() {
-                                    match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk clear failed").await {
-                                        Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
+                                    match reconnect_with_state(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk clear failed", &mut state).await {
+                                        Some((s, st)) => { sink = s; stream = st; }
                                         None => break Transition::Ended(EndReason::ReconnectExhausted),
                                     }
                                 }
@@ -548,10 +587,11 @@ impl CallSession {
                             if state.ptt_input_samples < MIN_PTT_COMMIT_SAMPLES {
                                 state.ptt_input_samples = 0;
                                 state.ptt_open = false;
+                                state.ptt_open_deadline = None;
                                 state.deferred_open_ptt_audio.clear();
                                 if sink.clear_user_audio().await.is_err() {
-                                    match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk clear failed").await {
-                                        Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
+                                    match reconnect_with_state(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk clear failed", &mut state).await {
+                                        Some((s, st)) => { sink = s; stream = st; }
                                         None => break Transition::Ended(EndReason::ReconnectExhausted),
                                     }
                                 }
@@ -560,8 +600,8 @@ impl CallSession {
                                         .await
                                         .is_err()
                                 {
-                                    match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk response request failed").await {
-                                        Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
+                                    match reconnect_with_state(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk response request failed", &mut state).await {
+                                        Some((s, st)) => { sink = s; stream = st; }
                                         None => break Transition::Ended(EndReason::ReconnectExhausted),
                                     }
                                 }
@@ -569,9 +609,10 @@ impl CallSession {
                             }
                             state.ptt_input_samples = 0;
                             state.ptt_open = false;
+                            state.ptt_open_deadline = None;
                             if commit_ptt_turn_when_ready(sink.as_mut(), &mut state).await.is_err() {
-                                match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk commit failed").await {
-                                    Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
+                                match reconnect_with_state(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk commit failed", &mut state).await {
+                                    Some((s, st)) => { sink = s; stream = st; }
                                     None => break Transition::Ended(EndReason::ReconnectExhausted),
                                 }
                             }
@@ -589,10 +630,11 @@ impl CallSession {
                             // the next committed turn.
                             state.ptt_input_samples = 0;
                             state.ptt_open = false;
+                            state.ptt_open_deadline = None;
                             state.deferred_open_ptt_audio.clear();
                             if sink.clear_user_audio().await.is_err() {
-                                match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk clear failed").await {
-                                    Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
+                                match reconnect_with_state(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk clear failed", &mut state).await {
+                                    Some((s, st)) => { sink = s; stream = st; }
                                     None => break Transition::Ended(EndReason::ReconnectExhausted),
                                 }
                             }
@@ -601,8 +643,8 @@ impl CallSession {
                                     .await
                                     .is_err()
                             {
-                                match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk response request failed").await {
-                                    Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
+                                match reconnect_with_state(&provider, &build_reconnect_cfg(&cfg, &transcript), "push-to-talk response request failed", &mut state).await {
+                                    Some((s, st)) => { sink = s; stream = st; }
                                     None => break Transition::Ended(EndReason::ReconnectExhausted),
                                 }
                             }
@@ -610,16 +652,16 @@ impl CallSession {
                         None => break Transition::Ended(EndReason::HangUp),
                     },
                     ev = stream.next_runtime_event() => match ev {
-                        None => match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "the provider closed the event stream").await {
-                            Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
+                        None => match reconnect_with_state(&provider, &build_reconnect_cfg(&cfg, &transcript), "the provider closed the event stream", &mut state).await {
+                            Some((s, st)) => { sink = s; stream = st; }
                             None => break Transition::Ended(EndReason::ReconnectExhausted),
                         },
                         Some(Err(e)) => {
                             if e.is_terminal() {
                                 break Transition::Ended(EndReason::ProviderFatal);
                             }
-                            match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), &format!("event-stream error: {e}")).await {
-                                Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
+                            match reconnect_with_state(&provider, &build_reconnect_cfg(&cfg, &transcript), &format!("event-stream error: {e}"), &mut state).await {
+                                Some((s, st)) => { sink = s; stream = st; }
                                 None => break Transition::Ended(EndReason::ReconnectExhausted),
                             }
                         }
@@ -636,9 +678,16 @@ impl CallSession {
                             // ResponseDone clears `suppress`.
                             if state.suppress {
                                 // Suppressed: ignore this cancelled response's tool call.
-                            } else if call.name == END_VOICE_SESSION_TOOL {
+                            } else {
+                                // A tool call is definitive response output.
+                                // Legacy VoiceStream implementations do not
+                                // emit the runtime-only ResponseCreated marker,
+                                // so promote the lifecycle here before queuing
+                                // the tool result's follow-up response.
+                                state.mark_response_created();
+                                if call.name == END_VOICE_SESSION_TOOL {
                                 state.ending = true;
-                            } else if call.name == PAUSE_CALL_TOOL {
+                                } else if call.name == PAUSE_CALL_TOOL {
                                 // Session-control (NOT routed through ToolRouter — no
                                 // voice-approval). Ack, then enter pause
                                 // on this turn's ResponseDone.
@@ -649,21 +698,46 @@ impl CallSession {
                                     }
                                     None => serde_json::json!({ "error": "unknown pause condition" }),
                                 };
+                                state.deferred_items.push(
+                                    DeferredConversationItem::ToolResult {
+                                        call_id: call.call_id.clone(),
+                                        content: content.clone(),
+                                    },
+                                );
+                                state.deferred_response = true;
                                 let sent = sink
                                     .send_tool_result(call.call_id.as_deref(), content.clone())
                                     .await
                                     .is_ok();
-                                if sent && state.cancel_done_deadline.is_some() {
-                                    state.deferred_items.push(
-                                        DeferredConversationItem::ToolResult {
-                                            call_id: call.call_id.clone(),
-                                            content,
-                                        },
-                                    );
+                                if sent {
+                                    if request_response_when_ready(sink.as_mut(), &mut state)
+                                        .await
+                                        .is_err()
+                                    {
+                                        match reconnect_with_state(
+                                            &provider,
+                                            &build_reconnect_cfg(&cfg, &transcript),
+                                            "pause tool-result response request failed",
+                                            &mut state,
+                                        ).await {
+                                            Some((s, st)) => { sink = s; stream = st; }
+                                            None => break Transition::Ended(EndReason::ReconnectExhausted),
+                                        }
+                                    }
+                                } else {
+                                    match reconnect_with_state(
+                                        &provider,
+                                        &build_reconnect_cfg(&cfg, &transcript),
+                                        "pause tool-result send failed",
+                                        &mut state,
+                                    ).await {
+                                        Some((s, st)) => { sink = s; stream = st; }
+                                        None => break Transition::Ended(EndReason::ReconnectExhausted),
+                                    }
                                 }
-                                let _ = request_response_when_ready(sink.as_mut(), &mut state).await;
-                            } else {
-                                spawn_dispatch(&router, &mut dispatch, call);
+                                } else {
+                                    spawn_dispatch(&router, &mut dispatch, call);
+                                }
                             }
                         }
                         Some(Ok(VoiceRuntimeEvent::Voice(event))) => {
@@ -675,8 +749,8 @@ impl CallSession {
                                     let cond = state.pending_pause.take().unwrap_or(PauseCondition::TaskComplete);
                                     break Transition::Pause(cond);
                                 }
-                                Flow::Reconnect => match reconnect(&provider, &build_reconnect_cfg(&cfg, &transcript), "recovering from an in-call error (see the line above)").await {
-                                    Some((s, st)) => { sink = s; stream = st; state.on_reconnect(); }
+                                Flow::Reconnect => match reconnect_with_state(&provider, &build_reconnect_cfg(&cfg, &transcript), "recovering from an in-call error (see the line above)", &mut state).await {
+                                    Some((s, st)) => { sink = s; stream = st; }
                                     None => break Transition::Ended(EndReason::ReconnectExhausted),
                                 },
                             }
@@ -721,25 +795,86 @@ impl CallSession {
                                 Ok(resp) => resp.content.clone(),
                                 Err(e) => serde_json::json!({ "error": e.to_string() }),
                             };
+                            state.deferred_items.push(
+                                DeferredConversationItem::ToolResult {
+                                    call_id: call_id.clone(),
+                                    content: content.clone(),
+                                },
+                            );
+                            state.deferred_response = true;
                             let sent = sink
                                 .send_tool_result(call_id.as_deref(), content.clone())
                                 .await
                                 .is_ok();
-                            if sent && state.cancel_done_deadline.is_some() {
-                                state.deferred_items.push(
-                                    DeferredConversationItem::ToolResult {
-                                        call_id: call_id.clone(),
-                                        content,
-                                    },
-                                );
+                            if sent {
+                                if request_response_when_ready(sink.as_mut(), &mut state)
+                                    .await
+                                    .is_err()
+                                {
+                                    match reconnect_with_state(
+                                        &provider,
+                                        &build_reconnect_cfg(&cfg, &transcript),
+                                        "dispatch tool-result response request failed",
+                                        &mut state,
+                                    ).await {
+                                        Some((s, st)) => { sink = s; stream = st; }
+                                        None => break Transition::Ended(EndReason::ReconnectExhausted),
+                                    }
+                                }
+                            } else {
+                                match reconnect_with_state(
+                                    &provider,
+                                    &build_reconnect_cfg(&cfg, &transcript),
+                                    "dispatch tool-result send failed",
+                                    &mut state,
+                                ).await {
+                                    Some((s, st)) => { sink = s; stream = st; }
+                                    None => break Transition::Ended(EndReason::ReconnectExhausted),
+                                }
                             }
-                            let _ = request_response_when_ready(sink.as_mut(), &mut state).await;
                             // Universal callback seam: a completed
                             // worker dispatch is also delivered back into the
                             // host chat, not only spoken. Best-effort/fail-open.
-                            deliver_chat_callback(&host, callback, &result);
+                            deliver_chat_callback(
+                                &host,
+                                callback,
+                                &result,
+                                &mut callback_delivery,
+                            );
                         }
                     }
+                    _ = wait_ptt_open_timeout(state.ptt_open_deadline) => {
+                        // A missing close/cancel must not leave the provider's
+                        // input buffer recording forever. Fail closed: discard
+                        // the partial turn and unblock any earlier deferred
+                        // response without treating ambient audio as intent.
+                        if cancel_stale_open_ptt(sink.as_mut(), &mut state).await.is_err() {
+                            match reconnect_with_state(
+                                &provider,
+                                &build_reconnect_cfg(&cfg, &transcript),
+                                "push-to-talk watchdog clear failed",
+                                &mut state,
+                            ).await {
+                                Some((s, st)) => { sink = s; stream = st; }
+                                None => break Transition::Ended(EndReason::ReconnectExhausted),
+                            }
+                        } else if state.deferred_response
+                            && request_response_when_ready(sink.as_mut(), &mut state)
+                                .await
+                                .is_err()
+                        {
+                            match reconnect_with_state(
+                                &provider,
+                                &build_reconnect_cfg(&cfg, &transcript),
+                                "push-to-talk watchdog response request failed",
+                                &mut state,
+                            ).await {
+                                Some((s, st)) => { sink = s; stream = st; }
+                                None => break Transition::Ended(EndReason::ReconnectExhausted),
+                            }
+                        }
+                    }
+                    _ = callback_delivery.join_next(), if !callback_delivery.is_empty() => {}
                 }
             };
 
@@ -751,7 +886,22 @@ impl CallSession {
                     // running; the transport stays up for instant resume. ---
                     transport.clear_playout();
                     let _ = sink.close().await;
-                    let latched = run_paused(cond, &mut dispatch, &host).await;
+                    let latched = match run_paused(
+                        cond,
+                        &mut dispatch,
+                        &host,
+                        &mut callback_delivery,
+                        transport.as_mut(),
+                    )
+                    .await
+                    {
+                        PausedOutcome::Resume(latched) => latched,
+                        PausedOutcome::HangUp => {
+                            break 'call CallOutcome {
+                                reason: EndReason::HangUp,
+                            };
+                        }
+                    };
 
                     // --- RESUME: bring the realtime leg back with the pre-pause
                     // dialogue digest + the latched result, then speak it. ---
@@ -776,6 +926,7 @@ impl CallSession {
         // Drain any in-flight dispatches so a spawned `claude -p` isn't aborted
         // mid-write when the call ends.
         dispatch.shutdown().await;
+        while callback_delivery.join_next().await.is_some() {}
         let _ = sink.close().await;
         eprintln!(
             "aura-engine: metric call_duration_s={:.1} reason={:?}",
@@ -845,7 +996,13 @@ async fn handle_event(
                 Err(TransportError::Io(_)) => Flow::Continue,
             }
         }
-        VoiceEvent::OutputTextDelta(_) | VoiceEvent::InputTranscriptDelta { .. } => Flow::Continue,
+        VoiceEvent::OutputTextDelta(_) => {
+            if !state.suppress {
+                state.mark_response_created();
+            }
+            Flow::Continue
+        }
+        VoiceEvent::InputTranscriptDelta { .. } => Flow::Continue,
         VoiceEvent::UserSpeechStarted => {
             // Heard-audio estimate for truncate, taken BEFORE clear_playout
             // wipes the queue: delivered minus still-queued = what actually
@@ -879,6 +1036,8 @@ async fn handle_event(
                     }
                     state.suppress = true;
                     state.mark_cancel_pending();
+                    state.ending = false;
+                    state.pending_pause = None;
                 }
                 // Context sync for BOTH live and post-done barge-ins: truncate
                 // the item at what the user actually heard so the model's
@@ -911,6 +1070,19 @@ async fn handle_event(
         // JoinSet + router); this arm keeps the match exhaustive.
         VoiceEvent::ToolCall(_) => Flow::Continue,
         VoiceEvent::ResponseDone { .. } => {
+            // A deferred response is marked requested immediately after the
+            // preceding response's terminal event. Until its own
+            // `response.created` arrives, another late/duplicate done can only
+            // belong to the preceding lifecycle. Do not let it clear the new
+            // request. A pre-created cancellation is the exception: its done
+            // is exactly the terminal event we are waiting for.
+            if state.ignore_stale_done_until_created
+                && state.response_requested
+                && !state.response_created
+                && state.cancel_done_deadline.is_none()
+            {
+                return Flow::Continue;
+            }
             // Play the response's trailing partial frame so phrase endings
             // aren't swallowed (REMOTE reframer tail; no-op for LOCAL).
             let _ = transport.flush_output().await;
@@ -933,7 +1105,9 @@ async fn handle_event(
             if state.pending_pause.is_some() {
                 return Flow::Pause;
             }
-            if state.deferred_response && request_response_when_ready(sink, state).await.is_err() {
+            if state.deferred_response
+                && request_response_after_terminal(sink, state).await.is_err()
+            {
                 return Flow::Reconnect;
             }
             Flow::Continue
@@ -982,6 +1156,8 @@ async fn ptt_barge_in(
         }
         state.suppress = true;
         state.mark_cancel_pending();
+        state.ending = false;
+        state.pending_pause = None;
     }
     if let Some(item_id) = state.current_item.take() {
         let delivered_ms = state.item_delivered_samples / 24;
@@ -993,6 +1169,17 @@ async fn ptt_barge_in(
     Ok(())
 }
 
+async fn cancel_stale_open_ptt(
+    sink: &mut dyn VoiceSink,
+    state: &mut CallState,
+) -> Result<(), aura_voice::VoiceError> {
+    state.ptt_open = false;
+    state.ptt_open_deadline = None;
+    state.ptt_input_samples = 0;
+    state.deferred_open_ptt_audio.clear();
+    sink.clear_user_audio().await
+}
+
 /// Send `response.create` only when no successfully cancelled response is
 /// awaiting its terminal event. The user/tool item is already committed, so
 /// deferring here preserves it without asking the provider to run two
@@ -1001,11 +1188,21 @@ async fn request_response_when_ready(
     sink: &mut dyn VoiceSink,
     state: &mut CallState,
 ) -> Result<(), aura_voice::VoiceError> {
-    if state.cancel_done_deadline.is_some() || state.ptt_open {
+    if state.cancel_done_deadline.is_some() || state.response_in_flight() || state.ptt_open {
         state.deferred_response = true;
         return Ok(());
     }
-    sink.request_response().await?;
+    if state.deferred_legacy_commit {
+        sink.clear_user_audio().await?;
+        for pcm in &state.deferred_legacy_audio {
+            sink.send_audio(pcm).await?;
+        }
+        sink.commit_user_turn().await?;
+        state.deferred_legacy_commit = false;
+        state.deferred_legacy_audio.clear();
+    } else {
+        sink.request_response().await?;
+    }
     state.deferred_response = false;
     state.deferred_items.clear();
     state.deferred_open_ptt_audio.clear();
@@ -1013,12 +1210,31 @@ async fn request_response_when_ready(
     Ok(())
 }
 
+async fn request_response_after_terminal(
+    sink: &mut dyn VoiceSink,
+    state: &mut CallState,
+) -> Result<(), aura_voice::VoiceError> {
+    request_response_when_ready(sink, state).await?;
+    if state.response_requested {
+        state.ignore_stale_done_until_created = true;
+    }
+    Ok(())
+}
+
 async fn commit_ptt_turn_when_ready(
     sink: &mut dyn VoiceSink,
     state: &mut CallState,
 ) -> Result<(), aura_voice::VoiceError> {
+    if !sink.supports_split_manual_turn() {
+        state
+            .deferred_legacy_audio
+            .append(&mut state.deferred_open_ptt_audio);
+        state.deferred_legacy_commit = true;
+        state.deferred_response = true;
+        return request_response_when_ready(sink, state).await;
+    }
     sink.commit_user_audio().await?;
-    if state.cancel_done_deadline.is_some() {
+    if state.response_in_flight() || state.cancel_done_deadline.is_some() {
         state
             .deferred_items
             .push(DeferredConversationItem::PttAudio(std::mem::take(
@@ -1037,7 +1253,10 @@ struct CancelTimeoutRecovery {
     open_ptt_audio: Vec<Vec<i16>>,
     open_ptt_samples: u64,
     ptt_open: bool,
+    open_ptt_remaining: Duration,
     response_needed: bool,
+    legacy_commit_needed: bool,
+    legacy_audio: Vec<Vec<i16>>,
 }
 
 impl CancelTimeoutRecovery {
@@ -1047,7 +1266,13 @@ impl CancelTimeoutRecovery {
             open_ptt_audio: std::mem::take(&mut state.deferred_open_ptt_audio),
             open_ptt_samples: state.ptt_input_samples,
             ptt_open: state.ptt_open,
+            open_ptt_remaining: state
+                .ptt_open_deadline
+                .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+                .unwrap_or(PTT_OPEN_TIMEOUT),
             response_needed: state.deferred_response,
+            legacy_commit_needed: state.deferred_legacy_commit,
+            legacy_audio: std::mem::take(&mut state.deferred_legacy_audio),
         }
     }
 }
@@ -1074,12 +1299,18 @@ async fn replay_after_cancel_timeout(
     // Restore an in-progress turn only after every earlier committed item.
     // It remains open and uncommitted; its eventual PttClose owns the single
     // response.create for all deferred conversation items.
-    for pcm in recovery.open_ptt_audio {
-        sink.send_audio(&pcm).await?;
+    for pcm in &recovery.open_ptt_audio {
+        sink.send_audio(pcm).await?;
     }
     state.ptt_open = recovery.ptt_open;
+    state.ptt_open_deadline = recovery
+        .ptt_open
+        .then(|| tokio::time::Instant::now() + recovery.open_ptt_remaining);
     state.ptt_input_samples = recovery.open_ptt_samples;
+    state.deferred_open_ptt_audio = recovery.open_ptt_audio;
     state.deferred_response = recovery.response_needed;
+    state.deferred_legacy_commit = recovery.legacy_commit_needed;
+    state.deferred_legacy_audio = recovery.legacy_audio;
     if recovery.response_needed {
         request_response_when_ready(sink, state).await?;
     }
@@ -1090,6 +1321,13 @@ async fn replay_after_cancel_timeout(
 /// its deadline. Keeping this as a standalone future avoids borrowing call
 /// state across the other `tokio::select!` branches.
 async fn wait_cancel_done_timeout(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn wait_ptt_open_timeout(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
@@ -1228,6 +1466,7 @@ fn deliver_chat_callback(
     host: &Arc<dyn HostAdapter>,
     callback: Option<CallbackMeta>,
     result: &Result<ToolResponse, ToolError>,
+    deliveries: &mut JoinSet<()>,
 ) {
     let (Some(meta), Ok(resp)) = (callback, result) else {
         return;
@@ -1241,9 +1480,16 @@ fn deliver_chat_callback(
     // a subprocess (Hermes/Claude), and awaiting it inline would stall the
     // realtime event loop — freezing mic pump and audio playout. Best-effort
     // and fail-open: a delivery error is logged, never surfaced to the call.
-    tokio::spawn(async move {
-        if let Err(e) = host.deliver_callback(&task_result).await {
-            eprintln!("aura-engine: chat callback delivery failed: {e}");
+    deliveries.spawn(async move {
+        match tokio::time::timeout(
+            CALLBACK_DELIVERY_TIMEOUT,
+            host.deliver_callback(&task_result),
+        )
+        .await
+        {
+            Ok(Err(e)) => eprintln!("aura-engine: chat callback delivery failed: {e}"),
+            Err(_) => eprintln!("aura-engine: chat callback delivery timed out"),
+            Ok(Ok(_)) => {}
         }
     });
 }
@@ -1312,31 +1558,45 @@ async fn run_paused(
     cond: PauseCondition,
     dispatch: &mut JoinSet<DispatchOutcome>,
     host: &Arc<dyn HostAdapter>,
-) -> Latched {
-    match cond {
-        PauseCondition::TaskComplete => match dispatch.join_next().await {
-            Some(Ok((_call_id, result, callback))) => {
-                // The task finished while paused: deliver it into the host chat
-                // now and latch the spoken result for the resume turn.
-                deliver_chat_callback(host, callback, &result);
-                Latched::Task(result)
+    deliveries: &mut JoinSet<()>,
+    transport: &mut dyn AudioTransport,
+) -> PausedOutcome {
+    let condition = async {
+        match cond {
+            PauseCondition::TaskComplete => match dispatch.join_next().await {
+                Some(Ok((_call_id, result, callback))) => {
+                    // The task finished while paused: deliver it into the host chat
+                    // now and latch the spoken result for the resume turn.
+                    deliver_chat_callback(host, callback, &result, deliveries);
+                    Latched::Task(result)
+                }
+                // Nothing in flight (or it joined-errored) — resume right away.
+                _ => Latched::None,
+            },
+            PauseCondition::Timeout(d) => {
+                tokio::time::sleep(d).await;
+                Latched::None
             }
-            // Nothing in flight (or it joined-errored) — resume right away.
-            _ => Latched::None,
-        },
-        PauseCondition::Timeout(d) => {
-            tokio::time::sleep(d).await;
-            Latched::None
-        }
-        PauseCondition::Event(name) => {
-            // v1: no external unpause channel (key/feeder) wired yet —
-            // bounded safety wait so we never stay paused forever.
-            eprintln!(
-                "aura-engine: paused on event '{name}' — external unpause not wired yet; \
+            PauseCondition::Event(name) => {
+                // v1: no external unpause channel (key/feeder) wired yet —
+                // bounded safety wait so we never stay paused forever.
+                eprintln!(
+                    "aura-engine: paused on event '{name}' — external unpause not wired yet; \
                  resuming after the safety timeout"
-            );
-            tokio::time::sleep(Duration::from_secs(PAUSE_EVENT_SAFETY_SECS)).await;
-            Latched::None
+                );
+                tokio::time::sleep(Duration::from_secs(PAUSE_EVENT_SAFETY_SECS)).await;
+                Latched::None
+            }
+        }
+    };
+    tokio::pin!(condition);
+    loop {
+        tokio::select! {
+            latched = &mut condition => return PausedOutcome::Resume(latched),
+            input = transport.recv_input() => match input {
+                Some(_) => {}
+                None => return PausedOutcome::HangUp,
+            },
         }
     }
 }
@@ -1544,6 +1804,25 @@ async fn next_feeder_digest(feeder: Option<&Arc<dyn AmbientFeeder>>) -> String {
     }
 }
 
+/// Reconnect without silently losing a currently open manual turn.
+async fn reconnect_with_state(
+    provider: &Arc<dyn VoiceProvider>,
+    cfg: &VoiceSessionConfig,
+    why: &str,
+    state: &mut CallState,
+) -> Option<(Box<dyn VoiceSink>, Box<dyn VoiceStream>)> {
+    let recovery = CancelTimeoutRecovery::take(state);
+    let (mut sink, stream) = reconnect(provider, cfg, why).await?;
+    state.on_reconnect();
+    if replay_after_cancel_timeout(sink.as_mut(), state, recovery)
+        .await
+        .is_err()
+    {
+        return None;
+    }
+    Some((sink, stream))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1581,8 +1860,52 @@ mod tests {
         log: Arc<Mutex<SinkLog>>,
     }
 
+    struct LegacySink {
+        log: Arc<Mutex<SinkLog>>,
+    }
+
+    #[async_trait]
+    impl VoiceSink for LegacySink {
+        async fn send_audio(&mut self, pcm16: &[i16]) -> Result<(), VoiceError> {
+            self.log.lock().unwrap().audio.push(pcm16.to_vec());
+            Ok(())
+        }
+        async fn cancel_response(&mut self) -> Result<(), VoiceError> {
+            Ok(())
+        }
+        async fn send_tool_result(
+            &mut self,
+            _call_id: Option<&str>,
+            _output: serde_json::Value,
+        ) -> Result<(), VoiceError> {
+            Ok(())
+        }
+        async fn inject_system_context(&mut self, _text: &str) -> Result<(), VoiceError> {
+            Ok(())
+        }
+        async fn request_response(&mut self) -> Result<(), VoiceError> {
+            let mut log = self.log.lock().unwrap();
+            log.requests += 1;
+            log.actions.push(SinkAction::Request);
+            Ok(())
+        }
+        async fn commit_user_turn(&mut self) -> Result<(), VoiceError> {
+            let mut log = self.log.lock().unwrap();
+            log.commits += 1;
+            log.actions.push(SinkAction::Commit);
+            Ok(())
+        }
+        async fn close(&mut self) -> Result<(), VoiceError> {
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl VoiceSink for FakeSink {
+        fn supports_split_manual_turn(&self) -> bool {
+            true
+        }
+
         async fn send_audio(&mut self, pcm16: &[i16]) -> Result<(), VoiceError> {
             let mut log = self.log.lock().unwrap();
             log.audio.push(pcm16.to_vec());
@@ -1705,6 +2028,18 @@ mod tests {
 
     #[async_trait]
     impl VoiceProvider for FakeProvider {
+        fn supports_manual_turn_detection(&self) -> bool {
+            true
+        }
+
+        async fn connect_with_manual_turn_detection(
+            &self,
+            cfg: &VoiceSessionConfig,
+            _manual_turn_detection: bool,
+        ) -> Result<(Box<dyn VoiceSink>, Box<dyn VoiceStream>), VoiceError> {
+            self.connect(cfg).await
+        }
+
         fn model_id(&self) -> &str {
             "fake-model"
         }
@@ -2130,7 +2465,10 @@ mod tests {
             open_ptt_audio: vec![vec![5; 1_200]],
             open_ptt_samples: 1_200,
             ptt_open: true,
+            open_ptt_remaining: PTT_OPEN_TIMEOUT,
             response_needed: true,
+            legacy_commit_needed: false,
+            legacy_audio: Vec::new(),
         };
 
         replay_after_cancel_timeout(&mut sink, &mut state, recovery)
@@ -2330,6 +2668,8 @@ mod tests {
         };
         let mut state = CallState {
             response_created: true,
+            ending: true,
+            pending_pause: Some(PauseCondition::TaskComplete),
             current_item: Some("item-7".to_owned()),
             item_delivered_samples: 24_000, // 1000 ms delivered
             ..CallState::default()
@@ -2348,6 +2688,14 @@ mod tests {
         assert_eq!(cleared.load(Ordering::SeqCst), 1);
         assert_eq!(state.current_item, None);
         assert_eq!(state.item_delivered_samples, 0);
+        assert!(
+            !state.ending,
+            "cancelled hangup intent must not survive barge-in"
+        );
+        assert!(
+            state.pending_pause.is_none(),
+            "cancelled pause intent must not survive barge-in"
+        );
     }
 
     #[tokio::test]
@@ -2715,8 +3063,10 @@ mod tests {
         // Connected twice: the initial session + the resume after the pause.
         assert_eq!(h.connects.load(Ordering::SeqCst), 2);
         let log = sink_log.lock().unwrap();
-        // The pause ack + the resume kick both asked for a response.
-        assert!(log.requests >= 2, "requests = {}", log.requests);
+        // The tool result must not create an overlapping response before the
+        // tool-call response terminates. Pausing collapses that session, so
+        // only the resumed session's kick is requested.
+        assert_eq!(log.requests, 1, "requests = {}", log.requests);
         assert!(log.closed, "the collapsed session's sink was closed");
     }
 
@@ -2809,10 +3159,239 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_followup_waits_for_done_and_stale_done_cannot_clear_it() {
+        let h = harness(vec![], vec![], false);
+        let mut sink = FakeSink {
+            log: h.sink_log.clone(),
+        };
+        let mut transport = h.transport;
+        let mut state = CallState {
+            response_created: true,
+            ..CallState::default()
+        };
+
+        let tool_result = serde_json::json!({"ok": true});
+        state
+            .deferred_items
+            .push(DeferredConversationItem::ToolResult {
+                call_id: Some("tool-1".to_owned()),
+                content: tool_result.clone(),
+            });
+        sink.send_tool_result(Some("tool-1"), tool_result)
+            .await
+            .unwrap();
+        request_response_when_ready(&mut sink, &mut state)
+            .await
+            .unwrap();
+        assert!(state.deferred_response);
+        assert_eq!(state.deferred_items.len(), 1);
+        assert_eq!(h.sink_log.lock().unwrap().requests, 0);
+
+        assert!(matches!(
+            handle_event(
+                VoiceEvent::ResponseDone { input_tokens: None },
+                transport.as_mut(),
+                &mut sink,
+                &mut state,
+                false,
+            )
+            .await,
+            Flow::Continue
+        ));
+        assert!(state.response_requested);
+        assert_eq!(h.sink_log.lock().unwrap().requests, 1);
+        assert!(state.deferred_items.is_empty());
+
+        // A duplicate terminal event from the old response arrives before the
+        // new response.created. It must not clear the new request.
+        let _ = handle_event(
+            VoiceEvent::ResponseDone { input_tokens: None },
+            transport.as_mut(),
+            &mut sink,
+            &mut state,
+            false,
+        )
+        .await;
+        assert!(state.response_requested);
+        assert_eq!(h.sink_log.lock().unwrap().requests, 1);
+
+        state.mark_response_created();
+        let _ = handle_event(
+            VoiceEvent::ResponseDone { input_tokens: None },
+            transport.as_mut(),
+            &mut sink,
+            &mut state,
+            false,
+        )
+        .await;
+        assert!(!state.response_in_flight());
+    }
+
+    #[tokio::test]
+    async fn ordinary_request_accepts_legitimate_done_before_created() {
+        let h = harness(vec![], vec![], false);
+        let mut sink = FakeSink {
+            log: h.sink_log.clone(),
+        };
+        let mut transport = h.transport;
+        let mut state = CallState {
+            response_requested: true,
+            ..CallState::default()
+        };
+
+        let flow = handle_event(
+            VoiceEvent::ResponseDone { input_tokens: None },
+            transport.as_mut(),
+            &mut sink,
+            &mut state,
+            false,
+        )
+        .await;
+        assert!(matches!(flow, Flow::Continue));
+        assert!(!state.response_in_flight());
+        assert!(!state.ignore_stale_done_until_created);
+    }
+
+    #[tokio::test]
+    async fn legacy_manual_commit_is_deferred_and_never_double_requests() {
+        let log = Arc::new(Mutex::new(SinkLog::default()));
+        let mut sink = LegacySink { log: log.clone() };
+        let mut state = CallState {
+            response_created: true,
+            deferred_open_ptt_audio: vec![vec![1; 480]],
+            ..CallState::default()
+        };
+
+        commit_ptt_turn_when_ready(&mut sink, &mut state)
+            .await
+            .unwrap();
+        assert!(state.deferred_legacy_commit);
+        assert_eq!(log.lock().unwrap().commits, 0);
+
+        state.deferred_open_ptt_audio = vec![vec![2; 480]];
+        commit_ptt_turn_when_ready(&mut sink, &mut state)
+            .await
+            .unwrap();
+
+        state.mark_response_done();
+        request_response_when_ready(&mut sink, &mut state)
+            .await
+            .unwrap();
+        let log = log.lock().unwrap();
+        assert_eq!(log.commits, 1);
+        assert_eq!(
+            log.requests, 0,
+            "combined legacy commit owns response.create"
+        );
+        assert_eq!(log.actions, vec![SinkAction::Commit]);
+        assert_eq!(log.audio, vec![vec![1; 480], vec![2; 480]]);
+    }
+
+    #[tokio::test]
+    async fn paused_phase_discards_input_and_observes_hangup() {
+        let mut dispatch: JoinSet<DispatchOutcome> = JoinSet::new();
+        let mut deliveries = JoinSet::new();
+        let mut h = harness_input(vec![], vec![TransportInput::Audio(vec![7; 480])], true);
+        let outcome = run_paused(
+            PauseCondition::Timeout(Duration::from_secs(60)),
+            &mut dispatch,
+            &host(),
+            &mut deliveries,
+            h.transport.as_mut(),
+        )
+        .await;
+        assert!(matches!(outcome, PausedOutcome::HangUp));
+        assert!(h.transport.input.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_ptt_close_is_cancelled_without_committing() {
+        let log = Arc::new(Mutex::new(SinkLog::default()));
+        let mut sink = FakeSink { log: log.clone() };
+        let mut state = CallState {
+            ptt_open: true,
+            ptt_open_deadline: Some(tokio::time::Instant::now()),
+            ptt_input_samples: 480,
+            deferred_open_ptt_audio: vec![vec![5; 480]],
+            ..CallState::default()
+        };
+        cancel_stale_open_ptt(&mut sink, &mut state).await.unwrap();
+        assert!(!state.ptt_open);
+        assert!(state.ptt_open_deadline.is_none());
+        assert_eq!(state.ptt_input_samples, 0);
+        assert!(state.deferred_open_ptt_audio.is_empty());
+        let log = log.lock().unwrap();
+        assert_eq!(log.clears, 1);
+        assert_eq!(log.commits, 0);
+        assert_eq!(log.requests, 0);
+    }
+
+    #[test]
+    fn manual_audio_is_retained_only_for_an_open_turn() {
+        let mut state = CallState {
+            cancel_done_deadline: Some(tokio::time::Instant::now()),
+            ..CallState::default()
+        };
+        state.track_manual_audio(&[1; 480]);
+        assert!(state.deferred_open_ptt_audio.is_empty());
+        assert_eq!(state.ptt_input_samples, 0);
+
+        state.ptt_open = true;
+        state.track_manual_audio(&[2; 480]);
+        assert_eq!(state.deferred_open_ptt_audio, vec![vec![2; 480]]);
+        assert_eq!(state.ptt_input_samples, 480);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_replays_and_restores_open_ptt_turn() {
+        let h = harness(
+            vec![Script::Ok {
+                events: vec![],
+                end: End::Pending,
+            }],
+            vec![],
+            false,
+        );
+        let mut state = CallState {
+            ptt_open: true,
+            ptt_open_deadline: Some(tokio::time::Instant::now() + Duration::from_secs(60)),
+            ptt_input_samples: 960,
+            deferred_open_ptt_audio: vec![vec![3; 480], vec![4; 480]],
+            ending: true,
+            pending_pause: Some(PauseCondition::TaskComplete),
+            ..CallState::default()
+        };
+        let provider: Arc<dyn VoiceProvider> = h.provider.clone();
+        let pair = reconnect_with_state(&provider, &cfg(), "test reconnect", &mut state).await;
+        assert!(pair.is_some());
+        assert!(state.ptt_open);
+        assert_eq!(state.ptt_input_samples, 960);
+        assert_eq!(
+            state.deferred_open_ptt_audio,
+            vec![vec![3; 480], vec![4; 480]]
+        );
+        assert!(!state.ending);
+        assert!(state.pending_pause.is_none());
+        assert_eq!(
+            h.sink_log.lock().unwrap().audio,
+            vec![vec![3; 480], vec![4; 480]]
+        );
+    }
+
+    #[tokio::test]
     async fn run_paused_task_complete_with_no_inflight_returns_immediately() {
         let mut dispatch: JoinSet<DispatchOutcome> = JoinSet::new();
-        let latched = run_paused(PauseCondition::TaskComplete, &mut dispatch, &host()).await;
-        assert!(matches!(latched, Latched::None));
+        let mut deliveries = JoinSet::new();
+        let mut h = harness(vec![], vec![], false);
+        let latched = run_paused(
+            PauseCondition::TaskComplete,
+            &mut dispatch,
+            &host(),
+            &mut deliveries,
+            h.transport.as_mut(),
+        )
+        .await;
+        assert!(matches!(latched, PausedOutcome::Resume(Latched::None)));
     }
 
     #[test]
@@ -2971,6 +3550,7 @@ mod tests {
     #[tokio::test]
     async fn deliver_chat_callback_is_a_noop_without_meta_or_on_error() {
         let host = host();
+        let mut deliveries = JoinSet::new();
         // No callback meta (e.g. a read-only query) -> nothing delivered, no panic.
         deliver_chat_callback(
             &host,
@@ -2980,6 +3560,7 @@ mod tests {
                 content: serde_json::json!({}),
                 speech: "answered".into(),
             }),
+            &mut deliveries,
         );
         // A failed dispatch -> nothing delivered even if meta is present.
         deliver_chat_callback(
@@ -2990,6 +3571,7 @@ mod tests {
                 project: String::new(),
             }),
             &Err(ToolError::UnknownTool("boom".into())),
+            &mut deliveries,
         );
         // Let any (here, none) spawned delivery task run before the test ends.
         tokio::task::yield_now().await;

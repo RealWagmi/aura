@@ -29,6 +29,8 @@ enum InputMode {
 #[derive(Debug, Clone)]
 struct PushToTalkGate {
     state: Arc<std::sync::atomic::AtomicU64>,
+    failed: Arc<std::sync::atomic::AtomicBool>,
+    failure_notify: Arc<tokio::sync::Notify>,
     label: String,
     #[cfg(target_os = "linux")]
     _control_socket: Arc<LinuxControlSocket>,
@@ -59,14 +61,29 @@ impl PushToTalkGate {
     fn press_count(&self) -> u64 {
         self.state.load(std::sync::atomic::Ordering::Acquire)
     }
+
+    async fn wait_for_failure(&self) {
+        if self.failed.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        self.failure_notify.notified().await;
+    }
 }
 
 #[cfg(windows)]
 fn start_push_to_talk(_call_id: &str) -> Result<InputMode, Box<dyn std::error::Error>> {
     let raw = std::env::var("AURA_PUSH_TO_TALK_HOTKEY").unwrap_or_else(|_| "ctrl+space".to_owned());
-    let watcher = hotkey::start_push_to_talk_watcher(&raw)?;
+    let allow_global = std::env::var("AURA_PUSH_TO_TALK_ALLOW_GLOBAL_HOTKEY").as_deref() == Ok("1");
+    if allow_global {
+        eprintln!(
+            "aura: AURA_PUSH_TO_TALK_ALLOW_GLOBAL_HOTKEY=1 enables the PTT hotkey system-wide; keystrokes are observed even when Aura is not focused."
+        );
+    }
+    let watcher = hotkey::start_push_to_talk_watcher(&raw, allow_global)?;
     Ok(InputMode::TogglePushToTalk(PushToTalkGate {
         state: watcher.presses,
+        failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        failure_notify: Arc::new(tokio::sync::Notify::new()),
         label: watcher.label,
     }))
 }
@@ -94,6 +111,10 @@ fn start_push_to_talk(call_id: &str) -> Result<InputMode, Box<dyn std::error::Er
     let listener = tokio::net::UnixListener::from_std(listener)?;
     let presses = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let task_presses = Arc::clone(&presses);
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task_failed = Arc::clone(&failed);
+    let failure_notify = Arc::new(tokio::sync::Notify::new());
+    let task_failure_notify = Arc::clone(&failure_notify);
     let task_path = path.clone();
     let _listener_task = tokio::spawn(async move {
         loop {
@@ -115,10 +136,15 @@ fn start_push_to_talk(call_id: &str) -> Result<InputMode, Box<dyn std::error::Er
                     });
                 }
                 Err(err) => {
+                    if is_transient_control_accept_error(&err) {
+                        continue;
+                    }
                     eprintln!(
                         "aura: Linux push-to-talk control socket {} stopped: {err}",
                         task_path.display()
                     );
+                    task_failed.store(true, std::sync::atomic::Ordering::Release);
+                    task_failure_notify.notify_one();
                     break;
                 }
             }
@@ -126,9 +152,22 @@ fn start_push_to_talk(call_id: &str) -> Result<InputMode, Box<dyn std::error::Er
     });
     Ok(InputMode::TogglePushToTalk(PushToTalkGate {
         state: presses,
+        failed,
+        failure_notify,
         label: format!("aura-cli ptt-toggle ({})", path.display()),
         _control_socket: control_socket,
     }))
+}
+
+#[cfg(target_os = "linux")]
+fn is_transient_control_accept_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    )
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
@@ -139,14 +178,24 @@ fn start_push_to_talk(_call_id: &str) -> Result<InputMode, Box<dyn std::error::E
     )
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Environment mutation must finish before Tokio starts worker threads.
     load_dotenv();
     // Handle `--version` / `--help` before touching the mic or stdin.
     if let Some(code) = handle_cli_flags() {
         std::process::exit(code);
     }
-    if let Err(err) = run().await {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("aura-cli: failed to start async runtime: {err}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(err) = runtime.block_on(run()) {
         eprintln!("aura-cli: {err}");
         std::process::exit(1);
     }
@@ -189,7 +238,8 @@ fn handle_cli_flags() -> Option<i32> {
                  the model speaks; no barge-in), off (raw mic; headsets only)\n  \
                  AURA_INPUT_MODE legacy strings only; new connection strings carry\n                  \
                  the server-selected m=voice or m=ptt mode\n  \
-                 AURA_PUSH_TO_TALK_HOTKEY Windows global toggle hotkey\n                  \
+                 AURA_PUSH_TO_TALK_HOTKEY Windows focus-scoped toggle hotkey\n                  \
+                 AURA_PUSH_TO_TALK_ALLOW_GLOBAL_HOTKEY=1 explicitly allow system-wide PTT\n                  \
                  for push_to_talk mode (default ctrl+space; letters/numbers need a modifier)\n  \
                  AURA_PUSH_TO_TALK_MAX_RECORDING_MS max push_to_talk open-mic time\n                  \
                  in milliseconds (default 300000, about 5 minutes)",
@@ -246,7 +296,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "aura: opening a secure tunnel to {} (call {})…",
         conn.authority, conn.call_id
     );
-    let cfg = TunnelConfig::default();
+    let cfg = TunnelConfig {
+        input_mode: Some(tunnel_input_mode),
+        ..TunnelConfig::default()
+    };
 
     // The connection string is self-describing: dial whichever transport the
     // server minted — direct Noise/UDP, or iroh QUIC for a NAT/CGNAT server.
@@ -385,6 +438,9 @@ async fn pump<T: VoiceTunnel>(
     eprintln!("aura: on the call — speak when you hear Aura. Ctrl-C to hang up.");
     loop {
         tokio::select! {
+            _ = wait_ptt_control_failure(&input_mode) => {
+                return Err("Linux push-to-talk control socket failed; ending the call rather than leaving microphone control unavailable".into());
+            }
             mic = audio.recv_pcm24() => match mic {
                 Some(frame) => match &input_mode {
                     InputMode::Voice => tunnel.send_pcm24(&frame),
@@ -485,6 +541,14 @@ async fn pump<T: VoiceTunnel>(
 }
 
 #[cfg(any(windows, target_os = "linux"))]
+async fn wait_ptt_control_failure(input_mode: &InputMode) {
+    match input_mode {
+        InputMode::TogglePushToTalk(gate) => gate.wait_for_failure().await,
+        InputMode::Voice => std::future::pending().await,
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
 const DEFAULT_PUSH_TO_TALK_MAX_RECORDING_MS: u64 = 300_000;
 #[cfg(any(windows, target_os = "linux"))]
 const PUSH_TO_TALK_FRAME_MS: u64 = 20;
@@ -558,8 +622,11 @@ fn parse_push_to_talk_max_recording_ms(
     let ms = trimmed.parse::<u64>().map_err(|_| {
         format!("AURA_PUSH_TO_TALK_MAX_RECORDING_MS must be a positive number, got {raw:?}")
     })?;
-    if ms == 0 {
-        return Err("AURA_PUSH_TO_TALK_MAX_RECORDING_MS must be greater than 0".into());
+    let minimum_ms = PUSH_TO_TALK_MIN_RECORDING_FRAMES as u64 * PUSH_TO_TALK_FRAME_MS;
+    if ms < minimum_ms {
+        return Err(
+            format!("AURA_PUSH_TO_TALK_MAX_RECORDING_MS must be at least {minimum_ms} ms").into(),
+        );
     }
     recording_ms_to_frames(ms)
 }
@@ -985,6 +1052,7 @@ fn is_cli_dotenv_key_allowed(key: &str, trusted_user_config: bool) -> bool {
                 "AURA_INPUT_MODE"
                     | "AURA_PUSH_TO_TALK_HOTKEY"
                     | "AURA_PUSH_TO_TALK_MAX_RECORDING_MS"
+                    | "AURA_PUSH_TO_TALK_ALLOW_GLOBAL_HOTKEY"
             ))
 }
 
@@ -1143,6 +1211,11 @@ mod tests {
     #[test]
     fn push_to_talk_max_recording_rejects_invalid_values() {
         assert!(parse_push_to_talk_max_recording_ms(Some("0")).is_err());
+        assert!(parse_push_to_talk_max_recording_ms(Some("99")).is_err());
+        assert_eq!(
+            parse_push_to_talk_max_recording_ms(Some("100")).unwrap(),
+            PUSH_TO_TALK_MIN_RECORDING_FRAMES
+        );
         assert!(parse_push_to_talk_max_recording_ms(Some("abc")).is_err());
     }
 
@@ -1185,7 +1258,8 @@ mod tests {
 #[cfg(all(test, target_os = "linux"))]
 mod linux_tests {
     use super::{
-        create_private_directory_tree, is_push_to_talk_toggle_command, remove_stale_control_socket,
+        create_private_directory_tree, is_push_to_talk_toggle_command,
+        is_transient_control_accept_error, remove_stale_control_socket,
         select_push_to_talk_control_dir,
     };
     use std::ffi::OsString;
@@ -1197,6 +1271,16 @@ mod linux_tests {
         assert!(!is_push_to_talk_toggle_command(b""));
         assert!(!is_push_to_talk_toggle_command(b"toggle"));
         assert!(!is_push_to_talk_toggle_command(b"toggle\nextra"));
+    }
+
+    #[test]
+    fn control_accept_retries_only_transient_errors() {
+        assert!(is_transient_control_accept_error(&std::io::Error::from(
+            std::io::ErrorKind::Interrupted
+        )));
+        assert!(!is_transient_control_accept_error(&std::io::Error::from(
+            std::io::ErrorKind::OutOfMemory
+        )));
     }
 
     #[test]

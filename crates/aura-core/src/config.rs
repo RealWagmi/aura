@@ -207,7 +207,7 @@ impl ProviderConfig {
                     let legacy = self.voice.as_str();
                     is_openai_realtime_voice(legacy).then_some(legacy)
                 })
-                .unwrap_or("alloy"),
+                .unwrap_or("marin"),
         }
     }
 }
@@ -215,7 +215,16 @@ impl ProviderConfig {
 fn is_openai_realtime_voice(voice: &str) -> bool {
     matches!(
         voice,
-        "alloy" | "ash" | "ballad" | "coral" | "echo" | "sage" | "shimmer" | "verse"
+        "alloy"
+            | "ash"
+            | "ballad"
+            | "cedar"
+            | "coral"
+            | "echo"
+            | "marin"
+            | "sage"
+            | "shimmer"
+            | "verse"
     )
 }
 
@@ -1831,7 +1840,7 @@ mod tests {
             openai_voice: None,
             ..ProviderConfig::default()
         };
-        assert_eq!(p.effective_voice(), "alloy");
+        assert_eq!(p.effective_voice(), "marin");
 
         p.engine = VoiceEngine::Grok;
         p.grok_voice = None;
@@ -1842,7 +1851,7 @@ mod tests {
     fn effective_voice_ignores_grok_default_when_engine_is_openai() {
         let p: ProviderConfig = serde_json::from_str(r#"{"engine":"openai_realtime"}"#).unwrap();
         assert_eq!(p.voice, "eve");
-        assert_eq!(p.effective_voice(), "alloy");
+        assert_eq!(p.effective_voice(), "marin");
     }
 
     #[test]

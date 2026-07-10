@@ -54,7 +54,7 @@ pub use host::{
     HostKind, HostMemoryCard, HostMemoryPriority, HostMemorySection, HostMemorySource, HostPrivacy,
     HostSessionIdentity, HostToolDescriptor, ToolManifest,
 };
-pub use private_fs::append_private_jsonl_line;
+pub use private_fs::{append_private_jsonl_line, write_private_contents};
 pub use redaction::{contains_secret, content_fingerprint, log_safe, redact_secrets};
 pub use session::{
     detect_active_claude_session, load_session, prune_sessions, save_session_atomic, session_path,
