@@ -123,8 +123,6 @@ pub struct VoiceSessionConfig {
     pub temperature: Option<f64>,
     /// Optional end-of-turn silence timeout in ms (server-VAD).
     pub end_of_turn_timeout_ms: Option<u64>,
-    /// Disable server VAD and let the client explicitly commit each user turn.
-    pub manual_turn_detection: bool,
     /// Optional output speed multiplier.
     pub output_speed: Option<f64>,
     /// When `true`, `connect` includes a cold-start user item + response
@@ -164,7 +162,6 @@ impl Default for VoiceSessionConfig {
             latency_target_ms: 800,
             temperature: None,
             end_of_turn_timeout_ms: None,
-            manual_turn_detection: false,
             output_speed: None,
             cold_start_kick: false,
             transcription_language: None,
@@ -190,6 +187,16 @@ pub trait VoiceProvider: Send + Sync {
         &self,
         cfg: &VoiceSessionConfig,
     ) -> Result<(Box<dyn VoiceSink>, Box<dyn VoiceStream>), VoiceError>;
+    /// Connect with explicit manual turn detection. The default preserves
+    /// source compatibility for third-party providers; built-in realtime
+    /// providers override it to disable server VAD for push-to-talk.
+    async fn connect_with_manual_turn_detection(
+        &self,
+        cfg: &VoiceSessionConfig,
+        _manual_turn_detection: bool,
+    ) -> Result<(Box<dyn VoiceSink>, Box<dyn VoiceStream>), VoiceError> {
+        self.connect(cfg).await
+    }
 }
 
 /// The write half: owns the mic-pump (LOCAL) / inbound side (REMOTE).
@@ -228,9 +235,19 @@ pub trait VoiceSink: Send {
     /// Ask the model to produce a response now (used when `server_vad` is
     /// off, or after a tool result).
     async fn request_response(&mut self) -> Result<(), VoiceError>;
+    /// Commit the current input-audio buffer as one user conversation item
+    /// without starting a response. Manual push-to-talk uses this split form
+    /// so a turn can be preserved while a cancelled response is still waiting
+    /// for its terminal `response.done` event.
+    async fn commit_user_audio(&mut self) -> Result<(), VoiceError> {
+        Err(VoiceError::Protocol(
+            "provider does not support split manual-turn commit".to_owned(),
+        ))
+    }
     /// Commit the current input-audio buffer as one user turn, then ask the
     /// model to answer. Used by manual push-to-talk sessions. Server-VAD
-    /// sessions keep the default behaviour.
+    /// sessions and older provider implementations keep the original default
+    /// response-request behaviour.
     async fn commit_user_turn(&mut self) -> Result<(), VoiceError> {
         self.request_response().await
     }
@@ -307,7 +324,6 @@ mod tests {
         assert_eq!(cfg.instructions, "instructions");
         assert_eq!(cfg.voice, "voice");
         assert_eq!(cfg.latency_target_ms, 800);
-        assert!(!cfg.manual_turn_detection);
         assert!(!cfg.cold_start_kick);
         assert!(cfg.transcription_language.is_none());
     }

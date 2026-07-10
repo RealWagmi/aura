@@ -124,9 +124,11 @@ impl TunnelServer {
         let mut buf = [0u8; RECV_BUF];
         let mut scratch = [0u8; MAX_HANDSHAKE_MSG];
         let deadline = tokio::time::Instant::now() + cfg.handshake_timeout;
-        // A genuine msg1 datagram is exactly this size; reject anything else
-        // BEFORE building an RNG-seeded responder (anti-amplification).
+        // Admit the current and legacy fixed sizes only. A PSK-authenticated
+        // legacy payload gets a clear version error below; arbitrary sizes are
+        // rejected before building an RNG-seeded responder.
         let expected = 1 + noise::msg1_len();
+        let legacy_expected = 1 + 48;
 
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -137,14 +139,17 @@ impl TunnelServer {
                 Ok(r) => r?,
                 Err(_) => return Err(TunnelError::HandshakeTimeout),
             };
-            if n != expected || buf[0] != TAG_HANDSHAKE {
+            if (n != expected && n != legacy_expected) || buf[0] != TAG_HANDSHAKE {
                 continue; // not a plausibly-sized handshake msg1 — cheap reject
             }
             let mut hs = noise::responder(secret.as_bytes())?;
-            if hs.read_message(&buf[1..n], &mut scratch).is_err() {
+            let payload_len = hs.read_message(&buf[1..n], &mut scratch);
+            if payload_len.is_err() {
                 continue; // wrong PSK / malformed — keep waiting for the real client
             }
-            let n2 = match hs.write_message(&[], &mut scratch) {
+            let payload_len = payload_len.map_err(noise::NoiseError::from)?;
+            noise::verify_protocol_marker(&scratch[..payload_len])?;
+            let n2 = match hs.write_message(noise::PROTOCOL_MARKER, &mut scratch) {
                 Ok(n) => n,
                 Err(_) => continue,
             };
@@ -187,7 +192,7 @@ impl TunnelEndpoint {
         let mut hs = noise::initiator(secret.as_bytes())?;
         let mut scratch = [0u8; MAX_HANDSHAKE_MSG];
         let n1 = hs
-            .write_message(&[], &mut scratch)
+            .write_message(noise::PROTOCOL_MARKER, &mut scratch)
             .map_err(noise::NoiseError::from)?;
         let mut msg1 = Vec::with_capacity(1 + n1);
         msg1.push(TAG_HANDSHAKE);
@@ -202,8 +207,10 @@ impl TunnelEndpoint {
             socket.send(&msg1).await?;
             match timeout(cfg.handshake_retransmit, socket.recv(&mut buf)).await {
                 Ok(Ok(n)) if n >= 1 && buf[0] == TAG_HANDSHAKE => {
-                    hs.read_message(&buf[1..n], &mut scratch)
+                    let payload_len = hs
+                        .read_message(&buf[1..n], &mut scratch)
                         .map_err(noise::NoiseError::from)?;
+                    noise::verify_protocol_marker(&scratch[..payload_len])?;
                     break;
                 }
                 Ok(Ok(_)) => continue, // unexpected datagram — retransmit
@@ -659,5 +666,36 @@ mod tests {
             server_handle.await.unwrap().is_err(),
             "server must time out"
         );
+    }
+
+    #[tokio::test]
+    async fn authenticated_legacy_protocol_is_rejected_explicitly() {
+        let secret = SessionSecret::generate().unwrap();
+        let server = TunnelServer::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let server_secret = secret.clone();
+        let cfg = TunnelConfig {
+            handshake_timeout: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let server_task = tokio::spawn(async move { server.accept(&server_secret, cfg).await });
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut legacy = noise::initiator(secret.as_bytes()).unwrap();
+        let mut scratch = [0u8; MAX_HANDSHAKE_MSG];
+        let n = legacy.write_message(&[], &mut scratch).unwrap();
+        let mut datagram = Vec::with_capacity(1 + n);
+        datagram.push(TAG_HANDSHAKE);
+        datagram.extend_from_slice(&scratch[..n]);
+        socket.send_to(&datagram, addr).await.unwrap();
+
+        let error = match server_task.await.unwrap() {
+            Ok(_) => panic!("legacy protocol unexpectedly connected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            TunnelError::Noise(noise::NoiseError::ProtocolVersion)
+        ));
     }
 }

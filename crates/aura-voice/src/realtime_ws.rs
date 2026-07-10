@@ -186,12 +186,11 @@ impl VoiceSink for RealtimeSink {
         self.send(wire::response_create_event()).await
     }
 
-    async fn commit_user_turn(&mut self) -> Result<(), VoiceError> {
+    async fn commit_user_audio(&mut self) -> Result<(), VoiceError> {
         if !self.manual_turn_detection {
-            return self.request_response().await;
+            return Ok(());
         }
-        self.send(wire::input_audio_buffer_commit_event()).await?;
-        self.send(wire::response_create_event()).await
+        self.send(wire::input_audio_buffer_commit_event()).await
     }
 
     async fn close(&mut self) -> Result<(), VoiceError> {

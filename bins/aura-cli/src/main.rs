@@ -230,13 +230,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let raw = read_connection_string()?;
     let conn = ConnectionString::parse(&raw)?;
-    let input_mode = resolve_input_mode(conn.input_mode)?;
+    let tunnel_input_mode = resolve_input_mode(conn.input_mode)?;
     #[cfg(any(windows, target_os = "linux"))]
-    let ptt_max_frames = if input_mode == TunnelInputMode::PushToTalk {
+    let ptt_max_frames = if tunnel_input_mode == TunnelInputMode::PushToTalk {
         Some(push_to_talk_max_recording_frames()?)
     } else {
         None
     };
+    // Prepare every fallible local PTT component before dialing. A successful
+    // tunnel handshake consumes the server's single-use connection string, so
+    // an invalid hotkey or unsafe/unavailable Linux control directory must fail
+    // before that handshake rather than strand the call.
+    let input_mode = InputMode::from_mode(tunnel_input_mode, &conn.call_id)?;
     eprintln!(
         "aura: opening a secure tunnel to {} (call {})…",
         conn.authority, conn.call_id
@@ -251,7 +256,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             pump(
                 tunnel,
                 input_mode,
-                &conn.call_id,
                 #[cfg(any(windows, target_os = "linux"))]
                 ptt_max_frames,
             )
@@ -268,7 +272,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             pump(
                 tunnel,
                 input_mode,
-                &conn.call_id,
                 #[cfg(any(windows, target_os = "linux"))]
                 ptt_max_frames,
             )
@@ -354,13 +357,11 @@ impl VoiceTunnel for IrohEndpoint {
 /// endpoints don't conflict (the discipline the engine's loop relies on).
 async fn pump<T: VoiceTunnel>(
     mut tunnel: T,
-    tunnel_input_mode: TunnelInputMode,
-    call_id: &str,
+    input_mode: InputMode,
     #[cfg(any(windows, target_os = "linux"))] ptt_max_frames: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("aura: tunnel up. Acquiring microphone and speaker…");
     let mut audio = CpalTransport::start(AudioSettings::default())?;
-    let input_mode = InputMode::from_mode(tunnel_input_mode, call_id)?;
     #[cfg(any(windows, target_os = "linux"))]
     let mut ptt_recording = false;
     #[cfg(any(windows, target_os = "linux"))]
@@ -610,25 +611,34 @@ fn push_to_talk_control_dir() -> Result<std::path::PathBuf, Box<dyn std::error::
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let uid = unsafe { libc::geteuid() };
-    let dir = if let Some(runtime_dir) =
-        std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty())
-    {
-        std::path::PathBuf::from(runtime_dir).join("aura")
-    } else {
-        std::env::temp_dir().join(format!("aura-{uid}"))
-    };
+    let (private_base, dir) = select_push_to_talk_control_dir(
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        std::env::var_os("HOME"),
+    )?;
 
-    match std::fs::create_dir(&dir) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(err) => {
-            return Err(format!(
-                "failed to create Linux push-to-talk runtime directory {}: {err}",
-                dir.display()
-            )
-            .into());
-        }
+    let base_metadata = std::fs::symlink_metadata(&private_base).map_err(|err| {
+        format!(
+            "failed to inspect Linux push-to-talk base directory {}: {err}",
+            private_base.display()
+        )
+    })?;
+    if !base_metadata.file_type().is_dir()
+        || base_metadata.uid() != uid
+        || base_metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(format!(
+            "refusing unsafe Linux push-to-talk base directory {} (must be an owned directory not writable by group or others)",
+            private_base.display()
+        )
+        .into());
     }
+
+    std::fs::create_dir_all(&dir).map_err(|err| {
+        format!(
+            "failed to create Linux push-to-talk runtime directory {}: {err}",
+            dir.display()
+        )
+    })?;
     let metadata = std::fs::symlink_metadata(&dir)?;
     if !metadata.file_type().is_dir() || metadata.uid() != uid {
         return Err(format!(
@@ -639,6 +649,31 @@ fn push_to_talk_control_dir() -> Result<std::path::PathBuf, Box<dyn std::error::
     }
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     Ok(dir)
+}
+
+#[cfg(target_os = "linux")]
+fn select_push_to_talk_control_dir(
+    xdg_runtime_dir: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Result<(std::path::PathBuf, std::path::PathBuf), Box<dyn std::error::Error>> {
+    if let Some(runtime_dir) = xdg_runtime_dir.filter(|value| !value.is_empty()) {
+        let base = std::path::PathBuf::from(runtime_dir);
+        let dir = base.join("aura");
+        return Ok((base, dir));
+    }
+    if let Some(home) = home.filter(|value| !value.is_empty()) {
+        // Do not use a predictable shared-temp path here. Another local user
+        // could create `/tmp/aura-$UID` first and deny PTT startup. The home
+        // directory remains a stable, user-private rendezvous point for the
+        // separate `aura-cli ptt-toggle` process.
+        let base = std::path::PathBuf::from(home);
+        let dir = base.join(".cache").join("aura").join("runtime");
+        return Ok((base, dir));
+    }
+    Err(
+        "Linux push-to-talk needs XDG_RUNTIME_DIR or HOME; refusing an unsafe shared temporary-directory fallback"
+            .into(),
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -1042,7 +1077,11 @@ mod tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod linux_tests {
-    use super::{is_push_to_talk_toggle_command, remove_stale_control_socket};
+    use super::{
+        is_push_to_talk_toggle_command, remove_stale_control_socket,
+        select_push_to_talk_control_dir,
+    };
+    use std::ffi::OsString;
 
     #[test]
     fn control_socket_requires_exact_toggle_command() {
@@ -1050,6 +1089,31 @@ mod linux_tests {
         assert!(!is_push_to_talk_toggle_command(b""));
         assert!(!is_push_to_talk_toggle_command(b"toggle"));
         assert!(!is_push_to_talk_toggle_command(b"toggle\nextra"));
+    }
+
+    #[test]
+    fn control_dir_prefers_xdg_runtime_and_falls_back_to_home_cache() {
+        let (base, dir) = select_push_to_talk_control_dir(
+            Some(OsString::from("/run/user/1000")),
+            Some(OsString::from("/home/alice")),
+        )
+        .expect("XDG runtime path");
+        assert_eq!(base, std::path::PathBuf::from("/run/user/1000"));
+        assert_eq!(dir, base.join("aura"));
+
+        let (base, dir) =
+            select_push_to_talk_control_dir(None, Some(OsString::from("/home/alice")))
+                .expect("home cache path");
+        assert_eq!(base, std::path::PathBuf::from("/home/alice"));
+        assert_eq!(dir, base.join(".cache/aura/runtime"));
+    }
+
+    #[test]
+    fn control_dir_never_falls_back_to_shared_temp() {
+        let err = select_push_to_talk_control_dir(None, None).expect_err("missing private base");
+        assert!(err
+            .to_string()
+            .contains("unsafe shared temporary-directory"));
     }
 
     #[test]

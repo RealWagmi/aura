@@ -17,6 +17,9 @@ use snow::{HandshakeState, StatelessTransportState};
 
 /// NNpsk0 with X25519 / ChaChaPoly / BLAKE2s.
 pub const NOISE_PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
+/// Authenticated application-protocol marker carried in both Noise handshake
+/// messages. Incompatible transport framing must change this marker.
+pub const PROTOCOL_MARKER: &[u8] = b"aura/direct/1";
 /// AEAD tag length (ChaChaPoly) — transport ciphertext = plaintext + this.
 pub const TAG_LEN: usize = 16;
 /// Upper bound on a handshake message; NNpsk0 messages are well under this.
@@ -28,6 +31,8 @@ pub enum NoiseError {
     Snow(#[from] snow::Error),
     #[error("invalid Noise params (compile-time constant)")]
     Params,
+    #[error("unsupported aura tunnel protocol version")]
+    ProtocolVersion,
 }
 
 fn builder() -> Result<snow::Builder<'static>, NoiseError> {
@@ -56,13 +61,23 @@ pub fn finalize(hs: HandshakeState) -> Result<Transport, NoiseError> {
 /// for the pattern). The server uses it to cheaply reject wrong-sized junk
 /// datagrams BEFORE building an RNG-seeded responder (anti-amplification).
 pub fn msg1_len() -> usize {
-    const FALLBACK: usize = 48; // e(32) + psk-tag(16) for NNpsk0
+    const FALLBACK: usize = 61; // e(32) + encrypted marker(13) + tags(16)
     match initiator(&[0u8; 32]) {
         Ok(mut hs) => {
             let mut buf = [0u8; MAX_HANDSHAKE_MSG];
-            hs.write_message(&[], &mut buf).unwrap_or(FALLBACK)
+            hs.write_message(PROTOCOL_MARKER, &mut buf)
+                .unwrap_or(FALLBACK)
         }
         Err(_) => FALLBACK,
+    }
+}
+
+/// Verify the authenticated application payload from either handshake message.
+pub fn verify_protocol_marker(payload: &[u8]) -> Result<(), NoiseError> {
+    if payload == PROTOCOL_MARKER {
+        Ok(())
+    } else {
+        Err(NoiseError::ProtocolVersion)
     }
 }
 
@@ -101,10 +116,12 @@ mod tests {
         let mut res = responder(psk_r)?;
         let mut a = [0u8; MAX_HANDSHAKE_MSG];
         let mut b = [0u8; MAX_HANDSHAKE_MSG];
-        let n1 = ini.write_message(&[], &mut a)?; // msg1
-        res.read_message(&a[..n1], &mut b)?;
-        let n2 = res.write_message(&[], &mut a)?; // msg2
-        ini.read_message(&a[..n2], &mut b)?;
+        let n1 = ini.write_message(PROTOCOL_MARKER, &mut a)?; // msg1
+        let p1 = res.read_message(&a[..n1], &mut b)?;
+        verify_protocol_marker(&b[..p1])?;
+        let n2 = res.write_message(PROTOCOL_MARKER, &mut a)?; // msg2
+        let p2 = ini.read_message(&a[..n2], &mut b)?;
+        verify_protocol_marker(&b[..p2])?;
         assert!(ini.is_handshake_finished() && res.is_handshake_finished());
         Ok((finalize(ini)?, finalize(res)?))
     }
@@ -129,9 +146,38 @@ mod tests {
         let mut res = responder(&[2u8; 32]).unwrap();
         let mut a = [0u8; MAX_HANDSHAKE_MSG];
         let mut b = [0u8; MAX_HANDSHAKE_MSG];
-        let n1 = ini.write_message(&[], &mut a).unwrap();
+        let n1 = ini.write_message(PROTOCOL_MARKER, &mut a).unwrap();
         // The responder must reject msg1 authenticated under a different PSK.
         assert!(res.read_message(&a[..n1], &mut b).is_err());
+    }
+
+    #[test]
+    fn authenticated_protocol_mismatch_is_rejected() {
+        let psk = [4u8; 32];
+        let mut ini = initiator(&psk).unwrap();
+        let mut res = responder(&psk).unwrap();
+        let mut message = [0u8; MAX_HANDSHAKE_MSG];
+        let mut payload = [0u8; MAX_HANDSHAKE_MSG];
+
+        let n1 = ini.write_message(b"aura/direct/0", &mut message).unwrap();
+        let p1 = res.read_message(&message[..n1], &mut payload).unwrap();
+        assert!(matches!(
+            verify_protocol_marker(&payload[..p1]),
+            Err(NoiseError::ProtocolVersion)
+        ));
+
+        let mut ini = initiator(&psk).unwrap();
+        let mut legacy_res = responder(&psk).unwrap();
+        let n1 = ini.write_message(PROTOCOL_MARKER, &mut message).unwrap();
+        legacy_res
+            .read_message(&message[..n1], &mut payload)
+            .unwrap();
+        let n2 = legacy_res.write_message(&[], &mut message).unwrap();
+        let p2 = ini.read_message(&message[..n2], &mut payload).unwrap();
+        assert!(matches!(
+            verify_protocol_marker(&payload[..p2]),
+            Err(NoiseError::ProtocolVersion)
+        ));
     }
 
     #[test]

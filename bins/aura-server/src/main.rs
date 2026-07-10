@@ -291,7 +291,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         latency_target_ms: 800,
         temperature: Some(0.5),
         end_of_turn_timeout_ms,
-        manual_turn_detection: ptt_mode,
         output_speed: None,
         cold_start_kick: true,
         // ISO-639-1 hint for OpenAI's input transcription (e.g. "ru");
@@ -396,7 +395,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Run the call. On ANY end (caller hung up, model called `end_voice_session`,
     // provider fatal) the engine returns and we record the terminal state; the
     // post-call summary was already delivered inside `run`. `main` then exits.
-    let outcome = match CallSession::run(transport, provider, host, feeder, cfg).await {
+    let call_result = if ptt_mode {
+        CallSession::run_with_manual_turn_detection(transport, provider, host, feeder, cfg).await
+    } else {
+        CallSession::run(transport, provider, host, feeder, cfg).await
+    };
+    let outcome = match call_result {
         Ok(o) => o,
         Err(e) => {
             write_status("failed", &call_id, Some(&e.to_string()));

@@ -27,7 +27,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{interval, timeout, MissedTickBehavior};
+use tokio::time::{interval, timeout_at, Instant, MissedTickBehavior};
 
 use crate::endpoint::TunnelConfig;
 use crate::jitter::JitterBuffer;
@@ -43,7 +43,7 @@ use crate::wire::{
 
 /// ALPN identifying the aura voice tunnel over iroh. Both sides must match, or
 /// iroh aborts the connection in its handshake.
-pub const ALPN: &[u8] = b"aura/voice/0";
+pub const ALPN: &[u8] = b"aura/voice/1";
 
 /// 20 ms @ 24 kHz mono.
 const FRAME_SAMPLES: usize = 480;
@@ -93,7 +93,7 @@ async fn build_endpoint(
     preset: IrohPreset,
     secret_key: SecretKey,
     accept_alpn: Option<&[u8]>,
-    online_timeout: Duration,
+    startup_deadline: Instant,
 ) -> Result<Endpoint, IrohError> {
     let builder = match preset {
         IrohPreset::Production => Endpoint::builder(presets::N0),
@@ -116,12 +116,15 @@ async fn build_endpoint(
             )
             .map_err(ierr)?;
     }
-    let endpoint = builder.bind().await.map_err(ierr)?;
+    let endpoint = timeout_at(startup_deadline, builder.bind())
+        .await
+        .map_err(|_| IrohError::HandshakeTimeout)?
+        .map_err(ierr)?;
     // `online()` waits for a relay home; with relay disabled (LocalDirect) it
     // would never resolve. Only the Production path needs to wait for relay/
     // discovery registration before its address is dialable.
     if preset == IrohPreset::Production {
-        timeout(online_timeout, endpoint.online())
+        timeout_at(startup_deadline, endpoint.online())
             .await
             .map_err(|_| IrohError::HandshakeTimeout)?;
     }
@@ -167,6 +170,7 @@ impl Drop for AbortOnDrop {
 pub struct IrohServer {
     endpoint: Endpoint,
     preset: IrohPreset,
+    startup_deadline: Instant,
 }
 
 impl IrohServer {
@@ -180,14 +184,19 @@ impl IrohServer {
         preset: IrohPreset,
         cfg: TunnelConfig,
     ) -> Result<Self, IrohError> {
+        let startup_deadline = Instant::now() + cfg.handshake_timeout;
         let endpoint = build_endpoint(
             preset,
             ephemeral_secret_key()?,
             Some(ALPN),
-            cfg.handshake_timeout,
+            startup_deadline,
         )
         .await?;
-        Ok(Self { endpoint, preset })
+        Ok(Self {
+            endpoint,
+            preset,
+            startup_deadline,
+        })
     }
 
     /// This server's endpoint id — the public key the client dials. Goes into
@@ -224,7 +233,12 @@ impl IrohServer {
     ) -> Result<IrohEndpoint, IrohError> {
         // Bound the WHOLE accept (connection + Noise handshake) so a client that
         // connects but stalls mid-handshake can't strand the server.
-        let (conn, transport) = timeout(cfg.handshake_timeout, async {
+        // `accept` may shorten the bind-time deadline for callers that use the
+        // convenience `bind()` API with a custom accept config, but it can
+        // never restart or extend the original startup clock.
+        let configured_deadline = Instant::now() + cfg.handshake_timeout;
+        let deadline = self.startup_deadline.min(configured_deadline);
+        let (conn, transport) = timeout_at(deadline, async {
             let incoming =
                 self.endpoint.accept().await.ok_or_else(|| {
                     IrohError::Iroh("endpoint closed before a connection".to_owned())
@@ -235,10 +249,12 @@ impl IrohServer {
             let mut hs = noise::responder(secret.as_bytes())?;
             let mut scratch = [0u8; MAX_HANDSHAKE_MSG];
             let msg1 = read_framed(&mut recv).await?;
-            hs.read_message(&msg1, &mut scratch)
+            let payload_len = hs
+                .read_message(&msg1, &mut scratch)
                 .map_err(|_| IrohError::Handshake("bad msg1 / wrong session secret".to_owned()))?;
+            noise::verify_protocol_marker(&scratch[..payload_len])?;
             let n2 = hs
-                .write_message(&[], &mut scratch)
+                .write_message(noise::PROTOCOL_MARKER, &mut scratch)
                 .map_err(noise::NoiseError::from)?;
             write_framed(&mut send, &scratch[..n2]).await?;
             let _ = send.finish();
@@ -277,23 +293,26 @@ impl IrohEndpoint {
         preset: IrohPreset,
         cfg: TunnelConfig,
     ) -> Result<Self, IrohError> {
+        let startup_deadline = Instant::now() + cfg.handshake_timeout;
         let endpoint =
-            build_endpoint(preset, ephemeral_secret_key()?, None, cfg.handshake_timeout).await?;
+            build_endpoint(preset, ephemeral_secret_key()?, None, startup_deadline).await?;
         // Bound the WHOLE connect (QUIC connection + Noise handshake) so a server
         // that accepts but never answers msg2 can't strand the client.
-        let (conn, transport) = timeout(cfg.handshake_timeout, async {
+        let (conn, transport) = timeout_at(startup_deadline, async {
             let conn = endpoint.connect(addr, ALPN).await.map_err(ierr)?;
             // Initiator Noise handshake over a fresh bi-stream.
             let (mut send, mut recv) = conn.open_bi().await.map_err(ierr)?;
             let mut hs = noise::initiator(secret.as_bytes())?;
             let mut scratch = [0u8; MAX_HANDSHAKE_MSG];
             let n1 = hs
-                .write_message(&[], &mut scratch)
+                .write_message(noise::PROTOCOL_MARKER, &mut scratch)
                 .map_err(noise::NoiseError::from)?;
             write_framed(&mut send, &scratch[..n1]).await?;
             let msg2 = read_framed(&mut recv).await?;
-            hs.read_message(&msg2, &mut scratch)
+            let payload_len = hs
+                .read_message(&msg2, &mut scratch)
                 .map_err(noise::NoiseError::from)?;
+            noise::verify_protocol_marker(&scratch[..payload_len])?;
             let _ = send.finish();
             Ok::<_, IrohError>((conn, Arc::new(noise::finalize(hs)?)))
         })
@@ -611,6 +630,7 @@ impl aura_engine::AudioTransport for IrohTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::timeout;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn loopback_iroh_handshakes_and_round_trips_pcm() {
@@ -674,5 +694,28 @@ mod tests {
             "server must reject the wrong-secret client"
         );
         assert!(client.is_err(), "wrong-secret client must not connect");
+    }
+
+    #[tokio::test]
+    async fn server_startup_deadline_includes_time_after_bind() {
+        let cfg = TunnelConfig {
+            handshake_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let mut server = IrohServer::bind_with_config(IrohPreset::LocalDirect, cfg)
+            .await
+            .unwrap();
+        server.startup_deadline = Instant::now() - Duration::from_millis(1);
+
+        let secret = SessionSecret::generate().unwrap();
+        let started = Instant::now();
+        let result = server.accept(&secret, cfg).await;
+        assert!(matches!(result, Err(IrohError::HandshakeTimeout)));
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn alpn_identifies_reliable_control_protocol_version() {
+        assert_eq!(ALPN, b"aura/voice/1");
     }
 }

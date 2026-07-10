@@ -321,7 +321,14 @@ fn turn_detection_from_latency(latency_target_ms: u64, silence_override_ms: Opti
 /// Build the xAI `session.update` frame from a [`VoiceSessionConfig`].
 /// Top-level `voice` / `turn_detection` / `temperature`; PCM16 @ 24k both ways.
 pub fn xai_session_update_event(cfg: &VoiceSessionConfig) -> Value {
-    let turn_detection = if cfg.manual_turn_detection {
+    xai_session_update_event_with_mode(cfg, false)
+}
+
+pub fn xai_session_update_event_with_mode(
+    cfg: &VoiceSessionConfig,
+    manual_turn_detection: bool,
+) -> Value {
+    let turn_detection = if manual_turn_detection {
         Value::Null
     } else {
         turn_detection_from_latency(cfg.latency_target_ms, cfg.end_of_turn_timeout_ms)
@@ -361,7 +368,15 @@ pub fn xai_session_update_event(cfg: &VoiceSessionConfig) -> Value {
 /// recommendation for `gpt-realtime-2.1`; the mini model is raised to
 /// `medium` to compensate for the smaller model.
 pub fn openai_session_update_event(cfg: &VoiceSessionConfig, model: &str) -> Value {
-    let turn_detection = if cfg.manual_turn_detection {
+    openai_session_update_event_with_mode(cfg, model, false)
+}
+
+pub fn openai_session_update_event_with_mode(
+    cfg: &VoiceSessionConfig,
+    model: &str,
+    manual_turn_detection: bool,
+) -> Value {
+    let turn_detection = if manual_turn_detection {
         Value::Null
     } else {
         turn_detection_from_latency(cfg.latency_target_ms, cfg.end_of_turn_timeout_ms)
@@ -471,7 +486,6 @@ mod tests {
             latency_target_ms: 800,
             temperature: Some(0.5),
             end_of_turn_timeout_ms: None,
-            manual_turn_detection: false,
             output_speed: None,
             cold_start_kick: true,
             transcription_language: None,
@@ -573,12 +587,11 @@ mod tests {
 
     #[test]
     fn manual_turn_detection_disables_vad_for_push_to_talk() {
-        let mut cfg = cfg();
-        cfg.manual_turn_detection = true;
-        let xai = xai_session_update_event(&cfg);
+        let cfg = cfg();
+        let xai = xai_session_update_event_with_mode(&cfg, true);
         assert!(xai["session"]["turn_detection"].is_null());
 
-        let openai = openai_session_update_event(&cfg, OPENAI_DEFAULT_MODEL);
+        let openai = openai_session_update_event_with_mode(&cfg, OPENAI_DEFAULT_MODEL, true);
         assert!(openai["session"]["audio"]["input"]["turn_detection"].is_null());
     }
 

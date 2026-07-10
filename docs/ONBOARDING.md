@@ -611,8 +611,11 @@ The server is env-driven (no config file is loaded); the skill launches it and
   modifier.
 - On Linux, bind your desktop shortcut to `aura-cli ptt-toggle`. Each active
   call gets a separate `0600` socket under a private `0700` per-user runtime
-  directory. The command removes only stale owned sockets and refuses to pick
-  a call when multiple PTT calls are active.
+  directory (`$XDG_RUNTIME_DIR/aura`, or `$HOME/.cache/aura/runtime` when
+  `XDG_RUNTIME_DIR` is unset). The command removes only stale owned sockets and
+  refuses to pick a call when multiple PTT calls are active. Local PTT controls
+  are validated before the client dials, so an invalid setting does not consume
+  the single-use connection string.
 - `AURA_PUSH_TO_TALK_MAX_RECORDING_MS=300000` — client safety cap for an
   accidentally open push-to-talk mic. Set it in the client's real process
   environment or trusted user-global Aura `.env`; project `.env` files cannot
