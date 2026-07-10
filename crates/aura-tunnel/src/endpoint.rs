@@ -339,6 +339,7 @@ impl TunnelEndpoint {
                                             if replay_status == ReplayStatus::Fresh {
                                                 let _ = ack_tx.send(id);
                                                 last_recv = tokio::time::Instant::now();
+                                                jitter.push_marker(nonce);
                                             }
                                             continue;
                                         }
@@ -351,8 +352,10 @@ impl TunnelEndpoint {
                                         if replay_status == ReplayStatus::TooOld {
                                             continue;
                                         }
-                                        // Only a newly accepted authenticated frame proves liveness;
-                                        // empty == keepalive (not pushed to audio).
+                                        // Only a newly accepted authenticated frame proves liveness.
+                                        // Every fresh nonce enters jitter sequencing, including
+                                        // keepalives and internal ACKs; marker payloads are discarded
+                                        // after they advance ordering and never become audio.
                                         // Control frames go through the SAME jitter
                                         // buffer as audio: release order == send
                                         // order, and the control's sequence number
@@ -360,13 +363,15 @@ impl TunnelEndpoint {
                                         // (which stalled the turn's trailing frames
                                         // past the commit).
                                         last_recv = tokio::time::Instant::now();
-                                        if !pt.is_empty() {
-                                            if let Some((id, _)) = decode_reliable_control(&pt) {
-                                                // ACK authenticated receipt, not jitter release:
-                                                // a lone control otherwise cannot fill the two-frame
-                                                // prebuffer needed to reach the release point.
-                                                outbound.lock().expect("outbound lock").push_priority(encode_control_ack(id));
-                                            }
+                                        if pt.is_empty() {
+                                            jitter.push_marker(nonce);
+                                        } else if let Some((id, _)) = decode_reliable_control(&pt) {
+                                            // ACK authenticated receipt so the sender can resume and
+                                            // emit the following sequence marker. The jitter buffer's
+                                            // bounded control fallback covers loss of that marker.
+                                            outbound.lock().expect("outbound lock").push_priority(encode_control_ack(id));
+                                            jitter.push_control(nonce, pt);
+                                        } else {
                                             jitter.push(nonce, pt);
                                         }
                                     }
@@ -387,7 +392,9 @@ impl TunnelEndpoint {
                                 break; // peer vanished with no close → hang up
                             }
                             if let Some(bytes) = jitter.pop() {
-                                if let Some((_id, control)) = decode_reliable_control(&bytes) {
+                                if bytes.is_empty() {
+                                    continue; // authenticated sequence marker, never application input
+                                } else if let Some((_id, control)) = decode_reliable_control(&bytes) {
                                     if inbound_tx.send(TunnelInput::Control(control)).await.is_err() {
                                         break;
                                     }
@@ -561,6 +568,45 @@ mod tests {
         assert_eq!(
             audio_seen, TURN_FRAMES,
             "every audio frame of the turn must arrive before its PttClose"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lone_terminal_control_after_silence_is_released() {
+        let secret = SessionSecret::generate().unwrap();
+        let server = TunnelServer::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap().to_string();
+        let server_secret = secret.clone();
+        let server_handle = tokio::spawn(async move {
+            server
+                .accept(&server_secret, TunnelConfig::default())
+                .await
+                .unwrap()
+        });
+        let client = TunnelEndpoint::connect_client(&addr, &secret, TunnelConfig::default())
+            .await
+            .unwrap();
+        let mut server_ep = server_handle.await.unwrap();
+
+        // Drain one audio spurt and leave the receiver idle long enough that
+        // the historical implementation returned to prebuffering.
+        client.send_pcm24(&[1; FRAME_SAMPLES * 2]);
+        for _ in 0..2 {
+            assert!(matches!(
+                timeout(Duration::from_secs(1), server_ep.recv_input())
+                    .await
+                    .unwrap(),
+                Some(TunnelInput::Audio(_))
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        client.send_control(TunnelControl::PttClose);
+        assert_eq!(
+            timeout(Duration::from_secs(1), server_ep.recv_input())
+                .await
+                .expect("lone terminal control remained stuck"),
+            Some(TunnelInput::Control(TunnelControl::PttClose))
         );
     }
 

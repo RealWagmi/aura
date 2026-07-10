@@ -1,8 +1,8 @@
 //! Adaptive jitter buffer for inbound tunnel audio frames.
 //!
 //! Frames arrive over UDP with network jitter and occasional reordering or
-//! loss. This buffer reorders by sequence number (the low 16 bits of the Noise
-//! per-packet nonce, wraparound-aware per RFC 1982), holds a target depth
+//! loss. This buffer reorders by the full Noise per-packet nonce
+//! (wraparound-aware per RFC 1982), holds a target depth
 //! between 40 ms and 80 ms (2–4 frames at the 20 ms profile) to absorb jitter,
 //! drops already-played late packets, and on a persistent gap (loss) skips
 //! ahead rather than stalling — bumping the target depth up so future jitter is
@@ -18,6 +18,16 @@ pub const MIN_DEPTH_FRAMES: usize = 2;
 /// Maximum buffered depth: 80 ms.
 pub const MAX_DEPTH_FRAMES: usize = 4;
 
+/// Release an in-order control after this many 20 ms ticks even if no later
+/// sequence marker arrives. Normally the following authenticated keepalive
+/// satisfies prebuffering on the next tick; this is the loss fallback.
+const CONTROL_RELEASE_TICKS: usize = 5;
+
+struct Entry {
+    payload: Vec<u8>,
+    is_control: bool,
+}
+
 /// RFC 1982 serial comparison for full-width transport sequence numbers: is `a` strictly
 /// after `b` (accounting for wraparound)?
 fn seq_after(a: u64, b: u64) -> bool {
@@ -26,7 +36,7 @@ fn seq_after(a: u64, b: u64) -> bool {
 
 /// Reordering, depth-gating jitter buffer over Opus packets keyed by RTP seq.
 pub struct JitterBuffer {
-    entries: HashMap<u64, Vec<u8>>,
+    entries: HashMap<u64, Entry>,
     /// Next sequence number to release (set from the first pushed packet).
     next_pop: Option<u64>,
     /// Highest sequence number seen so far.
@@ -41,6 +51,8 @@ pub struct JitterBuffer {
     /// `LOSS_SKIP_TICKS` the gap is declared lost and skipped, so a tail-of-
     /// spurt loss can't strand the trailing frames forever.
     stuck: usize,
+    /// Ticks an in-order control has waited alone during prebuffering.
+    control_wait: usize,
 }
 
 /// Ticks (×20 ms) to wait on a gap with later frames buffered before declaring
@@ -48,9 +60,9 @@ pub struct JitterBuffer {
 const LOSS_SKIP_TICKS: usize = 3;
 
 /// A forward sequence jump larger than this (5 s of frames) is a stream
-/// restart, not loss: the sender was idle (keepalives consume nonces but are
-/// never pushed here — e.g. a push-to-talk client between turns) and resumed.
-/// Resync the release baseline instead of walking the phantom gap.
+/// restart, not loss. This remains a defensive recovery path for sequence
+/// markers lost during a long partition; normal authenticated keepalives are
+/// represented explicitly and keep the sequence timeline continuous.
 const RESYNC_GAP_FRAMES: u64 = 250;
 
 impl Default for JitterBuffer {
@@ -68,6 +80,7 @@ impl JitterBuffer {
             target: MIN_DEPTH_FRAMES,
             playing: false,
             stuck: 0,
+            control_wait: 0,
         }
     }
 
@@ -98,6 +111,22 @@ impl JitterBuffer {
     /// a huge forward jump (sender was idle, e.g. a gated push-to-talk mic)
     /// re-establishes it instead of walking thousands of phantom losses.
     pub fn push(&mut self, seq: u64, payload: Vec<u8>) {
+        self.push_entry(seq, payload, false);
+    }
+
+    /// Insert an ordered control frame. Controls share the audio sequence but
+    /// may use the bounded lone-control fallback while prebuffering.
+    pub fn push_control(&mut self, seq: u64, payload: Vec<u8>) {
+        self.push_entry(seq, payload, true);
+    }
+
+    /// Record an authenticated transport sequence position that carries no
+    /// application payload (keepalive or internal ACK).
+    pub fn push_marker(&mut self, seq: u64) {
+        self.push_entry(seq, Vec::new(), false);
+    }
+
+    fn push_entry(&mut self, seq: u64, payload: Vec<u8>, is_control: bool) {
         match self.next_pop {
             None => self.next_pop = Some(seq),
             Some(np)
@@ -119,6 +148,7 @@ impl JitterBuffer {
                 self.highest = None;
                 self.playing = false;
                 self.stuck = 0;
+                self.control_wait = 0;
             }
             Some(np) if seq != np && !seq_after(seq, np) => return, // too late
             _ => {}
@@ -128,7 +158,13 @@ impl JitterBuffer {
             Some(h) if seq_after(seq, h) => self.highest = Some(seq),
             _ => {}
         }
-        self.entries.insert(seq, payload);
+        self.entries.insert(
+            seq,
+            Entry {
+                payload,
+                is_control,
+            },
+        );
     }
 
     /// Release the next in-order frame, or `None` to keep waiting. Waits until
@@ -137,21 +173,31 @@ impl JitterBuffer {
     /// target up (adaptation).
     pub fn pop(&mut self) -> Option<Vec<u8>> {
         if !self.playing {
-            self.next_pop?;
+            let np = self.next_pop?;
             // Pre-buffer: wait until the initial target depth is reached.
             if self.span() < self.target {
-                return None;
+                let lone_control = self.entries.get(&np).is_some_and(|entry| entry.is_control);
+                if lone_control {
+                    self.control_wait += 1;
+                    if self.control_wait < CONTROL_RELEASE_TICKS {
+                        return None;
+                    }
+                } else {
+                    self.control_wait = 0;
+                    return None;
+                }
             }
             self.playing = true;
+            self.control_wait = 0;
         }
         // Iterative (a skip re-examines the NEXT slot; a long run of losses
         // must not grow the stack).
         loop {
             let np = self.next_pop?;
-            if let Some(payload) = self.entries.remove(&np) {
+            if let Some(entry) = self.entries.remove(&np) {
                 self.next_pop = Some(np.wrapping_add(1));
                 self.stuck = 0;
-                return Some(payload);
+                return Some(entry.payload);
             }
             // Missing packet at `np`. Are later frames already buffered behind it?
             let have_later =
@@ -174,6 +220,7 @@ impl JitterBuffer {
             // True underrun: nothing buffered ahead; re-buffer to the target.
             self.playing = false;
             self.stuck = 0;
+            self.control_wait = 0;
             return None;
         }
     }
@@ -307,5 +354,25 @@ mod tests {
         jb.push(100, pkt(1));
         assert_eq!(jb.pop(), Some(pkt(1)));
         assert_eq!(jb.pop(), Some(pkt(2)));
+    }
+
+    #[test]
+    fn marker_advances_sequence_without_application_payload() {
+        let mut jb = JitterBuffer::new();
+        jb.push_control(10, pkt(7));
+        assert!(jb.pop().is_none());
+        jb.push_marker(11);
+        assert_eq!(jb.pop(), Some(pkt(7)));
+        assert_eq!(jb.pop(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn lone_control_releases_after_bounded_wait() {
+        let mut jb = JitterBuffer::new();
+        jb.push_control(20, pkt(9));
+        for _ in 1..CONTROL_RELEASE_TICKS {
+            assert!(jb.pop().is_none());
+        }
+        assert_eq!(jb.pop(), Some(pkt(9)));
     }
 }

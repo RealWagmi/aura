@@ -455,6 +455,7 @@ impl IrohEndpoint {
                                                 if replay_status == ReplayStatus::Fresh {
                                                     let _ = ack_tx.send(id);
                                                     last_recv = tokio::time::Instant::now();
+                                                    jitter.push_marker(nonce);
                                                 }
                                                 continue;
                                             }
@@ -468,14 +469,14 @@ impl IrohEndpoint {
                                                 continue;
                                             }
                                             last_recv = tokio::time::Instant::now();
-                                            // Empty == keepalive (authenticated); not audio.
-                                            // Control frames go through the SAME jitter
-                                            // buffer as audio so they cannot overtake
-                                            // the turn's trailing frames (see endpoint.rs).
-                                            if !pt.is_empty() {
-                                                if let Some((id, _)) = decode_reliable_control(&pt) {
-                                                    outbound.lock().expect("outbound lock").push_priority(encode_control_ack(id));
-                                                }
+                                            // Every fresh nonce enters jitter sequencing. Empty
+                                            // keepalives and internal ACKs are marker positions only.
+                                            if pt.is_empty() {
+                                                jitter.push_marker(nonce);
+                                            } else if let Some((id, _)) = decode_reliable_control(&pt) {
+                                                outbound.lock().expect("outbound lock").push_priority(encode_control_ack(id));
+                                                jitter.push_control(nonce, pt);
+                                            } else {
                                                 jitter.push(nonce, pt);
                                             }
                                         }
@@ -489,7 +490,9 @@ impl IrohEndpoint {
                                 break;
                             }
                             if let Some(bytes) = jitter.pop() {
-                                if let Some((_id, control)) = decode_reliable_control(&bytes) {
+                                if bytes.is_empty() {
+                                    continue;
+                                } else if let Some((_id, control)) = decode_reliable_control(&bytes) {
                                     if inbound_tx.send(TunnelInput::Control(control)).await.is_err() {
                                         break;
                                     }
@@ -670,6 +673,46 @@ mod tests {
             .expect("client recv timed out")
             .expect("client tunnel closed");
         assert_eq!(got_client[0], 200, "first server frame");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lone_terminal_control_after_silence_is_released() {
+        let secret = SessionSecret::generate().unwrap();
+        let cfg = TunnelConfig {
+            handshake_timeout: Duration::from_secs(10),
+            ..Default::default()
+        };
+        let server = IrohServer::bind_with_config(IrohPreset::LocalDirect, cfg)
+            .await
+            .unwrap();
+        let server_addr = server.addr();
+        let server_secret = secret.clone();
+        let server_handle =
+            tokio::spawn(async move { server.accept(&server_secret, cfg).await.unwrap() });
+        let client =
+            IrohEndpoint::connect_client(server_addr, &secret, IrohPreset::LocalDirect, cfg)
+                .await
+                .unwrap();
+        let mut server_ep = server_handle.await.unwrap();
+
+        client.send_pcm24(&[1; FRAME_SAMPLES * 2]);
+        for _ in 0..2 {
+            assert!(matches!(
+                timeout(Duration::from_secs(1), server_ep.recv_input())
+                    .await
+                    .unwrap(),
+                Some(TunnelInput::Audio(_))
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        client.send_control(TunnelControl::PttCancel);
+        assert_eq!(
+            timeout(Duration::from_secs(1), server_ep.recv_input())
+                .await
+                .expect("lone terminal control remained stuck"),
+            Some(TunnelInput::Control(TunnelControl::PttCancel))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
